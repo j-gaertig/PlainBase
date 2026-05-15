@@ -1,0 +1,27 @@
+spawn:
+  enabled: true
+  location:
+    world: world
+    x: 100.5
+    y: 64.0
+    z: 100.5
+    yaw: 90.0
+    pitch: 0.0
+
+first-spawn:
+  enabled: true
+  location:
+    world: world
+    x: 0.0
+    y: 70.0
+    z: 0.0
+
+commands:
+  setspawn:
+    enabled: true
+  disablespawn:
+    enabled: true
+  setfirstspawn:
+    enabled: true
+  disablefirstspawn:
+    enabled: true
