@@ -10,21 +10,3 @@ load: POSTWORLD
 
 authors: [ j-gaertig ]
 website: https://github.com/j-gaertig/
-
-commands:
-  setspawn:
-    description: Set the spawn location.
-    usage: /setspawn or /setspawn <world> <x> <y> <z>
-    permission: op
-  setfirstspawn:
-    description: Set the first spawn location.
-    usage: /setfirstspawn or /setfirstspawn <world> <x> <y> <z>
-    permission: op
-  disablespawn:
-    description: Disable the spawn location.
-    usage: /disablespawn
-    permission: op
-  disablefirstspawn:
-    description: Disable the first spawn location.
-    usage: /disablefirstspawn
-    permission: op

@@ -1,14 +1,14 @@
 package de.jgaertig.plainBase.spawn.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import io.papermc.paper.command.brigadier.BasicCommand;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Location;
-import org.bukkit.command.Command;
-import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
-public class SetSpawn implements CommandExecutor {
+public class SetSpawn implements BasicCommand {
 
     private final PlainBase plugin;
 
@@ -17,16 +17,22 @@ public class SetSpawn implements CommandExecutor {
     }
 
     @Override
-    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String @NotNull [] args) {
+    public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
+        CommandSender sender = stack.getSender();
+
+        if (!sender.isOp()) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
+            return;
+        }
 
         if (!plugin.getSpawnConfig().getBoolean("commands.setspawn.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
-            return true;
+            return;
         }
 
         if (!(sender instanceof Player player)) {
             sender.sendMessage("This command can only be executed by players.");
-            return true;
+            return;
         }
 
         Location loc = null;
@@ -41,7 +47,7 @@ public class SetSpawn implements CommandExecutor {
                 loc = new Location(player.getWorld(), x, y, z, player.getLocation().getYaw(), player.getLocation().getPitch());
             } catch (NumberFormatException e) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>Invalid coordinates!"));
-                return true;
+                return;
             }
         }
 
@@ -49,11 +55,10 @@ public class SetSpawn implements CommandExecutor {
             saveToSpawnConfig(loc);
         } else {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Failed to set spawn location!"));
-            return true;
+            return;
         }
 
         player.sendMessage(plugin.getMiniMessage().deserialize("<green>Successfully set spawn location!"));
-        return true;
     }
 
     private double parseCoordinate(String arg, double current) {

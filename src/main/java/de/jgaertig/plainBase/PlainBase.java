@@ -1,9 +1,13 @@
 package de.jgaertig.plainBase;
 
 import de.jgaertig.plainBase.spawn.SpawnListener;
-import de.jgaertig.plainBase.spawn.commands.DisableFirstSpawn;import de.jgaertig.plainBase.spawn.commands.DisableSpawn;
+import de.jgaertig.plainBase.spawn.commands.DisableFirstSpawn;
+import de.jgaertig.plainBase.spawn.commands.DisableSpawn;
 import de.jgaertig.plainBase.spawn.commands.SetFirstSpawn;
 import de.jgaertig.plainBase.spawn.commands.SetSpawn;
+import io.papermc.paper.command.brigadier.BasicCommand;
+import io.papermc.paper.command.brigadier.Commands;
+import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -28,7 +32,7 @@ public final class PlainBase extends JavaPlugin {
             setupSpawn();
         }
 
-        getLogger().info("[PlainBase] Successfully Enabled!");
+        getLogger().info("Successfully Enabled!");
     }
 
 
@@ -61,13 +65,16 @@ public final class PlainBase extends JavaPlugin {
 
 
     private void setupSpawn() {
-        getCommand("setspawn").setExecutor(new SetSpawn(this));
-        getCommand("setfirstspawn").setExecutor(new SetFirstSpawn(this));
-
-        getCommand("disablespawn").setExecutor(new DisableSpawn(this));
-        getCommand("disablefirstspawn").setExecutor(new DisableFirstSpawn(this));
-
         getServer().getPluginManager().registerEvents(new SpawnListener(this), this);
+
+        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+            var commands = event.registrar();
+
+            commands.register("setspawn", "Set the spawn location", new SetSpawn(this));
+            commands.register("setfirstspawn", "Set the first spawn", new SetFirstSpawn(this));
+            commands.register("disablespawn", "Disable spawn", new DisableSpawn(this));
+            commands.register("disablefirstspawn", "Disable first spawn", new DisableFirstSpawn(this));
+        });
     }
 
 

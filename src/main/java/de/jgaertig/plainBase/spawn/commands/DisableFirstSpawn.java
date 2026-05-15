@@ -1,9 +1,12 @@
 package de.jgaertig.plainBase.spawn.commands;
 
 import de.jgaertig.plainBase.PlainBase;
-import org.bukkit.command.CommandExecutor;
+import io.papermc.paper.command.brigadier.BasicCommand;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
+import org.bukkit.command.CommandSender;
+import org.jetbrains.annotations.NotNull;
 
-public class DisableFirstSpawn implements CommandExecutor {
+public class DisableFirstSpawn implements BasicCommand {
 
     private final PlainBase plugin;
 
@@ -12,10 +15,17 @@ public class DisableFirstSpawn implements CommandExecutor {
     }
 
     @Override
-    public boolean onCommand(org.bukkit.command.CommandSender sender, org.bukkit.command.Command command, String label, String[] args) {
+    public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
+        CommandSender sender = stack.getSender();
+
+        if (!sender.isOp()) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
+            return;
+        }
+
         if (!plugin.getSpawnConfig().getBoolean("commands.disablefirstspawn.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
-            return true;
+            return;
         }
 
         var config = plugin.getSpawnConfig();
@@ -23,7 +33,5 @@ public class DisableFirstSpawn implements CommandExecutor {
         plugin.saveSpawnConfig();
 
         sender.sendMessage(plugin.getMiniMessage().deserialize("<green>First Spawn has been disabled!"));
-
-        return true;
     }
 }
