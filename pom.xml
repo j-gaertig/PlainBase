@@ -6,7 +6,7 @@
 
     <groupId>de.jgaertig</groupId>
     <artifactId>PlainBase</artifactId>
-    <version>0.0.0-Experimental</version>
+    <version>0.0.1-Experimental</version>
     <packaging>jar</packaging>
 
     <name>PlainBase</name>
