@@ -6,21 +6,14 @@ PlainBase is a lightweight, all-in-one Paper plugin designed to simplify server 
 *   **Modular System:** Enable or disable features via the central `config.yml`.
 *   **Advanced Spawn System:**
     *   Set global spawn points and unique first-join spawn points.
-<<<<<<< HEAD
     *   Flexible coordinate system (supports relative `~` and absolute coordinates).
     *   Automated teleportation on join for new and returning players.
     *   **Commands:**
         *   `/spawn` - Teleports you to the global spawn point.
-=======
-    *   Flexible coordinate system (supports relative and absolute coordinates).
-    *   Automated teleportation on join for new and returning players.
-    *   **Commands:**
->>>>>>> 75e98775ac94ebad43b2f189b8a352c722a4e153
         *   `/setspawn [x y z]` - Sets the global spawn point at your location or specified coordinates.
         *   `/setfirstspawn [x y z]` - Sets the spawn point specifically for new players.
         *   `/disablespawn` - Disables the global spawn system.
         *   `/disablefirstspawn` - Disables the first-join spawn system.
-<<<<<<< HEAD
         *   *Note: Management commands require Operator (OP) status.*
 *   **Join Items System:**
     *   Give players items automatically when they join.
@@ -38,20 +31,7 @@ PlainBase is a lightweight, all-in-one Paper plugin designed to simplify server 
 *   **And more:** We aim to bridge the gap between complexity and usability for many more standard features.
 
 ## Help Me
-This is a **one-man project**, and I am working hard to make server management as possible. Your support means everything!
-=======
-        *   *Note: All commands currently require Operator (OP) status and can be toggled in `spawn.yml`.*
-
-## Planned Features
-*   **Join System:** Customizable Join Items, Join Messages, and MOTD.
-*   **Tablist & Scoreboard:** Integrated TAB management and side menus (Scoreboards).
-*   **Home & Warp System:** Core teleportation management for players.
-*   **Basic Moderation Tools:** Essential commands to keep your server safe.
-*   **And more:** We aim to bridge the gap between complexity and usability for many more standard features.
-
-## Help Me
 This is a **one-man project**, and I am working hard to make server management as simple as possible. Your support means everything!
->>>>>>> 75e98775ac94ebad43b2f189b8a352c722a4e153
 *   **Found a bug?** Please open an [Issue](https://github.com/jgaertig/PlainBase/issues) so I can fix it.
 *   **Like the project?** Please leave a **Star** on GitHub to show your support and help others find it.
 *   **Spread the word!** Feel free to share this project with others who might find it useful.
