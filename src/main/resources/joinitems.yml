@@ -1,0 +1,23 @@
+items:
+  navigator:
+    slot: 0
+    material: COMPASS
+    name: "<gradient:gold:yellow>Compass</gradient>"
+    lore:
+      - "<gray>Rechtsklick zum Öffnen!</gray>"
+    commands:
+      - "lobby"
+  info:
+    slot: 8
+    material: BOOK
+    name: "<blue>Information</blue>"
+    lore:
+      - "<white>Right-Click for Information!</white>"
+    commands:
+      - "say Hello %player%"
+
+# Whether the items should be locked in the inventory, so that they cannot be moved or removed.
+settings:
+  lock-items: true
+
+version: 1.0
