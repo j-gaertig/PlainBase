@@ -9,7 +9,7 @@
 
 ---
 
-[Features](#-current-features) • [Planned](#-planned-features) • [Support](#-support--community) • [Issues](https://github.com/jgaertig/PlainBase/issues)
+[Features](#-current-features) • [Planned](#-planned-features) • [Support](#-support--community) • [Issues](https://github.com/j-gaertig/PlainBase/issues)
 
 </div>
 
