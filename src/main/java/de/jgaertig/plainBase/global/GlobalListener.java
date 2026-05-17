@@ -38,6 +38,13 @@ public class GlobalListener implements Listener {
                 ));
             }
 
+            if (plugin.getJoinMessagesConfig().getDouble("version", 0.0) < plugin.getLatestJoinMessagesV()) {
+                event.getPlayer().sendMessage(plugin.getMiniMessage().deserialize(
+                        "<red><bold>[PlainBase]</bold> Your <yellow>joinmessages.yml</yellow> is outdated! " +
+                                "Please update it to version " + plugin.getLatestJoinMessagesV() + " from GitHub."
+                ));
+            }
+
         }
     }
 }

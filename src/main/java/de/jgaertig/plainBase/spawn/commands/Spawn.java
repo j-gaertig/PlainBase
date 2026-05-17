@@ -51,7 +51,7 @@ public class Spawn implements BasicCommand {
                 (float) config.getDouble(path + ".pitch")
         );
 
-        player.teleport(loc);
+        player.teleportAsync(loc);
 
     }
 }
