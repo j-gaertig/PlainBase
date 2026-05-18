@@ -19,3 +19,5 @@ buildNumber.properties
 # Manuelly added
 Get-ReleasePrompt.ps1
 server/
+.idea/
+PlainBase.iml
