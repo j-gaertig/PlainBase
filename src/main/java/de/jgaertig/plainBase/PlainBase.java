@@ -3,6 +3,7 @@ package de.jgaertig.plainBase;
 import de.jgaertig.plainBase.global.GlobalListener;
 import de.jgaertig.plainBase.global.commands.PlainBaseCommand;
 import de.jgaertig.plainBase.joinItems.JoinItemsListener;
+import de.jgaertig.plainBase.joinMessages.JoinMessagesListener;
 import de.jgaertig.plainBase.spawn.SpawnListener;
 import de.jgaertig.plainBase.spawn.commands.*;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
@@ -11,70 +12,94 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 
 public final class PlainBase extends JavaPlugin {
 
-    private File spawnFile;
-    private FileConfiguration spawnConfig;
-    private File joinItemsFile;
-    private FileConfiguration joinItemsConfig;
-    private File joinMessagesFile;
-    private FileConfiguration joinMessagesConfig;
+    private final Map<String, FileConfiguration> configs = new HashMap<>();
+    private final Map<String, Double> latestVersions = new HashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
-
-    private final double LATEST_CONFIG_V = 1.2;
-    private final double LATEST_SPAWN_V = 1.1;
-    private final double LATEST_JOINITEMS_V = 1.1;
-    private final double LATEST_JOINMESSAGES_V = 1.0;
-
-    public double getLatestConfigV() { return LATEST_CONFIG_V; }
-    public double getLatestSpawnV() { return LATEST_SPAWN_V; }
-    public double getLatestJoinItemsV() { return LATEST_JOINITEMS_V; }
-    public double getLatestJoinMessagesV() { return LATEST_JOINMESSAGES_V; }
 
     @Override
     public void onEnable() {
-
         saveDefaultConfig();
-        getServer().getPluginManager().registerEvents(new GlobalListener(this), this);
+
+        latestVersions.put("config.yml", 1.2);
+        latestVersions.put("spawn.yml", 1.1);
+        latestVersions.put("joinitems.yml", 1.1);
+        latestVersions.put("joinmessages.yml", 1.0);
 
         getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-            var commands = event.registrar();
-            commands.register("plainbase", "", new PlainBaseCommand(this));
-
+            event.registrar().register("plainbase", new PlainBaseCommand(this));
         });
 
-        if (getConfig().getBoolean("modules.spawn", true)) {
-            setupSpawn();
-        }
-        if (getConfig().getBoolean("modules.joinitems", true)) {
-            setupJoinItems();
-        }
-        if (getConfig().getBoolean("modules.joinmessages", true)) {
-            setupJoinMessages();
-        }
+        if (getConfig().getBoolean("modules.spawn", true)) setupSpawn();
+        if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
+        if (getConfig().getBoolean("modules.joinmessages", true)) setupJoinMessages();
 
+        getServer().getPluginManager().registerEvents(new GlobalListener(this), this);
         checkAllConfigVersions();
 
         getLogger().info("Successfully Enabled!");
     }
 
-
     @Override
     public void onDisable() {
-        // Plugin shutdown logic
+        getLogger().info("Successfully Disabled!");
+    }
+
+    public FileConfiguration loadModuleConfig(String fileName) {
+        File file = new File(getDataFolder(), "modules/" + fileName);
+        if (!file.exists()) {
+            file.getParentFile().mkdirs();
+            saveResource("modules/" + fileName, false);
+        }
+
+        try (InputStreamReader reader = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
+            FileConfiguration config = YamlConfiguration.loadConfiguration(reader);
+            configs.put(fileName, config);
+            return config;
+        } catch (IOException e) {
+            getLogger().severe("Could not load " + fileName + "!");
+            return null;
+        }
+    }
+
+    public Map<String, FileConfiguration> getConfigs() {
+        return configs;
+    }
+
+    public Map<String, Double> getLatestVersions() {
+        return latestVersions;
+    }
+
+    public FileConfiguration getSpawnConfig() {
+        return configs.get("spawn.yml");
+    }
+
+    public FileConfiguration getJoinItemsConfig() {
+        return configs.get("joinitems.yml");
+    }
+
+    public FileConfiguration getJoinMessagesConfig() {
+        return configs.get("joinmessages.yml");
     }
 
     private void checkAllConfigVersions() {
-        checkVersion("config.yml", getConfig().getDouble("version", 0.0), LATEST_CONFIG_V);
+        Double configLatest = latestVersions.get("config.yml");
+        if (configLatest != null) {
+            checkVersion("config.yml", getConfig().getDouble("version", 0.0), configLatest);
+        }
 
-        checkVersion("spawn.yml", getSpawnConfig().getDouble("version", 0.0), LATEST_SPAWN_V);
-
-        checkVersion("joinitems.yml", getJoinItemsConfig().getDouble("version", 0.0), LATEST_JOINITEMS_V);
-
-        checkVersion("joinmessages.yml", getJoinMessagesConfig().getDouble("version", 0.0), LATEST_JOINMESSAGES_V);
+        configs.forEach((name, config) -> {
+            Double latest = latestVersions.get(name);
+            if (latest != null) {
+                checkVersion("modules/" + name, config.getDouble("version", 0.0), latest);
+            }
+        });
     }
 
     private void checkVersion(String fileName, double currentV, double latestV) {
@@ -86,102 +111,39 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupSpawn() {
-        // create Spawn Config
-        spawnFile = new File(getDataFolder(), "spawn.yml");
-        if (!spawnFile.exists()) {
-            spawnFile.getParentFile().mkdirs();
-            saveResource("spawn.yml", false);
-        }
-        try (java.io.InputStreamReader reader = new java.io.InputStreamReader(
-                new java.io.FileInputStream(spawnFile), java.nio.charset.StandardCharsets.UTF_8)) {
-            spawnConfig = YamlConfiguration.loadConfiguration(reader);
-        } catch (IOException e) {
-            getLogger().severe("Could not load spawn.yml in UTF-8!");
-        }
-
-
-        // register Listeners
+        loadModuleConfig("spawn.yml");
         getServer().getPluginManager().registerEvents(new SpawnListener(this), this);
 
-
-        // register Commands
         getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
             var commands = event.registrar();
-
-            commands.register("spawn", "Teleport to spawn", new Spawn(this));
-            commands.register("setspawn", "Set the spawn location", new SetSpawn(this));
-            commands.register("setfirstspawn", "Set the first spawn", new SetFirstSpawn(this));
-            commands.register("disablespawn", "Disable spawn", new DisableSpawn(this));
-            commands.register("disablefirstspawn", "Disable first spawn", new DisableFirstSpawn(this));
+            commands.register("spawn", new Spawn(this));
+            commands.register("setspawn", new SetSpawn(this));
+            commands.register("setfirstspawn", new SetFirstSpawn(this));
+            commands.register("disablespawn", new DisableSpawn(this));
+            commands.register("disablefirstspawn", new DisableFirstSpawn(this));
         });
-    }
-
-    public FileConfiguration getSpawnConfig() {
-        return spawnConfig;
     }
 
     public void saveSpawnConfig() {
         try {
-            spawnConfig.save(spawnFile);
+            FileConfiguration config = getSpawnConfig();
+            if (config != null) {
+                config.save(new File(getDataFolder(), "modules/spawn.yml"));
+            }
         } catch (IOException e) {
-            getLogger().severe("Could not save spawn.yml in UTF-8!");
+            getLogger().severe("Could not save spawn.yml!");
         }
     }
 
-
     public void setupJoinItems() {
-        // create JoinItems Config
-        joinItemsFile = new File(getDataFolder(), "joinitems.yml");
-        if (!joinItemsFile.exists()) {
-            joinItemsFile.getParentFile().mkdirs();
-            saveResource("joinitems.yml", false);
-        }
-
-        try (java.io.InputStreamReader reader = new java.io.InputStreamReader(
-                new java.io.FileInputStream(joinItemsFile), java.nio.charset.StandardCharsets.UTF_8)) {
-            joinItemsConfig = YamlConfiguration.loadConfiguration(reader);
-        } catch (IOException e) {
-            getLogger().severe("Could not load joinitems.yml in UTF-8!");
-        }
-
-        // register Listeners
+        loadModuleConfig("joinitems.yml");
         getServer().getPluginManager().registerEvents(new JoinItemsListener(this), this);
     }
 
-    public FileConfiguration getJoinItemsConfig() {
-        return joinItemsConfig;
-    }
-
-
     public void setupJoinMessages() {
-        // create Join Messages Config
-        joinMessagesFile = new File(getDataFolder(), "joinmessages.yml");
-        if (!joinMessagesFile.exists()) {
-            joinMessagesFile.getParentFile().mkdirs();
-            saveResource("joinmessages.yml", false);
-        }
-        try (java.io.InputStreamReader reader = new java.io.InputStreamReader(
-                new java.io.FileInputStream(joinMessagesFile), java.nio.charset.StandardCharsets.UTF_8)) {
-            joinMessagesConfig = YamlConfiguration.loadConfiguration(reader);
-        } catch (IOException e) {
-            getLogger().severe("Could not load joinmessages.yml in UTF-8!");
-        }
-
-
-        // register Listeners
-
-
-        // register Commands
-        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-            var commands = event.registrar();
-
-        });
+        loadModuleConfig("joinmessages.yml");
+        getServer().getPluginManager().registerEvents(new JoinMessagesListener(this), this);
     }
-
-    public FileConfiguration getJoinMessagesConfig() {
-        return joinMessagesConfig;
-    }
-
 
     public MiniMessage getMiniMessage() {
         return miniMessage;
