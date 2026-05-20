@@ -51,6 +51,6 @@ public class SpawnListener implements Listener {
                 (float) config.getDouble(path + ".yaw"),
                 (float) config.getDouble(path + ".pitch")
         );
-        player.teleport(loc);
+        player.teleportAsync(loc);
     }
 }

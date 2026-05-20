@@ -1,7 +1,10 @@
 package de.jgaertig.plainBase;
 
 import de.jgaertig.plainBase.global.GlobalListener;
+import de.jgaertig.plainBase.global.commands.PlainBaseCommand;
 import de.jgaertig.plainBase.joinItems.JoinItemsListener;
+import de.jgaertig.plainBase.messages.BroadcastManager;
+import de.jgaertig.plainBase.messages.MessagesListener;
 import de.jgaertig.plainBase.spawn.SpawnListener;
 import de.jgaertig.plainBase.spawn.commands.*;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
@@ -10,56 +13,119 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 
 public final class PlainBase extends JavaPlugin {
 
-    private File spawnFile;
-    private FileConfiguration spawnConfig;
-    private File joinItemsFile;
-    private FileConfiguration joinItemsConfig;
+    private final Map<String, FileConfiguration> configs = new HashMap<>();
+    private final Map<String, Double> latestVersions = new HashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
+    private BroadcastManager broadcastManager;
 
-    private final double LATEST_CONFIG_V = 1.1;
-    private final double LATEST_SPAWN_V = 1.1;
-    private final double LATEST_JOINITEMS_V = 1.0;
-
-    public double getLatestConfigV() { return LATEST_CONFIG_V; }
-    public double getLatestSpawnV() { return LATEST_SPAWN_V; }
-    public double getLatestJoinItemsV() { return LATEST_JOINITEMS_V; }
+    private boolean commandsRegistered = false;
 
     @Override
     public void onEnable() {
-
         saveDefaultConfig();
+
+        latestVersions.put("config.yml", 1.2);
+        latestVersions.put("spawn.yml", 1.2);
+        latestVersions.put("joinitems.yml", 1.1);
+        latestVersions.put("messages.yml", 1.0);
+
+        if (!commandsRegistered) {
+            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+                var r = event.registrar();
+                r.register("plainbase", new PlainBaseCommand(this));
+            });
+        }
+
+        reloadModules();
+
         getServer().getPluginManager().registerEvents(new GlobalListener(this), this);
-
-        if (getConfig().getBoolean("modules.spawn", true)) {
-            setupSpawn();
-        }
-
-        if (getConfig().getBoolean("modules.joinitems", true)) {
-            setupJoinItems();
-        }
-
         checkAllConfigVersions();
+
+        commandsRegistered = true;
 
         getLogger().info("Successfully Enabled!");
     }
 
-
     @Override
     public void onDisable() {
-        // Plugin shutdown logic
+        stopModules();
+
+        getLogger().info("Successfully Disabled!");
+    }
+
+    public void reloadModules() {
+        stopModules();
+        reloadConfig();
+
+        if (getConfig().getBoolean("modules.spawn", true)) setupSpawn();
+        if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
+        if (getConfig().getBoolean("modules.messages", true)) setupMessages();
+    }
+
+    public void stopModules() {
+        if (broadcastManager != null) {
+            broadcastManager.stopBroadcasts();
+        }
+
+        org.bukkit.event.HandlerList.unregisterAll(this);
+    }
+
+    public FileConfiguration loadModuleConfig(String fileName) {
+        File file = new File(getDataFolder(), "modules/" + fileName);
+        if (!file.exists()) {
+            file.getParentFile().mkdirs();
+            saveResource("modules/" + fileName, false);
+        }
+
+        try (InputStreamReader reader = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
+            FileConfiguration config = YamlConfiguration.loadConfiguration(reader);
+            configs.put(fileName, config);
+            return config;
+        } catch (IOException e) {
+            getLogger().severe("Could not load " + fileName + "!");
+            return null;
+        }
+    }
+
+    public Map<String, FileConfiguration> getConfigs() {
+        return configs;
+    }
+
+    public Map<String, Double> getLatestVersions() {
+        return latestVersions;
+    }
+
+    public FileConfiguration getSpawnConfig() {
+        return configs.get("spawn.yml");
+    }
+
+    public FileConfiguration getJoinItemsConfig() {
+        return configs.get("joinitems.yml");
+    }
+
+    public FileConfiguration getMessagesConfig() {
+        return configs.get("messages.yml");
     }
 
     private void checkAllConfigVersions() {
-        checkVersion("config.yml", getConfig().getDouble("version", 0.0), LATEST_CONFIG_V);
+        Double configLatest = latestVersions.get("config.yml");
+        if (configLatest != null) {
+            checkVersion("config.yml", getConfig().getDouble("version", 0.0), configLatest);
+        }
 
-        checkVersion("spawn.yml", getSpawnConfig().getDouble("version", 0.0), LATEST_SPAWN_V);
-
-        checkVersion("joinitems.yml", getJoinItemsConfig().getDouble("version", 0.0), LATEST_JOINITEMS_V);
+        configs.forEach((name, config) -> {
+            Double latest = latestVersions.get(name);
+            if (latest != null) {
+                checkVersion("modules/" + name, config.getDouble("version", 0.0), latest);
+            }
+        });
     }
 
     private void checkVersion(String fileName, double currentV, double latestV) {
@@ -71,77 +137,44 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupSpawn() {
-        // create Spawn Config
-        spawnFile = new File(getDataFolder(), "spawn.yml");
-        if (!spawnFile.exists()) {
-            spawnFile.getParentFile().mkdirs();
-            saveResource("spawn.yml", false);
-        }
-        spawnConfig = YamlConfiguration.loadConfiguration(spawnFile);
-
-
-        // register Listeners
+        loadModuleConfig("spawn.yml");
         getServer().getPluginManager().registerEvents(new SpawnListener(this), this);
 
-
-        // register Commands
-        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-            var commands = event.registrar();
-
-            commands.register("spawn", "Teleport to spawn", new Spawn(this));
-            commands.register("setspawn", "Set the spawn location", new SetSpawn(this));
-            commands.register("setfirstspawn", "Set the first spawn", new SetFirstSpawn(this));
-            commands.register("disablespawn", "Disable spawn", new DisableSpawn(this));
-            commands.register("disablefirstspawn", "Disable first spawn", new DisableFirstSpawn(this));
-        });
-    }
-
-    public FileConfiguration getSpawnConfig() {
-        return spawnConfig;
+        if (!commandsRegistered) {
+            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+                var r = event.registrar();
+                r.register("spawn", new Spawn(this));
+                r.register("setspawn", new SetSpawn(this));
+                r.register("setfirstspawn", new SetFirstSpawn(this));
+                r.register("disablespawn", new DisableSpawn(this));
+                r.register("disablefirstspawn", new DisableFirstSpawn(this));
+            });
+        }
     }
 
     public void saveSpawnConfig() {
         try {
-            spawnConfig.save(spawnFile);
+            FileConfiguration config = getSpawnConfig();
+            if (config != null) {
+                config.save(new File(getDataFolder(), "modules/spawn.yml"));
+            }
         } catch (IOException e) {
-            getLogger().severe("Konnte spawn.yml nicht speichern!");
+            getLogger().severe("Could not save spawn.yml!");
         }
     }
-
 
     public void setupJoinItems() {
-        // create JoinItems Config
-        joinItemsFile = new File(getDataFolder(), "joinitems.yml");
-        if (!joinItemsFile.exists()) {
-            joinItemsFile.getParentFile().mkdirs();
-            saveResource("joinitems.yml", false);
-        }
-        joinItemsConfig = YamlConfiguration.loadConfiguration(joinItemsFile);
-
-
-        // register Listeners
+        loadModuleConfig("joinitems.yml");
         getServer().getPluginManager().registerEvents(new JoinItemsListener(this), this);
-
-
-        // register Commands
-        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-            var commands = event.registrar();
-
-        });
     }
 
-    public FileConfiguration getJoinItemsConfig() {
-        return joinItemsConfig;
-    }
+    public void setupMessages() {
+        loadModuleConfig("messages.yml");
+        getServer().getPluginManager().registerEvents(new MessagesListener(this), this);
 
-    public void saveJoinItemsConfig() {
-        try {
-            joinItemsConfig.save(joinItemsFile);
-        } catch (IOException e) {
-            getLogger().severe("Konnte joinitems.yml nicht speichern!");
-        }
+        broadcastManager = new BroadcastManager(this);
+        broadcastManager.startBroadcasts();
     }
-
 
     public MiniMessage getMiniMessage() {
         return miniMessage;

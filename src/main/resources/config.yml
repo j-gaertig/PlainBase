@@ -2,5 +2,7 @@
 modules:
   spawn: true # More Settings in spawn.yml
   joinitems: true # More Settings in joinitems.yml
+  messages: true # More Settings in messages.yml
 
-version: 1.1
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 1.2

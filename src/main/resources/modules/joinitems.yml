@@ -1,0 +1,98 @@
+# Example configuration for the join items.
+# You can change the items, their position, name, lore and commands as you like.
+# You can also add more items if you want to.
+
+items:
+  spawn-teleporter:
+    slot: 0
+    material: RED_BED
+    name: "<red><bold>Spawn <gray>(Click)"
+    lore:
+      - "<gray>Teleports you back"
+      - "<gray>to the spawn."
+    commands:
+      - "" # Your Command here (e.g. "spawn" (this Command requires the spawn module))
+    flags:
+      - "no-drop"
+      - "no-inventory-move"
+      - "no-creative-move"
+      - "no-drag"
+      - "no-swap"
+      - "re-give-after-/clear"
+      - "re-give-after-death"
+
+  minigames-selector:
+    slot: 2
+    material: IRON_DOOR
+    name: "<green><bold>Minigames <gray>(Click)"
+    lore:
+      - "<gray>Shows you a list of"
+      - "<gray>available minigames."
+    commands:
+      - "" # Your Command here
+    flags:
+      - "no-drop"
+      - "no-inventory-move"
+      - "no-creative-move"
+      - "no-drag"
+      - "no-swap"
+      - "re-give-after-/clear"
+      - "re-give-after-death"
+
+  profile:
+    slot: 4
+    material: PLAYER_HEAD
+    name: "<yellow>Your Profile<gray>(Click)"
+    lore:
+      - "<gray><bold>Click for stats!</gray>"
+    skull-owner: "%player%" # Choose the player head to be the head of the player who joined
+    commands:
+      - "" # Your Command here
+    flags:
+      - "no-drop"
+      - "no-inventory-move"
+      - "no-creative-move"
+      - "no-drag"
+      - "no-swap"
+      - "re-give-after-/clear"
+      - "re-give-after-death"
+
+  pakour:
+    slot: 6
+    material: WHITE_WOOL
+    name: "<green><bold>Parkour <gray>(Click)"
+    lore:
+      - "<gray>Click to start the parkour!"
+    commands:
+      - "" # Your Command here
+    flags:
+      - "no-drop"
+      - "no-inventory-move"
+      - "no-creative-move"
+      - "no-drag"
+      - "no-swap"
+      - "re-give-after-/clear"
+      - "re-give-after-death"
+
+  base-navigator:
+    slot: 8
+    material: COMPASS
+    name: "<white><bold>Navigator <gray>(Click)"
+    lore:
+      - ""
+    commands:
+      - "" # Your Command here
+    flags:
+      - "no-drop"
+      - "no-inventory-move"
+      - "no-creative-move"
+      - "no-drag"
+      - "no-swap"
+      - "re-give-after-/clear"
+      - "re-give-after-death"
+
+settings:
+  op-bypass: false
+
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 1.1

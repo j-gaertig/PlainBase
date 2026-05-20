@@ -1,0 +1,25 @@
+# Join & Quit Messages
+messages:
+  join: "<bold><gray>[<green>+</green>] <white>%player%</white>"
+  first-join: "<gradient:gold:yellow>Welcome!</gradient> <white>%player%</white>"
+  quit: "<gray>[<red>-</red>] <white>%player%</white>"
+
+# Welcome Message of the Day (MOTD)
+motd:
+  enabled: true
+  lines:
+    - "<gradient:gold:yellow>Welcome to our server!</gradient>"
+    - ""
+
+# Broadcast Messages
+broadcasts:
+  enabled: true
+  message1:
+    text: "<yellow>Report unserious players by using /report</yellow>"
+    cooldown: 300 # in seconds
+  message2:
+    text: "<yellow>Be nice and don't insult anyone in the chat!</yellow>"
+    cooldown: 60 # in seconds
+
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 1.0
