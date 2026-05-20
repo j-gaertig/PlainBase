@@ -23,6 +23,11 @@ public class Spawn implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
+        if (!plugin.getConfig().getBoolean("modules.spawn", true)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
+            return;
+        }
+
         if (!plugin.getSpawnConfig().getBoolean("commands.spawn.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;

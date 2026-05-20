@@ -1,84 +1,104 @@
-<div align="center">
+# <p align="center">🛠️ PlainBase</p>
 
-# 🛠️ PlainBase
-**The minimalist all-in-one solution for your Paper server.**
+<p align="center">
+  <a href="https://papermc.io"><img src="https://img.shields.io/badge/Platform-Paper%20%7C%20Purpur%20%7C%20Folia-blue.svg" alt="Platform"></a>
+  <a href="https://github.com/j-gaertig/PlainBase/releases/latest"><img src="https://img.shields.io/github/v/tag/j-gaertig/PlainBase?label=Version&color=orange" alt="Version"></a>
+  <a href="https://github.com/j-gaertig/PlainBase/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
+</p>
 
-[![Build Status](https://img.shields.io/badge/Platform-Paper-blue.svg)](https://papermc.io)
-[![Version](https://img.shields.io/github/v/tag/j-gaertig/PlainBase?label=Version&color=orange)](https://github.com/j-gaertig/PlainBase/releases/latest)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+<p align="center">
+  <strong>PlainBase</strong> is a lightweight, all-in-one Paper plugin designed to simplify server management.
+  <br>
+  Forget dozens of plugins – get the essentials in one clean, modular framework.
+</p>
+
+<p align="center">
+  <a href="#current-features">Features</a> •
+  <a href="#commands">Commands</a> •
+  <a href="#planned">Planned</a> •
+  <a href="#support">Support</a>
+</p>
 
 ---
 
-[Features](#-current-features) • [Planned](#-planned-features) • [Support](#-support--community) • [Issues](https://github.com/j-gaertig/PlainBase/issues)
+## 🚀 <a name="current-features"></a>Current Features
 
-</div>
-
-**PlainBase** is a lightweight, all-in-one Paper plugin designed to simplify server management. Instead of juggling dozens of different plugins for basic features like EssentialsX, ItemJoin, or TAB, PlainBase combines these essential functions into a single, easy-to-use framework while maintaining a clean and minimalist approach.
-
----
-
-## 🚀 Current Features
-
-### ⚙️ Core System
-*   **🧩 Modular Design:** Enable only what you need. Keep your server performance-focused by disabling unused modules via `config.yml`.
-*   **📡 Intelligence:** Automated notifications for OPs if configuration files are outdated, ensuring you always have the latest options.
+### 🧩 Core System
+*   **Modular Architecture:** Enable only what you need (Spawn, JoinItems, Messages) via the central `config.yml`.
+*   **⚡ High Performance:** Built from the ground up for modern Paper servers with native Folia and Purpur support.
 
 ### 📍 Advanced Spawn System
 <details open>
   <summary><b>View Module Details & Commands</b></summary>
-  <br>
-  
-  Powerful spawn management that handles both new and returning players with precision.
+  <ul>
+    <li>Set global and unique first-join spawn points.</li>
+    <li>Supports <b>relative coordinates</b> (<code>~</code>) for precise placement.</li>
+    <li>Automated teleportation on join for new and returning players.</li>
+  </ul>
 
-  *   **Dual-Spawn Support:** Set a global spawn and a unique landing spot for first-timers.
-  *   **Smart Coordinates:** Full support for relative `~` coordinates—set spawns without moving your character.
-  *   **Auto-Teleport:** Optional join-teleportation to keep your world entry organized.
-
-  #### ⌨️ Commands
+  #### Spawn Commands
   | Command | Description | Permission |
   | :--- | :--- | :--- |
-  | `/spawn` | Teleports you to the global spawn point. | *Everyone* |
+  | `/spawn` | Teleports you to the global spawn. | `Everyone` |
   | `/setspawn [x y z]` | Sets the global spawn point. | `OP` |
-  | `/setfirstspawn [x y z]` | Sets the spawn for new players. | `OP` |
+  | `/setfirstspawn [x y z]` | Sets the first-join spawn point. | `OP` |
   | `/disablespawn` | Disables the global spawn system. | `OP` |
   | `/disablefirstspawn` | Disables the first-join spawn system. | `OP` |
 </details>
 
 ### 🎒 Join Items System
-<details>
-  <summary><b>View Module Details & Features</b></summary>
-  <br>
+<details open>
+  <summary><b>View Module Details</b></summary>
+  <ul>
+    <li>Give players items automatically when they join.</li>
+    <li><b>MiniMessage Support:</b> Use modern formatting (colors, gradients, decorations).</li>
+    <li><b>Custom Actions:</b> Execute commands on click (supports <code>%player%</code>).</li>
+    <li><b>Protection:</b> Prevent moving, dropping, or swapping items.</li>
+    <li><b>Skull Support:</b> Custom heads (e.g., player's own head).</li>
+  </ul>
+</details>
 
-  Engage your players from the second they land with interactive hotbar items.
-
-  *   **🎨 MiniMessage Power:** Create stunning item names and lore with gradients, RGB, and hover effects.
-  *   **🖱️ Interactive:** Assign custom commands to items (supports `%player%` placeholder).
-  *   **🔒 Inventory Lock:** Protect essential items from being dropped, moved, or lost.
-  *   **📄 Easy Config:** Manage everything in the dedicated `joinitems.yml`.
+### 💬 Messages & Broadcasts
+<details open>
+  <summary><b>View Module Details</b></summary>
+  <ul>
+    <li><b>Join/Quit:</b> Fully customizable entry and exit messages.</li>
+    <li><b>MOTD:</b> Display a welcome message when players join.</li>
+    <li><b>Auto-Broadcasts:</b> Send periodic announcements with individual cooldowns.</li>
+    <li><b>Formatting:</b> Full MiniMessage support for all messages.</li>
+  </ul>
 </details>
 
 ---
 
-## 📅 Planned Features
+## ⌨️ <a name="commands"></a>General Commands
 
-*   **✨ Join Enhancements:** Customizable Join/Quit Messages and a feature-rich MOTD.
-*   **📊 Tablist & Side Menus:** Integrated TAB-list customization and Scoreboards (Sidebars).
-*   **🏠 Home & Warp System:** Core teleportation management for players.
-*   **👮 Basic Moderation Tools:** Essential commands to keep your server safe.
-*   **📈 More to come:** Bridging the gap between complexity and usability.
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/plainbase reload` | Reloads all configurations and modules instantly. | `OP` |
+| `/plainbase update` | Checks Modrinth for the latest compatible version. | `OP` |
+| `/plainbase toggle <module>` | Instantly enables or disables a specific module. | `OP` |
+
+---
+
+## 📅 <a name="planned"></a>Planned Features
+
+*   **📊 Tablist & Side Menus:** Integrated TAB-list and Scoreboards/Sidebars.
+*   **🏠 Home & Warp System:** Allow players to save and visit private or public locations.
+*   **👮 Basic Moderation:** Essential tools like kicks, bans, and muting.
+*   **⚙️ GUI Management:** Manage all modules through an intuitive in-game menu.
+*   **➕ And more...** We constantly evaluate and add features that provide real value.
 
 ---
 
-## 💎 Support & Community
+## 💎 <a name="support"></a>Support & Community
 
-This is a **one-man project**. I'm building this to make server management easier for everyone. If you find it useful, there are several ways to support the development:
+This is a **one-man project**, and I am working hard to make server management as simple as possible. Your support means everything!
 
-*   **🐛 Bug Reports:** Found something wrong? Open an [Issue](https://github.com/jgaertig/PlainBase/issues).
-*   **⭐ GitHub Star:** If you like the project, please leave a star - it helps more than you think!
-*   **❤️ Modrinth Heart:** Follow the project on [Modrinth](https://modrinth.com/plugin/plainbase) and show some love!
-*   **📢 Share:** Tell your friends or fellow server owners about PlainBase.
+*   **🐛 Issues?** Found a bug? Open an [Issue](https://github.com/jgaertig/PlainBase/issues).
+*   **⭐ GitHub:** Leave a **Star** if you like the project!
+*   **❤️ Modrinth:** Follow on [Modrinth](https://modrinth.com/plugin/plainbase) and leave a **Heart**!
+*   **📢 Share:** Tell your friends about PlainBase!
 
 ---
-<div align="center">
-  <sub>Built with ❤️ by j-gaertig</sub>
-</div>
+<p align="center">Built with ❤️ by j-gaertig</p>

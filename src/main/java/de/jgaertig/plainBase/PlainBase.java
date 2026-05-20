@@ -3,7 +3,8 @@ package de.jgaertig.plainBase;
 import de.jgaertig.plainBase.global.GlobalListener;
 import de.jgaertig.plainBase.global.commands.PlainBaseCommand;
 import de.jgaertig.plainBase.joinItems.JoinItemsListener;
-import de.jgaertig.plainBase.joinMessages.JoinMessagesListener;
+import de.jgaertig.plainBase.messages.BroadcastManager;
+import de.jgaertig.plainBase.messages.MessagesListener;
 import de.jgaertig.plainBase.spawn.SpawnListener;
 import de.jgaertig.plainBase.spawn.commands.*;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
@@ -22,33 +23,58 @@ public final class PlainBase extends JavaPlugin {
     private final Map<String, FileConfiguration> configs = new HashMap<>();
     private final Map<String, Double> latestVersions = new HashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
+    private BroadcastManager broadcastManager;
+
+    private boolean commandsRegistered = false;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
 
         latestVersions.put("config.yml", 1.2);
-        latestVersions.put("spawn.yml", 1.1);
+        latestVersions.put("spawn.yml", 1.2);
         latestVersions.put("joinitems.yml", 1.1);
-        latestVersions.put("joinmessages.yml", 1.0);
+        latestVersions.put("messages.yml", 1.0);
 
-        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-            event.registrar().register("plainbase", new PlainBaseCommand(this));
-        });
+        if (!commandsRegistered) {
+            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+                var r = event.registrar();
+                r.register("plainbase", new PlainBaseCommand(this));
+            });
+        }
 
-        if (getConfig().getBoolean("modules.spawn", true)) setupSpawn();
-        if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
-        if (getConfig().getBoolean("modules.joinmessages", true)) setupJoinMessages();
+        reloadModules();
 
         getServer().getPluginManager().registerEvents(new GlobalListener(this), this);
         checkAllConfigVersions();
+
+        commandsRegistered = true;
 
         getLogger().info("Successfully Enabled!");
     }
 
     @Override
     public void onDisable() {
+        stopModules();
+
         getLogger().info("Successfully Disabled!");
+    }
+
+    public void reloadModules() {
+        stopModules();
+        reloadConfig();
+
+        if (getConfig().getBoolean("modules.spawn", true)) setupSpawn();
+        if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
+        if (getConfig().getBoolean("modules.messages", true)) setupMessages();
+    }
+
+    public void stopModules() {
+        if (broadcastManager != null) {
+            broadcastManager.stopBroadcasts();
+        }
+
+        org.bukkit.event.HandlerList.unregisterAll(this);
     }
 
     public FileConfiguration loadModuleConfig(String fileName) {
@@ -84,8 +110,8 @@ public final class PlainBase extends JavaPlugin {
         return configs.get("joinitems.yml");
     }
 
-    public FileConfiguration getJoinMessagesConfig() {
-        return configs.get("joinmessages.yml");
+    public FileConfiguration getMessagesConfig() {
+        return configs.get("messages.yml");
     }
 
     private void checkAllConfigVersions() {
@@ -114,14 +140,16 @@ public final class PlainBase extends JavaPlugin {
         loadModuleConfig("spawn.yml");
         getServer().getPluginManager().registerEvents(new SpawnListener(this), this);
 
-        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-            var commands = event.registrar();
-            commands.register("spawn", new Spawn(this));
-            commands.register("setspawn", new SetSpawn(this));
-            commands.register("setfirstspawn", new SetFirstSpawn(this));
-            commands.register("disablespawn", new DisableSpawn(this));
-            commands.register("disablefirstspawn", new DisableFirstSpawn(this));
-        });
+        if (!commandsRegistered) {
+            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+                var r = event.registrar();
+                r.register("spawn", new Spawn(this));
+                r.register("setspawn", new SetSpawn(this));
+                r.register("setfirstspawn", new SetFirstSpawn(this));
+                r.register("disablespawn", new DisableSpawn(this));
+                r.register("disablefirstspawn", new DisableFirstSpawn(this));
+            });
+        }
     }
 
     public void saveSpawnConfig() {
@@ -140,9 +168,12 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().registerEvents(new JoinItemsListener(this), this);
     }
 
-    public void setupJoinMessages() {
-        loadModuleConfig("joinmessages.yml");
-        getServer().getPluginManager().registerEvents(new JoinMessagesListener(this), this);
+    public void setupMessages() {
+        loadModuleConfig("messages.yml");
+        getServer().getPluginManager().registerEvents(new MessagesListener(this), this);
+
+        broadcastManager = new BroadcastManager(this);
+        broadcastManager.startBroadcasts();
     }
 
     public MiniMessage getMiniMessage() {

@@ -39,10 +39,16 @@ public class PlainBaseCommand implements BasicCommand {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         "<gray>The module <yellow>" + moduleName + "</yellow> has been " + statusColor + "<gray>."
                 ));
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<italic><gray>Please restart the server for the changes to take effect."));
+                plugin.reloadModules();
             } else {
                 sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
             }
+        }
+
+        if (args.length >= 1 && args[0].equalsIgnoreCase("reload")) {
+
+            plugin.reloadModules();
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<green>Config reloaded and modules updated!"));
         }
 
         if (args.length >= 1 && args[0].equalsIgnoreCase("update")) {
@@ -79,12 +85,12 @@ public class PlainBaseCommand implements BasicCommand {
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
         if (args.length == 0) {
-            return List.of("toggle", "update");
+            return List.of("toggle", "update", "reload");
         }
 
         if (args.length == 1) {
             String input = args[0].toLowerCase();
-            return Stream.of("toggle", "update")
+            return Stream.of("toggle", "update", "reload")
                     .filter(s -> s.startsWith(input))
                     .toList();
         }
