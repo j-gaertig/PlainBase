@@ -92,7 +92,7 @@ items:
       - "re-give-after-death"
 
 settings:
-  op-bypass: true
+  op-bypass: false
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
 version: 1.1

@@ -6,17 +6,17 @@ messages:
 
 # Welcome Message of the Day (MOTD)
 motd:
-  enabled: false
+  enabled: true
   lines:
     - "<gradient:gold:yellow>Welcome to our server!</gradient>"
     - ""
 
 # Broadcast Messages
 broadcasts:
-  enabled: false
+  enabled: true
   message1:
     text: "<yellow>Report unserious players by using /report</yellow>"
-    cooldown: 500 # in seconds
+    cooldown: 300 # in seconds
   message2:
     text: "<yellow>Be nice and don't insult anyone in the chat!</yellow>"
     cooldown: 60 # in seconds
