@@ -1,0 +1,82 @@
+tpa:
+  enabled: true
+  request_timeout: 300 # in seconds
+  counter:
+    enabled: true
+    seconds: 3 # in seconds
+    # You can use "move", "damage", "death", "interact" or leave it empty for no cancelation
+    cancel_on:
+      - move
+      - damage
+      - death
+      - interact
+  commands:
+      tpa:
+        enabled: true
+      tpahere:
+        enabled: true
+      tpaccept:
+        enabled: true
+      tpdeny:
+        enabled: true
+      tpauto:
+        enabled: true
+      tpacancel:
+        enabled: true
+
+rtp:
+  enabled: true
+
+  cooldown: 60 # in seconds
+
+  counter:
+    enabled: true
+    seconds: 3 # in seconds
+    # You can use "move", "damage", "death", "interact" or leave it empty for no cancelation
+    cancel_on:
+      - move
+      - damage
+      - death
+      - interact
+
+  blacklist:
+    enabled: true
+    biomes:
+      - ocean
+    blocks:
+      - WATER
+      - LAVA
+      - KELP
+      - KELP_PLANT
+      - SEAGRASS
+      - CACTUS
+      - MAGMA_BLOCK
+      - CAMPFIRE
+      - SOUL_CAMPFIRE
+      - FIRE
+      - SOUL_FIRE
+      - LAVA_CAULDRON
+      - WATER_CAULDRON
+      - POWDER_SNOW_CAULDRON
+      - SWEET_BERRY_BUSH
+      - WITHER_ROSE
+      - POWDER_SNOW
+      - AIR
+      - CAVE_AIR
+      - VOID_AIR
+      - BEDROCK
+      - BARRIER
+      - STRUCTURE_VOID
+      - PORTAL
+      - END_PORTAL
+      - SAND
+      - RED_SAND
+      - GRAVEL
+      - POINTED_DRIPSTONE
+
+  commands:
+      rtp:
+        enabled: true
+
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 1.0

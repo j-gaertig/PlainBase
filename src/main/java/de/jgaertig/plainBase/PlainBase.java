@@ -7,6 +7,11 @@ import de.jgaertig.plainBase.messages.BroadcastManager;
 import de.jgaertig.plainBase.messages.MessagesListener;
 import de.jgaertig.plainBase.spawn.SpawnListener;
 import de.jgaertig.plainBase.spawn.commands.*;
+import de.jgaertig.plainBase.teleport.rtp.RTPManager;
+import de.jgaertig.plainBase.teleport.rtp.commands.RTPCommand;
+import de.jgaertig.plainBase.teleport.tpa.TPAManager;
+import de.jgaertig.plainBase.teleport.TeleportListener;
+import de.jgaertig.plainBase.teleport.tpa.commands.*;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.configuration.file.FileConfiguration;
@@ -24,6 +29,8 @@ public final class PlainBase extends JavaPlugin {
     private final Map<String, Double> latestVersions = new HashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     private BroadcastManager broadcastManager;
+    private TPAManager tpaManager;
+    private RTPManager rtpManager;
 
     private boolean commandsRegistered = false;
 
@@ -31,10 +38,11 @@ public final class PlainBase extends JavaPlugin {
     public void onEnable() {
         saveDefaultConfig();
 
-        latestVersions.put("config.yml", 1.2);
+        latestVersions.put("config.yml", 1.3);
         latestVersions.put("spawn.yml", 1.2);
         latestVersions.put("joinitems.yml", 1.1);
         latestVersions.put("messages.yml", 1.0);
+        latestVersions.put("teleport.yml", 1.0);
 
         if (!commandsRegistered) {
             getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
@@ -67,6 +75,7 @@ public final class PlainBase extends JavaPlugin {
         if (getConfig().getBoolean("modules.spawn", true)) setupSpawn();
         if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
         if (getConfig().getBoolean("modules.messages", true)) setupMessages();
+        if (getConfig().getBoolean("modules.teleport", true)) setupTeleport();
     }
 
     public void stopModules() {
@@ -112,6 +121,10 @@ public final class PlainBase extends JavaPlugin {
 
     public FileConfiguration getMessagesConfig() {
         return configs.get("messages.yml");
+    }
+
+    public FileConfiguration getTeleportConfig() {
+        return configs.get("teleport.yml");
     }
 
     private void checkAllConfigVersions() {
@@ -174,6 +187,37 @@ public final class PlainBase extends JavaPlugin {
 
         broadcastManager = new BroadcastManager(this);
         broadcastManager.startBroadcasts();
+    }
+
+    public void setupTeleport() {
+        loadModuleConfig("teleport.yml");
+
+        tpaManager = new TPAManager(this);
+        rtpManager = new RTPManager(this);
+
+        getServer().getPluginManager().registerEvents(new TeleportListener(this), this);
+
+        if (!commandsRegistered) {
+            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+                var r = event.registrar();
+                r.register("tpa", new TPACommand(this));
+                r.register("tpaccept", new TPACCEPTCommand(this));
+                r.register("tpahere", new TPAHERECommand(this));
+                r.register("tpauto", new TPAUTOCommand(this));
+                r.register("tpdeny", new TPDENYCommand(this));
+                r.register("tpacancel", new TPACANCELCommand(this));
+
+                r.register("rtp", new RTPCommand(this));
+            });
+        }
+    }
+
+    public TPAManager getTPAManager() {
+        return tpaManager;
+    }
+
+    public RTPManager getRTPManager() {
+        return rtpManager;
     }
 
     public MiniMessage getMiniMessage() {

@@ -1,8 +1,9 @@
 # Module Activation
 modules:
-  spawn: true # More Settings in spawn.yml
-  joinitems: true # More Settings in joinitems.yml
-  messages: true # More Settings in messages.yml
+  spawn: false # More Settings in spawn.yml
+  joinitems: false # More Settings in joinitems.yml
+  messages: false # More Settings in messages.yml
+  teleport: false # More Settings in teleport.yml
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.2
+version: 1.3
