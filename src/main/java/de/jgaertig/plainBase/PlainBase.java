@@ -7,8 +7,10 @@ import de.jgaertig.plainBase.messages.BroadcastManager;
 import de.jgaertig.plainBase.messages.MessagesListener;
 import de.jgaertig.plainBase.spawn.SpawnListener;
 import de.jgaertig.plainBase.spawn.commands.*;
+import de.jgaertig.plainBase.teleport.rtp.RTPManager;
+import de.jgaertig.plainBase.teleport.rtp.commands.RTPCommand;
 import de.jgaertig.plainBase.teleport.tpa.TPAManager;
-import de.jgaertig.plainBase.teleport.tpa.TPAListener;
+import de.jgaertig.plainBase.teleport.TeleportListener;
 import de.jgaertig.plainBase.teleport.tpa.commands.*;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import net.kyori.adventure.text.minimessage.MiniMessage;
@@ -28,6 +30,7 @@ public final class PlainBase extends JavaPlugin {
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     private BroadcastManager broadcastManager;
     private TPAManager tpaManager;
+    private RTPManager rtpManager;
 
     private boolean commandsRegistered = false;
 
@@ -190,8 +193,9 @@ public final class PlainBase extends JavaPlugin {
         loadModuleConfig("teleport.yml");
 
         tpaManager = new TPAManager(this);
+        rtpManager = new RTPManager(this);
 
-        getServer().getPluginManager().registerEvents(new TPAListener(this), this);
+        getServer().getPluginManager().registerEvents(new TeleportListener(this), this);
 
         if (!commandsRegistered) {
             getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
@@ -202,12 +206,18 @@ public final class PlainBase extends JavaPlugin {
                 r.register("tpauto", new TPAUTOCommand(this));
                 r.register("tpdeny", new TPDENYCommand(this));
                 r.register("tpacancel", new TPACANCELCommand(this));
+
+                r.register("rtp", new RTPCommand(this));
             });
         }
     }
 
     public TPAManager getTPAManager() {
         return tpaManager;
+    }
+
+    public RTPManager getRTPManager() {
+        return rtpManager;
     }
 
     public MiniMessage getMiniMessage() {

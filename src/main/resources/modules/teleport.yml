@@ -26,7 +26,9 @@ tpa:
 
 rtp:
   enabled: true
+
   cooldown: 60 # in seconds
+
   counter:
     enabled: true
     seconds: 3 # in seconds
@@ -36,6 +38,42 @@ rtp:
       - damage
       - death
       - interact
+
+  blacklist:
+    enabled: true
+    biomes:
+      - ocean
+    blocks:
+      - WATER
+      - LAVA
+      - KELP
+      - KELP_PLANT
+      - SEAGRASS
+      - CACTUS
+      - MAGMA_BLOCK
+      - CAMPFIRE
+      - SOUL_CAMPFIRE
+      - FIRE
+      - SOUL_FIRE
+      - LAVA_CAULDRON
+      - WATER_CAULDRON
+      - POWDER_SNOW_CAULDRON
+      - SWEET_BERRY_BUSH
+      - WITHER_ROSE
+      - POWDER_SNOW
+      - AIR
+      - CAVE_AIR
+      - VOID_AIR
+      - BEDROCK
+      - BARRIER
+      - STRUCTURE_VOID
+      - PORTAL
+      - END_PORTAL
+      - SAND
+      - RED_SAND
+      - GRAVEL
+      - POINTED_DRIPSTONE
+
   commands:
       rtp:
         enabled: true

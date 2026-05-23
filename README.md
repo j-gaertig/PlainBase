@@ -1,4 +1,4 @@
-# <p align="center">🛠️ PlainBase</p>
+# <p align="center">PlainBase</p>
 
 <p align="center">
     <a href="https://papermc.io"><img src="https://img.shields.io/badge/Platform-Paper%20%7C%20Purpur%20%7C%20Folia-blue.svg" alt="Platform"></a>
@@ -13,93 +13,99 @@
   Essential features, zero bloat.
 </p>
 
-<p align="center">
-  <a href="#current-features">Features</a> •
-  <a href="#commands">Commands</a> •
-  <a href="#planned">Planned</a> •
-  <a href="#support">Support</a>
-</p>
-
 ---
 
-## 🚀 <a name="current-features"></a>Current Features
+## Current Features
 
-### 🧩 Core System
-*   **Modular Architecture:** Enable only what you need (Spawn, JoinItems, Messages) via the central `config.yml`.
-*   **⚡ High Performance:** Built from the ground up for modern Paper servers with native Folia and Purpur support.
+### Core System
+*   **Modular Architecture:** You can enable and disable everything in the `config.yml`. No need for 20 different plugins.
+*   **High Performance:** It's built for modern Paper servers and works fine with Folia and Purpur too.
 
-### 📍 Advanced Spawn System
-<details open>
-  <summary><b>View Module Details & Commands</b></summary>
-  <ul>
-    <li>Set global and unique first-join spawn points.</li>
-    <li>Supports <b>relative coordinates</b> (<code>~</code>) for precise placement.</li>
-    <li>Automated teleportation on join for new and returning players.</li>
-  </ul>
-
-  #### Spawn Commands
-  | Command | Description | Permission |
-  | :--- | :--- | :--- |
-  | `/spawn` | Teleports you to the global spawn. | `Everyone` |
-  | `/setspawn [x y z]` | Sets the global spawn point. | `OP` |
-  | `/setfirstspawn [x y z]` | Sets the first-join spawn point. | `OP` |
-  | `/disablespawn` | Disables the global spawn system. | `OP` |
-  | `/disablefirstspawn` | Disables the first-join spawn system. | `OP` |
-</details>
-
-### 🎒 Join Items System
-<details open>
-  <summary><b>View Module Details</b></summary>
-  <ul>
-    <li>Give players items automatically when they join.</li>
-    <li><b>MiniMessage Support:</b> Use modern formatting (colors, gradients, decorations).</li>
-    <li><b>Custom Actions:</b> Execute commands on click (supports <code>%player%</code>).</li>
-    <li><b>Protection:</b> Prevent moving, dropping, or swapping items.</li>
-    <li><b>Skull Support:</b> Custom heads (e.g., player's own head).</li>
-  </ul>
-</details>
-
-### 💬 Messages & Broadcasts
-<details open>
-  <summary><b>View Module Details</b></summary>
-  <ul>
-    <li><b>Join/Quit:</b> Fully customizable entry and exit messages.</li>
-    <li><b>MOTD:</b> Display a welcome message when players join.</li>
-    <li><b>Auto-Broadcasts:</b> Send periodic announcements with individual cooldowns.</li>
-    <li><b>Formatting:</b> Full MiniMessage support for all messages.</li>
-  </ul>
-</details>
-
----
-
-## ⌨️ <a name="commands"></a>General Commands
+### Teleportation Module (TPA & RTP)
+This is a big one. I finally added a proper teleport system that actually feels good to use. 
+*   **TPA System:** Send requests to players with `/tpa` or bring them to you with `/tpahere`.
+*   **Auto-Accept:** You can toggle auto-accept for your friends with `/tpauto`. Settings are saved even after you logout.
+*   **Random Teleport (RTP):** Get a random spot in the world. It has cooldowns and checks if the biome or block is safe (no more drowning in the ocean).
+*   **Safety Features:** Teleports can have a countdown and will cancel if you move or take damage.
 
 | Command | Description | Permission |
 | :--- | :--- | :--- |
-| `/plainbase reload` | **Core Maintenance:** Reloads all configurations and reinitializes every module instantly without server restart. | `OP` |
-| `/plainbase update` | **Version Check:** Queries Modrinth for the latest compatible release and provides a direct download link. | `OP` |
-| `/plainbase toggle <module>` | **Live Configuration:** Instantly enables or disables specific features (e.g., `spawn`, `joinitems`) on the fly. | `OP` |
+| `/tpa <player>` | Ask to teleport to someone. | `Everyone` |
+| `/tpahere <player>` | Ask a player to teleport to you. | `Everyone` |
+| `/tpaccept` | Accept a pending request. | `Everyone` |
+| `/tpdeny` | Deny a request. | `Everyone` |
+| `/tpacancel` | Cancel your sent request. | `Everyone` |
+| `/tpauto` | Toggle auto-accepting teleport requests. | `Everyone` |
+| `/rtp` | Telepot to a random location. | `Everyone` |
+
+### Advanced Spawn System
+<details>
+  <summary>Details & Commands</summary>
+  <ul>
+    <li>Set global or first-join spawn points.</li>
+    <li>Use relative coords like <code>~</code> when setting spawns.</li>
+    <li>Auto-teleport players when they join.</li>
+  </ul>
+
+  | Command | Description | Permission |
+  | :--- | :--- | :--- |
+  | `/spawn` | Go to the spawn point. | `Everyone` |
+  | `/setspawn [x y z]` | Set the global spawn. | `OP` |
+  | `/setfirstspawn [x y z]` | Set the spawn for new players. | `OP` |
+</details>
+
+### Join Items System
+<details>
+  <summary>Details & Featurs</summary>
+  <ul>
+    <li>Give items to players on join automatically.</li>
+    <li>Full MiniMessage support for names and lore.</li>
+    <li>Click actions that run commands as the player.</li>
+    <li>Protection so players can't drop or move these items.</li>
+    <li>Supports custom player skulls.</li>
+  </ul>
+</details>
+
+### Messages & Broadcasts
+<details>
+  <summary>Details</summary>
+  <ul>
+    <li>Custom Join and Quit messages.</li>
+    <li>MOTD for when players enter the server.</li>
+    <li>Auto-Broadcast system with custom timers for announcements.</li>
+  </ul>
+</details>
 
 ---
 
-## 📅 <a name="planned"></a>Planned Features
+## General Management
 
-*   **📊 Tablist & Side Menus:** Integrated TAB-list and Scoreboards/Sidebars.
-*   **🏠 Home & Warp System:** Allow players to save and visit private or public locations.
-*   **👮 Basic Moderation:** Essential tools like kicks, bans, and muting.
-*   **⚙️ GUI Management:** Manage all modules through an intuitive in-game menu.
-*   **➕ And more...** We are constantly working on new features to make server management even easier.
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/plainbase reload` | Reloads all configs and modules instantly. | `OP` |
+| `/plainbase update` | Checks Modrinth for a newer version. | `OP` |
+| `/plainbase toggle <module>` | Enable/Disable modules while the server is running. | `OP` |
 
 ---
 
-## 💎 <a name="support"></a>Support & Community
+## Planned
+*   **Homes & Warps:** Its on my list for next update.
+*   **Tablist & Sidebar:** Some simple stats and custom headers.
+*   **Moderations:** Kick, ban, etc.
+*   **GUIs:** A nice menu so you don't have to type commands for everything.
+*   **And more...**
 
-This is a **one-man project**, and I am working hard to make server management as simple as possible. Your support means everything!
+---
 
-*   **🐛 Issues?** Found a bug? Open an [Issue](https://github.com/jgaertig/PlainBase/issues).
-*   **⭐ GitHub:** Leave a **Star** if you like the project!
-*   **❤️ Modrinth:** Follow on [Modrinth](https://modrinth.com/plugin/plainbase) and leave a **Heart**!
-*   **📢 Share:** Tell your friends about PlainBase!
+## Support & Community
+I'm doing this all by myself, so if you find a bug or have an idea, let me know. Every star on GitHub helps a lot!
+
+*   **Issues:** Found a bug? Open an [Issue](https://github.com/jgaertig/PlainBase/issues).
+*   **GitHub:** Leave a **Star**!
+*   **Modrinth:** Leave a **Heart** [here](https://modrinth.com/plugin/plainbase).
+*   **Share:** Tell people about it!
 
 ---
 <p align="center">Built with ❤️ by j-gaertig</p>
+
+
