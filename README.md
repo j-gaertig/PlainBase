@@ -1,15 +1,16 @@
 # <p align="center">🛠️ PlainBase</p>
 
 <p align="center">
-  <a href="https://papermc.io"><img src="https://img.shields.io/badge/Platform-Paper%20%7C%20Purpur%20%7C%20Folia-blue.svg" alt="Platform"></a>
+    <a href="https://papermc.io"><img src="https://img.shields.io/badge/Platform-Paper%20%7C%20Purpur%20%7C%20Folia-blue.svg" alt="Platform"></a>
+  <a href="https://modrinth.com/plugin/plainbase"><img src="https://img.shields.io/badge/Minecraft-1.21.6%20--%2026.1.2-3fb58e?style=flat&logo=minecraft&logoColor=white" alt="Minecraft Version"></a>
   <a href="https://github.com/j-gaertig/PlainBase/releases/latest"><img src="https://img.shields.io/github/v/tag/j-gaertig/PlainBase?label=Version&color=orange" alt="Version"></a>
   <a href="https://github.com/j-gaertig/PlainBase/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
 </p>
 
 <p align="center">
-  <strong>PlainBase</strong> is a lightweight, all-in-one Paper plugin designed to simplify server management.
+  <strong>PlainBase</strong> - The lightweight all-in-one core for your Minecraft server.
   <br>
-  Forget dozens of plugins – get the essentials in one clean, modular framework.
+  Essential features, zero bloat.
 </p>
 
 <p align="center">
@@ -75,9 +76,9 @@
 
 | Command | Description | Permission |
 | :--- | :--- | :--- |
-| `/plainbase reload` | Reloads all configurations and modules instantly. | `OP` |
-| `/plainbase update` | Checks Modrinth for the latest compatible version. | `OP` |
-| `/plainbase toggle <module>` | Instantly enables or disables a specific module. | `OP` |
+| `/plainbase reload` | **Core Maintenance:** Reloads all configurations and reinitializes every module instantly without server restart. | `OP` |
+| `/plainbase update` | **Version Check:** Queries Modrinth for the latest compatible release and provides a direct download link. | `OP` |
+| `/plainbase toggle <module>` | **Live Configuration:** Instantly enables or disables specific features (e.g., `spawn`, `joinitems`) on the fly. | `OP` |
 
 ---
 
@@ -87,7 +88,7 @@
 *   **🏠 Home & Warp System:** Allow players to save and visit private or public locations.
 *   **👮 Basic Moderation:** Essential tools like kicks, bans, and muting.
 *   **⚙️ GUI Management:** Manage all modules through an intuitive in-game menu.
-*   **➕ And more...** We constantly evaluate and add features that provide real value.
+*   **➕ And more...** We are constantly working on new features to make server management even easier.
 
 ---
 

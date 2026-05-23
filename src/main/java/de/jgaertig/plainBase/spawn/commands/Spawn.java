@@ -38,6 +38,11 @@ public class Spawn implements BasicCommand {
             return;
         }
 
+        if (!plugin.getSpawnConfig().getBoolean("spawn.enabled", true)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn position has been disabled."));
+            return;
+        }
+
         String path = "spawn.location";
 
         FileConfiguration config = plugin.getSpawnConfig();

@@ -2,8 +2,10 @@ package de.jgaertig.plainBase.messages;
 
 import de.jgaertig.plainBase.PlainBase;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
+import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.entity.Player;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -29,7 +31,11 @@ public class BroadcastManager {
             long ticks = Math.max(1, cooldownSeconds * 20); // Mindestens 1 Tick
 
             ScheduledTask task = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, (t) -> {
-                Bukkit.broadcast(plugin.getMiniMessage().deserialize(text));
+                Component message = plugin.getMiniMessage().deserialize(text);
+
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    player.sendMessage(message);
+                }
             }, ticks, ticks);
 
             activeTasks.add(task);
