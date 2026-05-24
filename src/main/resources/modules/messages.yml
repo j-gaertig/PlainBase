@@ -4,6 +4,16 @@ messages:
   first-join: "<gradient:gold:yellow>Welcome!</gradient> <white>%player%</white>"
   quit: "<gray>[<red>-</red>] <white>%player%</white>"
 
+# Command & Error Messages
+errors:
+  module-disabled: "<red>This module is currently disabled."
+  command-disabled: "<red>This command has been disabled."
+  player-not-found: "<red>Player not found!"
+  teleport-self: "<red>You cannot teleport to yourself!"
+  player-only: "<red>This command can only be executed by players."
+  usage-tpa: "<yellow>Usage: <gray>/tpa <player>"
+  usage-tpahere: "<yellow>Usage: <gray>/tpahere <player>"
+
 # Welcome Message of the Day (MOTD)
 motd:
   enabled: true
