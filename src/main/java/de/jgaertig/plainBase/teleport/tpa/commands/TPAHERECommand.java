@@ -25,44 +25,43 @@ public class TPAHERECommand implements BasicCommand {
         CommandSender sender = stack.getSender();
 
         if (!plugin.getConfig().getBoolean("modules.teleport", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.module-disabled", "<red>This module is currently disabled.")));
             return;
         }
 
         if (!plugin.getTeleportConfig().getBoolean("tpa.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA has been disabled."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.command-disabled", "<red>TPA has been disabled.")));
             return;
         }
 
         if (!plugin.getTeleportConfig().getBoolean("tpa.commands.tpahere.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.command-disabled", "<red>This command has been disabled.")));
             return;
         }
 
         if (!(sender instanceof Player player)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command can only be executed by players."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.player-only", "<red>This command can only be executed by players.")));
             return;
         }
 
         if (args.length != 1) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/tpahere <player>"));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.usage-tpahere", "<yellow>Usage: <gray>/tpahere <player>")));
             return;
         }
 
         Player target = Bukkit.getPlayer(args[0]);
 
         if (target == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Player not found!"));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.player-not-found", "<red>Player not found!")));
             return;
         }
 
         if (target.equals(player)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>You cannot teleport yourself to yourself!"));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.teleport-self", "<red>You cannot teleport yourself to yourself!")));
             return;
         }
 
         plugin.getTPAManager().sendRequest(player, target, TPAManager.RequestType.TPAHERE);
-
     }
 
     @Override

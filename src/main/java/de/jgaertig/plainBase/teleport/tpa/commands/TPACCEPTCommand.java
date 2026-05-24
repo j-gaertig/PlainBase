@@ -21,26 +21,25 @@ public class TPACCEPTCommand implements BasicCommand {
         CommandSender sender = stack.getSender();
 
         if (!plugin.getConfig().getBoolean("modules.teleport", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.module-disabled", "<red>This module is currently disabled.")));
             return;
         }
 
         if (!plugin.getTeleportConfig().getBoolean("tpa.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA has been disabled."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.command-disabled", "<red>TPA has been disabled.")));
             return;
         }
 
         if (!plugin.getTeleportConfig().getBoolean("tpa.commands.tpaccept.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.command-disabled", "<red>This command has been disabled.")));
             return;
         }
 
         if (!(sender instanceof Player player)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command can only be executed by players."));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(plugin.getMessagesConfig().getString("errors.player-only", "<red>This command can only be executed by players.")));
             return;
         }
 
         plugin.getTPAManager().acceptRequest(player);
-
     }
 }
