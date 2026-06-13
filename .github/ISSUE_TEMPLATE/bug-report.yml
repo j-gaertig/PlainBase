@@ -1,0 +1,69 @@
+name: "🐛 Bug Report"
+description: "Report a bug"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Thank you for reporting a bug. Please fill out the form as detailed as possible to help us resolve the issue."
+
+  - type: input
+    id: server-type
+    attributes:
+      label: "Server Software"
+      description: "For example: Paper, Purpur, Spigot, Folia"
+      placeholder: "Paper"
+    validations:
+      required: true
+
+  - type: input
+    id: server-version
+    attributes:
+      label: "Server Version"
+      description: "Output of the /version command"
+      placeholder: "26.1.2.build.64-stable"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: "Plugin Version"
+      description: "The exact version of this plugin you are running"
+      placeholder: "0.0.2-Experimental"
+    validations:
+      required: true
+
+  - type: input
+    id: module
+    attributes:
+      label: "Module"
+      description: "Which module is affected by the bug?"
+      placeholder: "spawn"
+    validations:
+      required: true
+
+  - type: textarea
+    id: bug-description
+    attributes:
+      label: "Bug Description"
+      description: "A clear and concise description of what the bug is."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: "Steps to Reproduce"
+      description: "Tell us exactly how to reproduce the bug step by step."
+      placeholder: "1. Install the plugin\n2. Run command /...\n3. See error"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs-errors
+    attributes:
+      label: "Console Logs or Error Dumps"
+      description: "Please paste your server log or stacktrace here. Use code blocks if possible. You can also link a pastebin."
+      render: text
+    validations:
+      required: false
