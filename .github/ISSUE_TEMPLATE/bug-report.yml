@@ -4,7 +4,7 @@ labels: ["bug"]
 body:
   - type: markdown
     attributes:
-      value: "Thank you for reporting a bug. Please fill out the form as detailed as possible to help us resolve the issue."
+      value: "Thanks for reporting an issue. Please provide as much detail as possible so we can reproduce and fix it quickly."
 
   - type: input
     id: server-type
@@ -33,20 +33,34 @@ body:
     validations:
       required: true
 
-  - type: input
-    id: module
+  - type: dropdown
+    id: affected-module
     attributes:
-      label: "Module"
-      description: "Which module is affected by the bug?"
-      placeholder: "spawn"
+      label: "Module Selection"
+      description: "Select the closest matching module"
+      options:
+        - global/core
+        - spawn
+        - teleport (TPA/RTP)
+        - messages/broadcast
+        - join items
+        - other
     validations:
       required: true
 
   - type: textarea
-    id: bug-description
+    id: expected-behavior
     attributes:
-      label: "Bug Description"
-      description: "A clear and concise description of what the bug is."
+      label: "Expected Behavior"
+      description: "What should happen instead?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: "Actual Behavior"
+      description: "What happens right now?"
     validations:
       required: true
 
@@ -63,7 +77,25 @@ body:
     id: logs-errors
     attributes:
       label: "Console Logs or Error Dumps"
-      description: "Please paste your server log or stacktrace here. Use code blocks if possible. You can also link a pastebin."
+      description: "Paste relevant server logs or stack traces (or link a paste service)."
       render: text
     validations:
       required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: "Additional Context"
+      description: "Anything else that might help (screenshots, configs, timing, etc.)"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: "Pre-Submission Checklist"
+      options:
+        - label: "I tested with the latest PlainBase version."
+          required: true
+        - label: "I searched existing issues and did not find a duplicate."
+          required: true
