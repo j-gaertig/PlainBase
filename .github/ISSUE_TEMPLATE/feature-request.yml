@@ -1,0 +1,66 @@
+name: "✨ Feature Request"
+description: "Suggest an idea or improvement"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for sharing an idea. Clear use cases help us prioritize and implement features faster."
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: "Target Module"
+      description: "Where would this feature fit best?"
+      options:
+        - global/core
+        - spawn
+        - teleport (TPA/RTP)
+        - messages/broadcast
+        - join items
+        - new module
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem or Use Case"
+      description: "What problem are you trying to solve?"
+      placeholder: "As a server owner/player, I want ... so that ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: "Proposed Solution"
+      description: "Describe the behavior or command/config you would like to have."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives Considered"
+      description: "Any workaround or alternative approach you already tried?"
+    validations:
+      required: false
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: "Examples or References"
+      description: "Optional: examples from other plugins/projects or mock command syntax."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: "Pre-Submission Checklist"
+      options:
+        - label: "I searched existing issues and did not find this suggestion."
+          required: true
+        - label: "This request describes one feature idea and a concrete use case."
+          required: true

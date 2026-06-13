@@ -1,0 +1,82 @@
+name: "❓ Question"
+description: "Ask a usage or configuration question"
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: "Ask your question with enough context so we can help quickly."
+
+  - type: input
+    id: server-type
+    attributes:
+      label: "Server Software"
+      description: "For example: Paper, Purpur, Spigot, Folia"
+      placeholder: "Paper"
+    validations:
+      required: true
+
+  - type: input
+    id: server-version
+    attributes:
+      label: "Server Version"
+      description: "Output of the /version command"
+      placeholder: "1.21.6 / 26.1.2 build ..."
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: "Plugin Version"
+      description: "The exact version of PlainBase you are running"
+      placeholder: "0.0.3-Experimental"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: "Related Module"
+      description: "Which module is your question about?"
+      options:
+        - global/core
+        - spawn
+        - teleport (TPA/RTP)
+        - messages/broadcast
+        - join items
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: "What are you trying to achieve?"
+      description: "Describe your desired setup or outcome."
+    validations:
+      required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: "Your Question"
+      description: "What exactly do you need help with?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: "What have you tried so far?"
+      description: "Commands, config changes, or docs you already checked."
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Relevant Logs or Config Snippets"
+      description: "Paste only the relevant parts (you can use code blocks)."
+      render: text
+    validations:
+      required: false
