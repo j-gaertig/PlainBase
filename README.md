@@ -22,11 +22,15 @@
 *   **High Performance:** It's built for modern Paper servers and works fine with Folia and Purpur too.
 
 ### Teleportation Module (TPA & RTP)
+<details open>
+<summary>Details & Commands</summary>
 This is a big one. I finally added a proper teleport system that actually feels good to use.
-*   **TPA System:** Send requests to players with `/tpa` or bring them to you with `/tpahere`.
-*   **Auto-Accept:** You can toggle auto-accept for your friends with `/tpauto`. Settings are saved even after you logout.
-*   **Random Teleport (RTP):** Get a random spot in the world. It has cooldowns and checks if the biome or block is safe (no more drowning in the ocean).
-*   **Safety Features:** Teleports can have a countdown and will cancel if you move or take damage.
+<ul>
+  <li><strong>TPA System:</strong> Send requests to players with <code>/tpa</code> or bring them to you with <code>/tpahere</code>.</li>
+  <li><strong>Auto-Accept:</strong> You can toggle auto-accept for your friends with <code>/tpauto</code>. Settings are saved even after you logout.</li>
+  <li><strong>Random Teleport (RTP):</strong> Get a random spot in the world. It has cooldowns and checks if the biome or block is safe (no more drowning in the ocean).</li>
+  <li><strong>Safety Features:</strong> Teleports can have a countdown and will cancel if you move or take damage.</li>
+</ul>
 
 | Command | Description | Permission |
 | :--- | :--- | :--- |
@@ -36,10 +40,11 @@ This is a big one. I finally added a proper teleport system that actually feels 
 | `/tpdeny` | Deny a request. | `plainbase.teleport.tpa.tpdeny` |
 | `/tpacancel` | Cancel your sent request. | `plainbase.teleport.tpa.tpacancel` |
 | `/tpauto` | Toggle auto-accepting teleport requests. | `plainbase.teleport.tpa.tpauto` |
-| `/rtp` | Telepot to a random location. | `plainbase.teleport.rtp.rtp` |
+| `/rtp` | Teleport to a random location. | `plainbase.teleport.rtp.rtp` |
 | *(all TPA commands)* | Grants every TPA permission above. | `plainbase.teleport.tpa.admin` |
 | *(all RTP commands)* | Grants every RTP permission above. | `plainbase.teleport.rtp.admin` |
 | *(all Teleport commands)* | Grants every permission of the Teleport module (TPA + RTP). | `plainbase.teleport.admin` |
+</details>
 
 ### Advanced Spawn System
 <details>
@@ -62,7 +67,7 @@ This is a big one. I finally added a proper teleport system that actually feels 
 
 ### Join Items System
 <details>
-  <summary>Details & Featurs</summary>
+  <summary>Details & Features</summary>
   <ul>
     <li>Give items to players on join automatically.</li>
     <li>Full MiniMessage support for names and lore.</li>
