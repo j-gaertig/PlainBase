@@ -23,7 +23,7 @@ public class DisableFirstSpawn implements BasicCommand {
             return;
         }
 
-        if (!sender.isOp()) {
+        if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.spawn.admin") && !sender.hasPermission("plainbase.spawn.disablefirstspawn")) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
             return;
         }

@@ -24,6 +24,11 @@ public class PlainBaseCommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
+        if (!sender.hasPermission("plainbase.admin")) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
+            return;
+        }
+
         if (args.length >= 2 && args[0].equalsIgnoreCase("toggle")) {
             String moduleName = args[1];
             String path = "modules." + moduleName;

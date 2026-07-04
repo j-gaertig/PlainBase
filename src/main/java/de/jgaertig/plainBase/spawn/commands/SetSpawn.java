@@ -25,7 +25,7 @@ public class SetSpawn implements BasicCommand {
             return;
         }
 
-        if (!sender.isOp()) {
+        if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.spawn.admin") && !sender.hasPermission("plainbase.spawn.setspawn")) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
             return;
         }

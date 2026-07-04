@@ -29,6 +29,11 @@ public class RTPCommand implements BasicCommand {
             return;
         }
 
+        if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.teleport.admin") && !sender.hasPermission("plainbase.teleport.rtp.admin") && !sender.hasPermission("plainbase.teleport.rtp.rtp")) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
+            return;
+        }
+
         if (!plugin.getTeleportConfig().getBoolean("rtp.commands.rtp.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;

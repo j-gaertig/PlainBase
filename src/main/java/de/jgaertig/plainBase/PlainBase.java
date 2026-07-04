@@ -16,6 +16,8 @@ import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.permissions.Permission;
+import org.bukkit.permissions.PermissionDefault;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.*;
@@ -36,6 +38,8 @@ public final class PlainBase extends JavaPlugin {
 
     @Override
     public void onEnable() {
+        setupPermissions();
+
         saveDefaultConfig();
 
         latestVersions.put("config.yml", 1.3);
@@ -66,6 +70,68 @@ public final class PlainBase extends JavaPlugin {
         stopModules();
 
         getLogger().info("Successfully Disabled!");
+    }
+
+    private void setupPermissions() {
+        // General
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.admin", "PlainBase: Allows access to all permissions", PermissionDefault.OP)
+        );
+
+        // spawn module
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.spawn.admin", "PlainBase: Allows access to all permissions of the spawn module", PermissionDefault.OP)
+        );
+
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.spawn.spawn", "PlainBase: Allows access to /spawn", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.spawn.setspawn", "PlainBase: Allows access to /setspawn", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.spawn.disablespawn", "PlainBase: Allows access to /disablespawn", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.spawn.setfirstspawn", "PlainBase: Allows access to /setfirstspawn", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.spawn.disablefirstspawn", "PlainBase: Allows access to /disablefirstspawn", PermissionDefault.OP)
+        );
+
+        // teleport module
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.admin", "PlainBase: Allows access to all permissions of the teleport module", PermissionDefault.OP)
+        );
+
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.rtp.admin", "PlainBase: Allows access to all permissions of rtp of the teleport module", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.rtp.rtp", "PlainBase: Allows access to /rtp", PermissionDefault.OP)
+        );
+
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.tpa.admin", "PlainBase: Allows access to all permissions of tpa of the teleport module", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.tpa.tpa", "PlainBase: Allows access to /tpa", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.tpa.tpaccept", "PlainBase: Allows access to /tpaccept", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.tpa.tpdeny", "PlainBase: Allows access to /tpdeny", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.tpa.tpacancel", "PlainBase: Allows access to /tpacancel", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.tpa.tpahere", "PlainBase: Allows access to /tpahere", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.teleport.tpa.tpauto", "PlainBase: Allows access to /tpauto", PermissionDefault.OP)
+        );
     }
 
     public void reloadModules() {

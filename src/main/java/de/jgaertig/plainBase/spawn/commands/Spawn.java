@@ -28,6 +28,11 @@ public class Spawn implements BasicCommand {
             return;
         }
 
+        if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.spawn.admin") && !sender.hasPermission("plainbase.spawn.spawn")) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
+            return;
+        }
+
         if (!plugin.getSpawnConfig().getBoolean("commands.spawn.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;

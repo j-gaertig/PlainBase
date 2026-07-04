@@ -34,6 +34,11 @@ public class TPACommand implements BasicCommand {
             return;
         }
 
+        if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.teleport.admin") && !sender.hasPermission("plainbase.teleport.tpa.admin") && !sender.hasPermission("plainbase.teleport.tpa.tpa")) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
+            return;
+        }
+
         if (!plugin.getTeleportConfig().getBoolean("tpa.commands.tpa.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;

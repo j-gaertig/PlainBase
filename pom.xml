@@ -6,7 +6,7 @@
 
     <groupId>de.jgaertig</groupId>
     <artifactId>PlainBase</artifactId>
-    <version>0.0.3-Experimental</version>
+    <version>0.0.4-Experimental</version>
     <packaging>jar</packaging>
 
     <name>PlainBase</name>
@@ -61,7 +61,7 @@
         <dependency>
             <groupId>io.papermc.paper</groupId>
             <artifactId>paper-api</artifactId>
-            <version>[26.1.2.build,)</version>
+            <version>[26.2.build,)</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>

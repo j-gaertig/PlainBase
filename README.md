@@ -22,7 +22,7 @@
 *   **High Performance:** It's built for modern Paper servers and works fine with Folia and Purpur too.
 
 ### Teleportation Module (TPA & RTP)
-This is a big one. I finally added a proper teleport system that actually feels good to use. 
+This is a big one. I finally added a proper teleport system that actually feels good to use.
 *   **TPA System:** Send requests to players with `/tpa` or bring them to you with `/tpahere`.
 *   **Auto-Accept:** You can toggle auto-accept for your friends with `/tpauto`. Settings are saved even after you logout.
 *   **Random Teleport (RTP):** Get a random spot in the world. It has cooldowns and checks if the biome or block is safe (no more drowning in the ocean).
@@ -30,13 +30,16 @@ This is a big one. I finally added a proper teleport system that actually feels 
 
 | Command | Description | Permission |
 | :--- | :--- | :--- |
-| `/tpa <player>` | Ask to teleport to someone. | `Everyone` |
-| `/tpahere <player>` | Ask a player to teleport to you. | `Everyone` |
-| `/tpaccept` | Accept a pending request. | `Everyone` |
-| `/tpdeny` | Deny a request. | `Everyone` |
-| `/tpacancel` | Cancel your sent request. | `Everyone` |
-| `/tpauto` | Toggle auto-accepting teleport requests. | `Everyone` |
-| `/rtp` | Telepot to a random location. | `Everyone` |
+| `/tpa <player>` | Ask to teleport to someone. | `plainbase.teleport.tpa.tpa` |
+| `/tpahere <player>` | Ask a player to teleport to you. | `plainbase.teleport.tpa.tpahere` |
+| `/tpaccept` | Accept a pending request. | `plainbase.teleport.tpa.tpaccept` |
+| `/tpdeny` | Deny a request. | `plainbase.teleport.tpa.tpdeny` |
+| `/tpacancel` | Cancel your sent request. | `plainbase.teleport.tpa.tpacancel` |
+| `/tpauto` | Toggle auto-accepting teleport requests. | `plainbase.teleport.tpa.tpauto` |
+| `/rtp` | Telepot to a random location. | `plainbase.teleport.rtp.rtp` |
+| *(all TPA commands)* | Grants every TPA permission above. | `plainbase.teleport.tpa.admin` |
+| *(all RTP commands)* | Grants every RTP permission above. | `plainbase.teleport.rtp.admin` |
+| *(all Teleport commands)* | Grants every permission of the Teleport module (TPA + RTP). | `plainbase.teleport.admin` |
 
 ### Advanced Spawn System
 <details>
@@ -47,11 +50,14 @@ This is a big one. I finally added a proper teleport system that actually feels 
     <li>Auto-teleport players when they join.</li>
   </ul>
 
-  | Command | Description | Permission |
-  | :--- | :--- | :--- |
-  | `/spawn` | Go to the spawn point. | `Everyone` |
-  | `/setspawn [x y z]` | Set the global spawn. | `OP` |
-  | `/setfirstspawn [x y z]` | Set the spawn for new players. | `OP` |
+| Command                  | Description                                  | Permission                          |
+|:-------------------------|:---------------------------------------------|:------------------------------------|
+| `/spawn`                 | Go to the spawn point.                       | `plainbase.spawn.spawn`             |
+| `/setspawn [x y z]`      | Set the global spawn.                        | `plainbase.spawn.setspawn`          |
+| `/disablespawn`          | Disable the global spawn.                    | `plainbase.spawn.disablespawn`      |
+| `/setfirstspawn [x y z]` | Set the spawn for new players.               | `plainbase.spawn.setfirstspawn`     |
+| `/disablefirstspawn`     | Disable the spawn for new players.           | `plainbase.spawn.disablefirstspawn` |
+| *(all Spawn commands)*   | Grants every permission of the Spawn module. | `plainbase.spawn.admin`             |
 </details>
 
 ### Join Items System
@@ -78,18 +84,30 @@ This is a big one. I finally added a proper teleport system that actually feels 
 
 ---
 
+## Permissions
+
+**Default:** Every PlainBase permission defaults to **`OP`** — regular players won't have access to any command out of the box.
+
+To allow non-OP players (or specific ranks/groups) to use a command, grant the permission manually via your permissions plugin, e.g. with LuckPerms:
+`/lp group default permission set plainbase.teleport.tpa.tpa true`
+
+Use `plainbase.<module>.admin` nodes (or `plainbase.admin` for everything) to grant a whole module/module-section at once instead of individual commands.
+
+---
+
 ## General Management
 
 | Command | Description | Permission |
-| :--- | :--- | :--- |
-| `/plainbase reload` | Reloads all configs and modules instantly. | `OP` |
-| `/plainbase update` | Checks Modrinth for a newer version. | `OP` |
-| `/plainbase toggle <module>` | Enable/Disable modules while the server is running. | `OP` |
+| :--- |:--------------------------------------------------------| :--- |
+| `/plainbase reload` | Reloads all configs and modules instantly. | `plainbase.admin` |
+| `/plainbase update` | Checks Modrinth for a newer version. | `plainbase.admin` |
+| `/plainbase toggle <module>` | Enable/Disable modules while the server is running. | `plainbase.admin` |
+| *(everything above)* | Grants *every PlainBase permission across all modules*. | `plainbase.admin` |
 
 ---
 
 ## Planned
-*   **Homes & Warps:** Its on my list for next update.
+*   **Homes & Warps:** Its on my list for next updates.
 *   **Tablist & Sidebar:** Some simple stats and custom headers.
 *   **Moderations:** Kick, ban, etc.
 *   **GUIs:** A nice menu so you don't have to type commands for everything.
@@ -107,5 +125,3 @@ I'm doing this all by myself, so if you find a bug or have an idea, let me know.
 
 ---
 <p align="center">Built with ❤️ by j-gaertig</p>
-
-
