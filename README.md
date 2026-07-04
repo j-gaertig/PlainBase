@@ -121,6 +121,7 @@ I'm doing this all by myself, so if you find a bug or have an idea, let me know.
 *   **Issues:** Found a bug? Open an [Issue](https://github.com/jgaertig/PlainBase/issues).
 *   **GitHub:** Leave a **Star**!
 *   **Modrinth:** Leave a **Heart** [here](https://modrinth.com/plugin/plainbase).
+*   **Hangar:** Leave a **Star** [here](https://hangar.papermc.io/j-gaertig/PlainBase).
 *   **Share:** Tell people about it!
 
 ---
