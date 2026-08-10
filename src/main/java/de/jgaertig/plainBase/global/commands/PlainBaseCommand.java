@@ -124,6 +124,7 @@ public class PlainBaseCommand implements BasicCommand {
     }
 
     private String getLatestVersionFromModrinth(String projectId, String gameVersion) {
+        HttpURLConnection conn = null;
         try {
             String encodedVersion = URLEncoder.encode(gameVersion, StandardCharsets.UTF_8);
             String urlString = "https://api.modrinth.com/v2/project/" + projectId
@@ -131,14 +132,15 @@ public class PlainBaseCommand implements BasicCommand {
                     + "%22%5D&loaders=%5B%22paper%22%5D";
 
             URL url = new URL(urlString);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setRequestProperty("User-Agent", "j-gaertig/PlainBase/" + plugin.getPluginMeta().getVersion());
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
 
-            if (conn.getResponseCode() == 200) {
-                try (Scanner scanner = new Scanner(conn.getInputStream())) {
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 200) {
+                try (Scanner scanner = new Scanner(conn.getInputStream(), StandardCharsets.UTF_8)) {
                     StringBuilder builder = new StringBuilder();
                     while (scanner.hasNextLine()) builder.append(scanner.nextLine());
 
@@ -153,10 +155,14 @@ public class PlainBaseCommand implements BasicCommand {
                     }
                 }
             } else {
-                plugin.getLogger().warning("Modrinth API responded with HTTP " + conn.getResponseCode());
+                plugin.getLogger().warning("Modrinth API responded with HTTP " + responseCode);
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to check for updates: " + e.getMessage());
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
         return null;
     }
