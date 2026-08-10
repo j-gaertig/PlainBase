@@ -12,10 +12,15 @@ import de.jgaertig.plainBase.teleport.rtp.commands.RTPCommand;
 import de.jgaertig.plainBase.teleport.tpa.TPAManager;
 import de.jgaertig.plainBase.teleport.TeleportListener;
 import de.jgaertig.plainBase.teleport.tpa.commands.*;
+import de.jgaertig.plainBase.vanish.VanishListener;
+import de.jgaertig.plainBase.vanish.VanishManager;
+import de.jgaertig.plainBase.vanish.commands.VanishCommand;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import net.kyori.adventure.text.minimessage.MiniMessage;
+import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
 import org.bukkit.permissions.Permission;
 import org.bukkit.permissions.PermissionDefault;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -33,6 +38,7 @@ public final class PlainBase extends JavaPlugin {
     private BroadcastManager broadcastManager;
     private TPAManager tpaManager;
     private RTPManager rtpManager;
+    private VanishManager vanishManager;
 
     private boolean commandsRegistered = false;
 
@@ -42,11 +48,12 @@ public final class PlainBase extends JavaPlugin {
 
         saveDefaultConfig();
 
-        latestVersions.put("config.yml", 1.3);
+        latestVersions.put("config.yml", 1.4);
         latestVersions.put("spawn.yml", 1.2);
         latestVersions.put("joinitems.yml", 1.1);
         latestVersions.put("messages.yml", 1.0);
         latestVersions.put("teleport.yml", 1.0);
+        latestVersions.put("vanish.yml", 1.0);
 
         if (!commandsRegistered) {
             getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
@@ -132,6 +139,27 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().addPermission(
                 new Permission("plainbase.teleport.tpa.tpauto", "PlainBase: Allows access to /tpauto", PermissionDefault.OP)
         );
+
+        // vanish module
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.admin", "PlainBase: Allows access to all permissions of the vanish module", PermissionDefault.OP)
+        );
+
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.vanish", "PlainBase: Allows access to /vanish", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.vanish.other", "PlainBase: Allows access to /vanish <player>", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.world", "PlainBase: Allows access to /vanish world", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.all", "PlainBase: Allows access to /vanish all", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.see", "PlainBase: Allows to see vanished players", PermissionDefault.OP)
+        );
     }
 
     public void reloadModules() {
@@ -142,11 +170,21 @@ public final class PlainBase extends JavaPlugin {
         if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
         if (getConfig().getBoolean("modules.messages", true)) setupMessages();
         if (getConfig().getBoolean("modules.teleport", true)) setupTeleport();
+        if (getConfig().getBoolean("modules.vanish", true)) setupVanish();
     }
 
     public void stopModules() {
         if (broadcastManager != null) {
             broadcastManager.stopBroadcasts();
+        }
+
+        // Reveal everyone when the vanish module is switched off, or when
+        // persist-on-rejoin is disabled (reload must not keep anyone hidden).
+        // A plain reload with persist enabled keeps vanished players hidden
+        // and setupVanish() re-applies their state.
+        if (vanishManager != null && (!getConfig().getBoolean("modules.vanish", true)
+                || !getVanishConfig().getBoolean("vanish.persist-on-rejoin", true))) {
+            vanishManager.resetAll();
         }
 
         org.bukkit.event.HandlerList.unregisterAll(this);
@@ -278,12 +316,40 @@ public final class PlainBase extends JavaPlugin {
         }
     }
 
+    public void setupVanish() {
+        loadModuleConfig("vanish.yml");
+
+        vanishManager = new VanishManager(this);
+
+        getServer().getPluginManager().registerEvents(new VanishListener(this), this);
+
+        if (!commandsRegistered) {
+            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+                var r = event.registrar();
+                r.register("vanish", new VanishCommand(this));
+            });
+        }
+
+        // Re-apply persisted vanish state for already-online players after a reload
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            vanishManager.applyOnJoin(player);
+        }
+    }
+
     public TPAManager getTPAManager() {
         return tpaManager;
     }
 
     public RTPManager getRTPManager() {
         return rtpManager;
+    }
+
+    public VanishManager getVanishManager() {
+        return vanishManager;
+    }
+
+    public FileConfiguration getVanishConfig() {
+        return configs.get("vanish.yml");
     }
 
     public MiniMessage getMiniMessage() {

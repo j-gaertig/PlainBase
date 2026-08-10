@@ -87,6 +87,26 @@ This is a big one. I finally added a proper teleport system that actually feels 
   </ul>
 </details>
 
+### Vanish Module
+<details>
+  <summary>Details & Commands</summary>
+  <ul>
+    <li>Vanish yourself, specific players, whole worlds or everyone.</li>
+    <li>Vanished players are hidden from the tab list, take no mob attention and projectiles pass through them.</li>
+    <li>Optional: hide armor (or ghost mode), invincibility, persist across rejoin, no collision / step sounds.</li>
+    <li>Players with the <code>plainbase.vanish.see</code> permission (or OPs, configurable) can still see vanished players.</li>
+  </ul>
+
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/vanish` | Toggle your own vanish. | `plainbase.vanish.vanish` |
+| `/vanish <player>` | Vanish another player. | `plainbase.vanish.vanish.other` |
+| `/vanish world` | Vanish all players in your world. | `plainbase.vanish.world` |
+| `/vanish all` | Vanish all online players. | `plainbase.vanish.all` |
+| *(all Vanish commands)* | Grants every permission of the Vanish module. | `plainbase.vanish.admin` |
+| *(see vanished)* | Allows seeing vanished players (default: OPs only). | `plainbase.vanish.see` |
+</details>
+
 ---
 
 ## Permissions

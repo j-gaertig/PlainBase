@@ -4,6 +4,7 @@ modules:
   joinitems: false # More Settings in joinitems.yml
   messages: false # More Settings in messages.yml
   teleport: false # More Settings in teleport.yml
+  vanish: false # More Settings in vanish.yml
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.3
+version: 1.4
