@@ -1,5 +1,8 @@
 package de.jgaertig.plainBase.global.commands;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 import de.jgaertig.plainBase.PlainBase;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
@@ -9,7 +12,12 @@ import org.bukkit.configuration.ConfigurationSection;
 import org.jetbrains.annotations.NotNull;
 import org.jspecify.annotations.NonNull;
 
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Scanner;
 import java.util.stream.Stream;
 
 public class PlainBaseCommand implements BasicCommand {
@@ -48,18 +56,18 @@ public class PlainBaseCommand implements BasicCommand {
             } else {
                 sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
             }
+            return;
         }
 
         if (args.length >= 1 && args[0].equalsIgnoreCase("reload")) {
-
             plugin.reloadModules();
             sender.sendMessage(plugin.getMiniMessage().deserialize("<green>Config reloaded and modules updated!"));
+            return;
         }
 
         if (args.length >= 1 && args[0].equalsIgnoreCase("update")) {
             String serverVersion = Bukkit.getMinecraftVersion();
             sender.sendMessage(plugin.getMiniMessage().deserialize("<gray>Checking for updates for Minecraft " + serverVersion + "..."));
-
 
             Bukkit.getAsyncScheduler().runNow(plugin, task -> {
                 String latestVersion = getLatestVersionFromModrinth("yfx0z1Sw", serverVersion);
@@ -114,33 +122,35 @@ public class PlainBaseCommand implements BasicCommand {
 
     private String getLatestVersionFromModrinth(String projectId, String gameVersion) {
         try {
-            String urlString = String.format(
-                    "https://api.modrinth.com/v2/project/%s/version?game_versions=[\"%s\"]&loaders=[\"paper\"]",
-                    projectId, gameVersion
-            );
+            String encodedVersion = URLEncoder.encode(gameVersion, StandardCharsets.UTF_8);
+            String urlString = "https://api.modrinth.com/v2/project/" + projectId
+                    + "/version?game_versions=%5B%22" + encodedVersion
+                    + "%22%5D&loaders=%5B%22paper%22%5D";
 
-            java.net.URL url = new java.net.URL(urlString);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            URL url = new URL(urlString);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setRequestProperty("User-Agent", "j-gaertig/PlainBase/" + plugin.getPluginMeta().getVersion());
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
 
             if (conn.getResponseCode() == 200) {
-                java.util.Scanner scanner = new java.util.Scanner(conn.getInputStream());
-                StringBuilder builder = new StringBuilder();
-                while (scanner.hasNextLine()) builder.append(scanner.nextLine());
-                scanner.close();
+                try (Scanner scanner = new Scanner(conn.getInputStream())) {
+                    StringBuilder builder = new StringBuilder();
+                    while (scanner.hasNextLine()) builder.append(scanner.nextLine());
 
-                String response = builder.toString();
+                    JsonArray versions = JsonParser.parseString(builder.toString()).getAsJsonArray();
+                    if (versions.isEmpty()) {
+                        return "NOT_FOUND";
+                    }
 
-                if (response.equals("[]")) {
-                    return "NOT_FOUND";
+                    JsonElement latest = versions.get(0);
+                    if (latest.isJsonObject() && latest.getAsJsonObject().has("version_number")) {
+                        return latest.getAsJsonObject().get("version_number").getAsString();
+                    }
                 }
-
-                if (response.contains("\"version_number\":\"")) {
-                    int start = response.indexOf("\"version_number\":\"") + 18;
-                    int end = response.indexOf("\"", start);
-                    return response.substring(start, end);
-                }
+            } else {
+                plugin.getLogger().warning("Modrinth API responded with HTTP " + conn.getResponseCode());
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to check for updates: " + e.getMessage());
