@@ -72,25 +72,28 @@ public class PlainBaseCommand implements BasicCommand {
             Bukkit.getAsyncScheduler().runNow(plugin, task -> {
                 String latestVersion = getLatestVersionFromModrinth("yfx0z1Sw", serverVersion);
 
-                if (latestVersion == null) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reach Modrinth. Please try again later."));
-                    return;
-                }
+                // Send result on the global region scheduler (main thread) - thread-safe on Paper and Folia
+                Bukkit.getGlobalRegionScheduler().run(plugin, scheduledTask -> {
+                    if (latestVersion == null) {
+                        sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reach Modrinth. Please try again later."));
+                        return;
+                    }
 
-                if (latestVersion.equals("NOT_FOUND")) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>No compatible version found for Minecraft " + serverVersion + "."));
-                    return;
-                }
+                    if (latestVersion.equals("NOT_FOUND")) {
+                        sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>No compatible version found for Minecraft " + serverVersion + "."));
+                        return;
+                    }
 
-                String currentVersion = plugin.getPluginMeta().getVersion();
-                if (currentVersion.equalsIgnoreCase(latestVersion)) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize("<green>You are running the latest version! (" + currentVersion + ")"));
-                } else {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
-                            "<yellow>A new version is available: <bold>" + latestVersion + "</bold>\n" +
-                                    "<gray>Download here: <click:open_url:'https://modrinth.com/plugin/plainbase'><underlined><blue>modrinth.com/plugin/plainbase</blue></underlined></click>"
-                    ));
-                }
+                    String currentVersion = plugin.getPluginMeta().getVersion();
+                    if (currentVersion.equalsIgnoreCase(latestVersion)) {
+                        sender.sendMessage(plugin.getMiniMessage().deserialize("<green>You are running the latest version! (" + currentVersion + ")"));
+                    } else {
+                        sender.sendMessage(plugin.getMiniMessage().deserialize(
+                                "<yellow>A new version is available: <bold>" + latestVersion + "</bold>\n" +
+                                        "<gray>Download here: <click:open_url:'https://modrinth.com/plugin/plainbase'><underlined><blue>modrinth.com/plugin/plainbase</blue></underlined></click>"
+                        ));
+                    }
+                });
             });
         }
     }
