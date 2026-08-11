@@ -114,7 +114,7 @@ This is a big one. I finally added a proper teleport system that actually feels 
     <li>Create, delete and open fully config-driven menus via <code>/menu</code>.</li>
     <li>Everything lives in <code>modules/menu.yml</code>: title (MiniMessage), size, fill material and per-slot items.</li>
     <li>Items can run commands, play sounds, show messages and close the menu on click.</li>
-    <li>Optionally show the player's own inventory below the menu (like a chest).</li>
+    <li>Menus are locked GUIs — players can't move or take items, and their own inventory below is not usable.</li>
     <li>Full PlaceholderAPI support (<code>%player_name%</code>, <code>%plainbase_vanished%</code>, ...) in titles, names, lore and messages.</li>
   </ul>
 

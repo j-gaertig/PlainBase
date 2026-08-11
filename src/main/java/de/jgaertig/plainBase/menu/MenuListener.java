@@ -6,7 +6,6 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.inventory.InventoryAction;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.inventory.Inventory;
@@ -29,6 +28,10 @@ public class MenuListener implements Listener {
         return null;
     }
 
+    /**
+     * Menus are always locked GUIs: clicks in the player's own inventory
+     * (bottom) are always blocked so no items can move in or out of the menu.
+     */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onClick(InventoryClickEvent event) {
         if (!(event.getWhoClicked() instanceof Player player)) return;
@@ -46,20 +49,8 @@ public class MenuListener implements Listener {
 
         int rawSlot = event.getRawSlot();
 
-        // Click in the player's own inventory (bottom)
+        // Click in the player's own inventory (bottom) — always blocked
         if (rawSlot >= top.getSize()) {
-            if (!menu.showPlayerInventory()) {
-                event.setCancelled(true);
-                return;
-            }
-            // Allow plain clicks inside the player's inventory, but never
-            // allow shift-clicks or hotbar swaps that would transfer items
-            // into the menu.
-            if (event.isShiftClick()
-                    || event.getAction() == InventoryAction.HOTBAR_SWAP
-                    || event.getAction() == InventoryAction.HOTBAR_MOVE_AND_READD) {
-                event.setCancelled(true);
-            }
             return;
         }
 
@@ -107,19 +98,8 @@ public class MenuListener implements Listener {
         MenuManager.MenuHolder holder = getMenuHolder(top);
         if (holder == null) return;
 
-        MenuManager.MenuDefinition menu = plugin.getMenuManager().getMenu(holder.getMenuName());
-        if (menu == null) return;
-
-        // Dragging into the menu is always cancelled; dragging inside the
-        // player's own inventory is allowed only when show-player-inventory is on
-        for (int slot : event.getRawSlots()) {
-            if (slot < top.getSize()) {
-                event.setCancelled(true);
-                return;
-            }
-        }
-        if (!menu.showPlayerInventory()) {
-            event.setCancelled(true);
-        }
+        // Dragging inside or into our menu is always cancelled — the bottom
+        // inventory is locked too, so nothing can move in or out of the menu.
+        event.setCancelled(true);
     }
 }

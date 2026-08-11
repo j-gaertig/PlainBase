@@ -13,7 +13,6 @@ menus:
   example:
     title: "<yellow>Example Menu"
     size: 27 # 9, 18, 27, 36, 45 or 54
-    show-player-inventory: false # true = bottom player inventory usable (like a chest)
     fill-material: GRAY_STAINED_GLASS_PANE # optional: fills all empty slots
     items:
       '11':
@@ -23,10 +22,10 @@ menus:
           - "<gray>Teleports you to the"
           - "<gray>spawn location."
         sound: "BLOCK_NOTE_BLOCK_PLING" # optional: sound effect on click
+        message: "<green>You have been teleported to spawn!" # shown to the clicking player
         close: true # optional: close the menu after clicking
         commands: # executed as the player, %player% supported
           - "spawn"
-        # message: "<green>Teleported!" # optional: message shown on click
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
 version: 1.0

@@ -25,7 +25,7 @@ public class MenuManager {
     private final PlainBase plugin;
     private final Map<String, MenuDefinition> menus = new ConcurrentHashMap<>();
 
-    public record MenuDefinition(String name, String title, int size, boolean showPlayerInventory,
+    public record MenuDefinition(String name, String title, int size,
                                  Material fillMaterial, Map<Integer, ItemDefinition> items) {
 
         public Component buildTitle(PlainBase plugin, Player viewer) {
@@ -78,7 +78,6 @@ public class MenuManager {
         for (String key : section.getKeys(false)) {
             String title = section.getString(key + ".title", key);
             int size = section.getInt(key + ".size", 27);
-            boolean showPlayerInv = section.getBoolean(key + ".show-player-inventory", false);
 
             Material fill = null;
             String fillString = section.getString(key + ".fill-material");
@@ -100,7 +99,7 @@ public class MenuManager {
                 }
             }
 
-            menus.put(key, new MenuDefinition(key, title, size, showPlayerInv, fill, items));
+            menus.put(key, new MenuDefinition(key, title, size, fill, items));
         }
     }
 
@@ -190,7 +189,6 @@ public class MenuManager {
         String path = "menus." + name;
         config.set(path + ".title", "<gray>" + name);
         config.set(path + ".size", 27);
-        config.set(path + ".show-player-inventory", false);
         config.set(path + ".items", null);
         plugin.saveMenuConfig();
         reloadMenus();
