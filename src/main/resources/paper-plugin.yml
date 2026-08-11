@@ -12,3 +12,11 @@ authors: [ j-gaertig ]
 website: https://github.com/j-gaertig/
 
 folia-supported: true
+
+# Optional: PlaceholderAPI for %plainbase_*% placeholders
+dependencies:
+  server:
+    PlaceholderAPI:
+      load: BEFORE
+      required: false
+      join-classpath: true

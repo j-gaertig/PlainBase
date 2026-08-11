@@ -107,6 +107,41 @@ This is a big one. I finally added a proper teleport system that actually feels 
 | *(see vanished)* | Allows seeing vanished players (default: OPs only). | `plainbase.vanish.see` |
 </details>
 
+### Menu Module
+<details>
+  <summary>Details & Commands</summary>
+  <ul>
+    <li>Create, delete and open fully config-driven menus via <code>/menu</code>.</li>
+    <li>Everything lives in <code>modules/menu.yml</code>: title (MiniMessage), size, fill material and per-slot items.</li>
+    <li>Items can run commands, play sounds, show messages and close the menu on click.</li>
+    <li>Optionally show the player's own inventory below the menu (like a chest).</li>
+    <li>Full PlaceholderAPI support (<code>%player_name%</code>, <code>%plainbase_vanished%</code>, ...) in titles, names, lore and messages.</li>
+  </ul>
+
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/menu new <name>` | Creates a new menu template. | `plainbase.menu.new` |
+| `/menu delete <name>` | Deletes a menu. | `plainbase.menu.delete` |
+| `/menu open <name>` | Opens a menu. | `plainbase.menu.open` |
+| `/menu list` | Lists all available menus. | `plainbase.menu.list` |
+| *(all Menu commands)* | Grants every permission of the Menu module. | `plainbase.menu.admin` |
+</details>
+
+### PlaceholderAPI
+<details>
+  <summary>Details</summary>
+  <ul>
+    <li>Optional soft dependency — PlainBase works fully without it.</li>
+    <li>When installed, the <code>%plainbase_*%</code> expansion is registered automatically.</li>
+    <li>Placeholders are resolved in menu titles, item names/lore, messages and commands.</li>
+  </ul>
+
+| Placeholder | Description |
+| :--- | :--- |
+| `%plainbase_version%` | The current PlainBase version. |
+| `%plainbase_vanished%` | Whether the player is currently vanished (`true`/`false`). |
+</details>
+
 ---
 
 ## Permissions
