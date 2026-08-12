@@ -222,6 +222,12 @@ public final class PlainBase extends JavaPlugin {
             vanishManager.resetAll();
         }
 
+        // Close any open menu inventories before the listeners are
+        // unregistered: an open menu whose clicks are no longer cancelled
+        // would let players take items out of the GUI (duplication/exploit).
+        if (menuManager != null) {
+            menuManager.closeAllMenus();
+        }
         menuManager = null;
         org.bukkit.event.HandlerList.unregisterAll(this);
     }

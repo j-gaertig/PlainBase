@@ -136,6 +136,21 @@ public class MenuManager {
         return menus.get(name);
     }
 
+    /**
+     * Closes every open menu inventory. Called on module stop/reload before
+     * the MenuListener is unregistered: an open menu whose clicks are no
+     * longer cancelled would let players take items out of the GUI
+     * (duplication/exploit risk).
+     */
+    public void closeAllMenus() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            Inventory top = player.getOpenInventory().getTopInventory();
+            if (top != null && top.getHolder() instanceof MenuHolder) {
+                player.closeInventory();
+            }
+        }
+    }
+
     public boolean openMenu(Player player, String name) {
         MenuDefinition menu = menus.get(name);
         if (menu == null) return false;
