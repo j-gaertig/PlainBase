@@ -87,6 +87,61 @@ This is a big one. I finally added a proper teleport system that actually feels 
   </ul>
 </details>
 
+### Vanish Module
+<details>
+  <summary>Details & Commands</summary>
+  <ul>
+    <li>Vanish yourself, specific players, whole worlds or everyone.</li>
+    <li>Vanished players are hidden from the tab list, take no mob attention and projectiles pass through them.</li>
+    <li>Optional: invincibility, persist across rejoin, no collision / step sounds.</li>
+    <li>Players with the <code>plainbase.vanish.see</code> permission (or OPs, configurable) can still see vanished players.</li>
+  </ul>
+
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/vanish` | Toggle your own vanish. | `plainbase.vanish.vanish` |
+| `/vanish <player>` | Vanish another player. | `plainbase.vanish.vanish.other` |
+| `/vanish world` | Toggle vanish for all players in your world (including you). | `plainbase.vanish.world` |
+| `/vanish all` | Toggle vanish for all online players (including you). | `plainbase.vanish.all` |
+| *(all Vanish commands)* | Grants every permission of the Vanish module. | `plainbase.vanish.admin` |
+| *(see vanished)* | Allows seeing vanished players (default: OPs only). | `plainbase.vanish.see` |
+</details>
+
+### Menu Module
+<details>
+  <summary>Details & Commands</summary>
+  <ul>
+    <li>Create, delete and open fully config-driven menus via <code>/menu</code>.</li>
+    <li>Everything lives in <code>modules/menu.yml</code>: title (MiniMessage), size, fill material and per-slot items.</li>
+    <li>Items can run commands, play sounds, show messages and close the menu on click.</li>
+    <li>Menus are locked GUIs — players can't move or take items, and their own inventory below is not usable.</li>
+    <li>Full PlaceholderAPI support (<code>%player_name%</code>, <code>%plainbase_vanished%</code>, ...) in titles, names, lore and messages.</li>
+  </ul>
+
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/menu new <name>` | Creates a new menu template. | `plainbase.menu.new` |
+| `/menu delete <name>` | Deletes a menu. | `plainbase.menu.delete` |
+| `/menu open <name>` | Opens a menu. | `plainbase.menu.open` |
+| `/menu list` | Lists all available menus. | `plainbase.menu.list` |
+| *(all Menu commands)* | Grants every permission of the Menu module. | `plainbase.menu.admin` |
+</details>
+
+### PlaceholderAPI
+<details>
+  <summary>Details</summary>
+  <ul>
+    <li>Optional soft dependency — PlainBase works fully without it.</li>
+    <li>When installed, the <code>%plainbase_*%</code> expansion is registered automatically.</li>
+    <li>Placeholders are resolved in menu titles, item names/lore, messages and commands.</li>
+  </ul>
+
+| Placeholder | Description |
+| :--- | :--- |
+| `%plainbase_version%` | The current PlainBase version. |
+| `%plainbase_vanished%` | Whether the player is currently vanished (`true`/`false`). |
+</details>
+
 ---
 
 ## Permissions

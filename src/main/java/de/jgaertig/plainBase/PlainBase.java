@@ -12,10 +12,20 @@ import de.jgaertig.plainBase.teleport.rtp.commands.RTPCommand;
 import de.jgaertig.plainBase.teleport.tpa.TPAManager;
 import de.jgaertig.plainBase.teleport.TeleportListener;
 import de.jgaertig.plainBase.teleport.tpa.commands.*;
+import de.jgaertig.plainBase.menu.MenuListener;
+import de.jgaertig.plainBase.menu.MenuManager;
+import de.jgaertig.plainBase.menu.commands.MenuCommand;
+import de.jgaertig.plainBase.placeholder.PlaceholderBridge;
+import de.jgaertig.plainBase.placeholder.PlainBaseExpansion;
+import de.jgaertig.plainBase.vanish.VanishListener;
+import de.jgaertig.plainBase.vanish.VanishManager;
+import de.jgaertig.plainBase.vanish.commands.VanishCommand;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import net.kyori.adventure.text.minimessage.MiniMessage;
+import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
 import org.bukkit.permissions.Permission;
 import org.bukkit.permissions.PermissionDefault;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -33,6 +43,9 @@ public final class PlainBase extends JavaPlugin {
     private BroadcastManager broadcastManager;
     private TPAManager tpaManager;
     private RTPManager rtpManager;
+    private VanishManager vanishManager;
+    private MenuManager menuManager;
+    private boolean placeholdersRegistered = false;
 
     private boolean commandsRegistered = false;
 
@@ -42,16 +55,26 @@ public final class PlainBase extends JavaPlugin {
 
         saveDefaultConfig();
 
-        latestVersions.put("config.yml", 1.3);
+        latestVersions.put("config.yml", 1.5);
         latestVersions.put("spawn.yml", 1.2);
         latestVersions.put("joinitems.yml", 1.1);
         latestVersions.put("messages.yml", 1.0);
         latestVersions.put("teleport.yml", 1.0);
+        latestVersions.put("vanish.yml", 1.1);
+        latestVersions.put("menu.yml", 1.0);
 
+        registerPlaceholderExpansion();
+
+        // Register commands unconditionally, independent of which modules are
+        // enabled at startup: the command implementations themselves guard on
+        // their module being enabled. This way /vanish and /menu still work
+        // when a module is enabled later via /plainbase toggle or config reload.
         if (!commandsRegistered) {
             getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
                 var r = event.registrar();
                 r.register("plainbase", new PlainBaseCommand(this));
+                r.register("vanish", new VanishCommand(this));
+                r.register("menu", new MenuCommand(this));
             });
         }
 
@@ -132,6 +155,45 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().addPermission(
                 new Permission("plainbase.teleport.tpa.tpauto", "PlainBase: Allows access to /tpauto", PermissionDefault.OP)
         );
+
+        // vanish module
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.admin", "PlainBase: Allows access to all permissions of the vanish module", PermissionDefault.OP)
+        );
+
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.vanish", "PlainBase: Allows access to /vanish", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.vanish.other", "PlainBase: Allows access to /vanish <player>", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.world", "PlainBase: Allows access to /vanish world", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.all", "PlainBase: Allows access to /vanish all", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.vanish.see", "PlainBase: Allows to see vanished players", PermissionDefault.OP)
+        );
+
+        // menu module
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.menu.admin", "PlainBase: Allows access to all permissions of the menu module", PermissionDefault.OP)
+        );
+
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.menu.new", "PlainBase: Allows access to /menu new", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.menu.delete", "PlainBase: Allows access to /menu delete", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.menu.open", "PlainBase: Allows access to /menu open", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.menu.list", "PlainBase: Allows access to /menu list", PermissionDefault.OP)
+        );
     }
 
     public void reloadModules() {
@@ -142,6 +204,8 @@ public final class PlainBase extends JavaPlugin {
         if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
         if (getConfig().getBoolean("modules.messages", true)) setupMessages();
         if (getConfig().getBoolean("modules.teleport", true)) setupTeleport();
+        if (getConfig().getBoolean("modules.vanish", true)) setupVanish();
+        if (getConfig().getBoolean("modules.menu", true)) setupMenu();
     }
 
     public void stopModules() {
@@ -149,6 +213,22 @@ public final class PlainBase extends JavaPlugin {
             broadcastManager.stopBroadcasts();
         }
 
+        // Reveal everyone when the vanish module is switched off, or when
+        // persist-on-rejoin is disabled (reload must not keep anyone hidden).
+        // A plain reload with persist enabled keeps vanished players hidden
+        // and setupVanish() re-applies their state.
+        if (vanishManager != null && (!getConfig().getBoolean("modules.vanish", true)
+                || !getVanishConfig().getBoolean("vanish.persist-on-rejoin", true))) {
+            vanishManager.resetAll();
+        }
+
+        // Close any open menu inventories before the listeners are
+        // unregistered: an open menu whose clicks are no longer cancelled
+        // would let players take items out of the GUI (duplication/exploit).
+        if (menuManager != null) {
+            menuManager.closeAllMenus();
+        }
+        menuManager = null;
         org.bukkit.event.HandlerList.unregisterAll(this);
     }
 
@@ -278,12 +358,84 @@ public final class PlainBase extends JavaPlugin {
         }
     }
 
+    public void setupVanish() {
+        loadModuleConfig("vanish.yml");
+
+        vanishManager = new VanishManager(this);
+
+        getServer().getPluginManager().registerEvents(new VanishListener(this), this);
+
+        // Re-apply persisted vanish state for already-online players after a reload
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            vanishManager.applyOnJoin(player);
+        }
+    }
+
+    public void setupMenu() {
+        loadModuleConfig("menu.yml");
+
+        menuManager = new MenuManager(this);
+        menuManager.reloadMenus();
+
+        getServer().getPluginManager().registerEvents(new MenuListener(this), this);
+    }
+
+    /**
+     * Registers the %plainbase_*% PlaceholderAPI expansion when PlaceholderAPI
+     * is present. Safe no-op otherwise (soft dependency).
+     */
+    private void registerPlaceholderExpansion() {
+        if (placeholdersRegistered) return;
+        if (getServer().getPluginManager().getPlugin("PlaceholderAPI") == null) return;
+
+        placeholdersRegistered = new PlainBaseExpansion(this).register();
+        if (placeholdersRegistered) {
+            getLogger().info("PlaceholderAPI detected — registered %plainbase_*% placeholders!");
+        }
+    }
+
     public TPAManager getTPAManager() {
         return tpaManager;
     }
 
     public RTPManager getRTPManager() {
         return rtpManager;
+    }
+
+    public VanishManager getVanishManager() {
+        return vanishManager;
+    }
+
+    public FileConfiguration getVanishConfig() {
+        return configs.get("vanish.yml");
+    }
+
+    public MenuManager getMenuManager() {
+        return menuManager;
+    }
+
+    public FileConfiguration getMenuConfig() {
+        return configs.get("menu.yml");
+    }
+
+    public void saveMenuConfig() {
+        try {
+            FileConfiguration config = getMenuConfig();
+            if (config != null) {
+                config.save(new File(getDataFolder(), "modules/menu.yml"));
+            }
+        } catch (IOException e) {
+            getLogger().severe("Could not save menu.yml!");
+        }
+    }
+
+    /**
+     * Applies PlaceholderAPI placeholders to a string when PlaceholderAPI is
+     * present. Also replaces %player% for backwards compatibility. Safe no-op
+     * without PlaceholderAPI (soft dependency).
+     */
+    public String applyPlaceholders(Player player, String text) {
+        return PlaceholderBridge.apply(player, text);
     }
 
     public MiniMessage getMiniMessage() {

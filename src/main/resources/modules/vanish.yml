@@ -1,0 +1,23 @@
+# Vanish Module
+vanish:
+  enabled: true
+  persist-on-rejoin: true         # Keep the vanish state across a rejoin
+  no-collision: true              # Let other players walk through the vanished player
+  no-step-sound: true             # Suppress all entity sounds (incl. steps) for the vanished player
+  invincible: false               # true = vanished player takes no damage at all
+  projectiles-pass-through: true  # Arrows & co. don't hit vanished players
+  mobs-ignore: true               # Mobs don't target or look at vanished players
+  hide-join-quit-messages: true   # No join/quit messages for vanished players
+  op-see: true                    # OPs (with plainbase.vanish.see) can see vanished players
+
+  world:
+    enabled: true                 # /vanish world
+  all:
+    enabled: true                 # /vanish all
+
+  commands:
+    vanish:
+      enabled: true
+
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 1.1
