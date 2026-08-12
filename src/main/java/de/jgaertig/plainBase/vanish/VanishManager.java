@@ -17,8 +17,17 @@ public class VanishManager {
     private final PlainBase plugin;
     private final Set<UUID> vanishedPlayers = ConcurrentHashMap.newKeySet();
 
+    // showEntity re-adds the tab entry on the NEXT tick, so the removal must be
+    // delayed by 1 tick to not get overridden.
+    private static final int TAB_REMOVE_DELAY_TICKS = 1;
+    // Paper re-sends PlayerInfoUpdate(ADD_PLAYER) whenever a viewer re-tracks the
+    // entity (render-distance change, teleport, rejoin), so the tab removal has to
+    // be re-enforced periodically in ghost mode.
+    private static final int TAB_REFRESH_INTERVAL_TICKS = 20;
+
     public VanishManager(PlainBase plugin) {
         this.plugin = plugin;
+        startTabRefreshTask();
     }
 
     public boolean isVanished(Player player) {
@@ -158,22 +167,35 @@ public class VanishManager {
 
     /**
      * Hides the target player from the given viewer (entity + tab list).
-     * If hide-armor is disabled, the player's skin is hidden via setInvisible
-     * but their armor stays visible, so we only remove them from the tab list.
+     * <p>
+     * Note on Paper behaviour: hiding a player entity ALWAYS also removes the
+     * tab-list entry (CraftPlayer.unregisterEntity sends a PlayerInfoRemove
+     * packet), and {@code Player#listPlayer} throws IllegalStateException while
+     * the entity is hidden. Keeping the tab entry visible for a fully hidden
+     * player is therefore not possible with the public Bukkit/Paper API (would
+     * require packet-level NMS). {@code tab-hidden: false} only has an effect
+     * in ghost mode (hide-armor: false), where the entity stays visible.
      */
     private void hideFrom(Player viewer, Player target) {
         if (canSee(viewer, target)) return;
 
         viewer.getScheduler().run(plugin, (t) -> {
-            if (plugin.getVanishConfig().getBoolean("vanish.hide-armor", true)) {
-                viewer.hidePlayer(plugin, target);
+            boolean hideArmor = plugin.getVanishConfig().getBoolean("vanish.hide-armor", true);
+            boolean tabHidden = plugin.getVanishConfig().getBoolean("vanish.tab-hidden", true);
+            if (hideArmor) {
+                // Hiding the entity always removes the tab entry as well; re-listing
+                // is impossible via the public API (listPlayer throws while hidden).
+                // tab-hidden: false therefore only matters in ghost mode below.
+                viewer.hideEntity(plugin, target);
             } else {
                 // "Ghost mode": keep the player visible (armor stays visible too),
-                // only remove them from the tab list.
-                viewer.showPlayer(plugin, target);
-            }
-            if (plugin.getVanishConfig().getBoolean("vanish.tab-hidden", true)) {
-                viewer.unlistPlayer(target);
+                // only remove them from the tab list if configured.
+                viewer.showEntity(plugin, target);
+                if (tabHidden) {
+                    // showEntity re-adds the tab entry on the NEXT tick, so remove
+                    // it after that to not get overridden.
+                    viewer.getScheduler().runDelayed(plugin, (task) -> viewer.unlistPlayer(target), null, TAB_REMOVE_DELAY_TICKS);
+                }
             }
         }, null);
     }
@@ -183,9 +205,36 @@ public class VanishManager {
      */
     private void showTo(Player viewer, Player target) {
         viewer.getScheduler().run(plugin, (t) -> {
-            viewer.showPlayer(plugin, target);
+            // The target may have disconnected between scheduling and execution
+            // (next tick) — guard against Paper throwing on stale entities.
+            if (!viewer.isOnline() || !target.isOnline()) return;
+            viewer.showEntity(plugin, target);
             viewer.listPlayer(target);
         }, null);
+    }
+
+    /**
+     * Ghost mode (hide-armor: false) keeps the entity visible, but Paper re-sends
+     * PlayerInfoUpdate(ADD_PLAYER) whenever a viewer re-tracks the entity
+     * (render-distance change, teleport, rejoin). A single delayed unlistPlayer
+     * is not enough — periodically re-remove the tab entry while the config is
+     * active. Cheap no-op unless ghost mode + tab-hidden is configured.
+     */
+    private void startTabRefreshTask() {
+        plugin.getServer().getGlobalRegionScheduler().runAtFixedRate(plugin, (task) -> {
+            if (plugin.getVanishConfig().getBoolean("vanish.hide-armor", true)
+                    || !plugin.getVanishConfig().getBoolean("vanish.tab-hidden", true)) {
+                return; // ghost mode + tab-hidden not active
+            }
+            for (UUID uuid : vanishedPlayers) {
+                Player target = Bukkit.getPlayer(uuid);
+                if (target == null) continue;
+                for (Player viewer : Bukkit.getOnlinePlayers()) {
+                    if (viewer.equals(target) || canSee(viewer, target)) continue;
+                    viewer.unlistPlayer(target);
+                }
+            }
+        }, 1, TAB_REFRESH_INTERVAL_TICKS);
     }
 
     /**

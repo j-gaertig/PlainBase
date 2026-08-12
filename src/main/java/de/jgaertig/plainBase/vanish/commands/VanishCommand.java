@@ -47,7 +47,7 @@ public class VanishCommand implements BasicCommand {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
-            if (!plugin.getVanishConfig().getBoolean("commands.vanish.enabled", true)) {
+            if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
@@ -73,7 +73,7 @@ public class VanishCommand implements BasicCommand {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
-            if (!plugin.getVanishConfig().getBoolean("commands.vanish.enabled", true)) {
+            if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
@@ -93,7 +93,7 @@ public class VanishCommand implements BasicCommand {
         // /vanish <player> — vanish a specific player
         if (args.length == 1) {
             if (!checkPermission(player, "plainbase.vanish.vanish.other")) return;
-            if (!plugin.getVanishConfig().getBoolean("commands.vanish.enabled", true)) {
+            if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
@@ -117,7 +117,7 @@ public class VanishCommand implements BasicCommand {
 
         // /vanish — vanish/unvanish self
         if (!checkPermission(player, "plainbase.vanish.vanish")) return;
-        if (!plugin.getVanishConfig().getBoolean("commands.vanish.enabled", true)) {
+        if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }

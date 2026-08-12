@@ -2,7 +2,7 @@
 vanish:
   enabled: true
   hide-armor: true                # true = fully hidden from others (including armor), false = "ghost mode" (visible, only tab-hidden + protection)
-  tab-hidden: true                # Remove vanished players from other players' tab list
+  tab-hidden: true                # Remove vanished players from other players' tab list. Only effective with hide-armor: false (ghost mode) — a fully hidden entity is always removed from the tab (Paper API limitation). In ghost mode the entry is re-removed periodically, so it may briefly reappear on distance changes.
   persist-on-rejoin: true         # Keep the vanish state across a rejoin
   no-collision: true              # Let other players walk through the vanished player
   no-step-sound: true             # Suppress step sounds for other players
