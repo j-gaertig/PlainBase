@@ -93,7 +93,7 @@ This is a big one. I finally added a proper teleport system that actually feels 
   <ul>
     <li>Vanish yourself, specific players, whole worlds or everyone.</li>
     <li>Vanished players are hidden from the tab list, take no mob attention and projectiles pass through them.</li>
-    <li>Optional: hide armor (or ghost mode), invincibility, persist across rejoin, no collision / step sounds.</li>
+    <li>Optional: invincibility, persist across rejoin, no collision / step sounds.</li>
     <li>Players with the <code>plainbase.vanish.see</code> permission (or OPs, configurable) can still see vanished players.</li>
   </ul>
 

@@ -60,7 +60,7 @@ public final class PlainBase extends JavaPlugin {
         latestVersions.put("joinitems.yml", 1.1);
         latestVersions.put("messages.yml", 1.0);
         latestVersions.put("teleport.yml", 1.0);
-        latestVersions.put("vanish.yml", 1.0);
+        latestVersions.put("vanish.yml", 1.1);
         latestVersions.put("menu.yml", 1.0);
 
         registerPlaceholderExpansion();

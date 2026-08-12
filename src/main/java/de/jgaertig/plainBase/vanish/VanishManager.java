@@ -17,17 +17,8 @@ public class VanishManager {
     private final PlainBase plugin;
     private final Set<UUID> vanishedPlayers = ConcurrentHashMap.newKeySet();
 
-    // showEntity re-adds the tab entry on the NEXT tick, so the removal must be
-    // delayed by 1 tick to not get overridden.
-    private static final int TAB_REMOVE_DELAY_TICKS = 1;
-    // Paper re-sends PlayerInfoUpdate(ADD_PLAYER) whenever a viewer re-tracks the
-    // entity (render-distance change, teleport, rejoin), so the tab removal has to
-    // be re-enforced periodically in ghost mode.
-    private static final int TAB_REFRESH_INTERVAL_TICKS = 20;
-
     public VanishManager(PlainBase plugin) {
         this.plugin = plugin;
-        startTabRefreshTask();
     }
 
     public boolean isVanished(Player player) {
@@ -171,32 +162,16 @@ public class VanishManager {
      * Note on Paper behaviour: hiding a player entity ALWAYS also removes the
      * tab-list entry (CraftPlayer.unregisterEntity sends a PlayerInfoRemove
      * packet), and {@code Player#listPlayer} throws IllegalStateException while
-     * the entity is hidden. Keeping the tab entry visible for a fully hidden
-     * player is therefore not possible with the public Bukkit/Paper API (would
-     * require packet-level NMS). {@code tab-hidden: false} only has an effect
-     * in ghost mode (hide-armor: false), where the entity stays visible.
+     * the entity is hidden. Keeping the tab entry visible for a hidden player
+     * is therefore not possible with the public Bukkit/Paper API (would
+     * require packet-level NMS).
      */
     private void hideFrom(Player viewer, Player target) {
         if (canSee(viewer, target)) return;
 
         viewer.getScheduler().run(plugin, (t) -> {
-            boolean hideArmor = plugin.getVanishConfig().getBoolean("vanish.hide-armor", true);
-            boolean tabHidden = plugin.getVanishConfig().getBoolean("vanish.tab-hidden", true);
-            if (hideArmor) {
-                // Hiding the entity always removes the tab entry as well; re-listing
-                // is impossible via the public API (listPlayer throws while hidden).
-                // tab-hidden: false therefore only matters in ghost mode below.
-                viewer.hideEntity(plugin, target);
-            } else {
-                // "Ghost mode": keep the player visible (armor stays visible too),
-                // only remove them from the tab list if configured.
-                viewer.showEntity(plugin, target);
-                if (tabHidden) {
-                    // showEntity re-adds the tab entry on the NEXT tick, so remove
-                    // it after that to not get overridden.
-                    viewer.getScheduler().runDelayed(plugin, (task) -> viewer.unlistPlayer(target), null, TAB_REMOVE_DELAY_TICKS);
-                }
-            }
+            // Hiding the entity removes it from view and from the tab list.
+            viewer.hideEntity(plugin, target);
         }, null);
     }
 
@@ -214,34 +189,7 @@ public class VanishManager {
     }
 
     /**
-     * Ghost mode (hide-armor: false) keeps the entity visible, but Paper re-sends
-     * PlayerInfoUpdate(ADD_PLAYER) whenever a viewer re-tracks the entity
-     * (render-distance change, teleport, rejoin). A single delayed unlistPlayer
-     * is not enough — periodically re-remove the tab entry while the config is
-     * active. Cheap no-op unless ghost mode + tab-hidden is configured.
-     */
-    private void startTabRefreshTask() {
-        plugin.getServer().getGlobalRegionScheduler().runAtFixedRate(plugin, (task) -> {
-            if (plugin.getVanishConfig().getBoolean("vanish.hide-armor", true)
-                    || !plugin.getVanishConfig().getBoolean("vanish.tab-hidden", true)) {
-                return; // ghost mode + tab-hidden not active
-            }
-            for (UUID uuid : vanishedPlayers) {
-                Player target = Bukkit.getPlayer(uuid);
-                if (target == null) continue;
-                for (Player viewer : Bukkit.getOnlinePlayers()) {
-                    if (viewer.equals(target) || canSee(viewer, target)) continue;
-                    viewer.unlistPlayer(target);
-                }
-            }
-        }, 1, TAB_REFRESH_INTERVAL_TICKS);
-    }
-
-    /**
      * Applies the player's own vanish state (visibility, collision, sounds).
-     * Note: without packet-level rendering we cannot hide the skin but keep the
-     * armor visible — hide-armor=false therefore keeps the player fully visible
-     * ("ghost mode": tab-hidden + protection, but no visual hide).
      */
     private void applySelfState(Player player) {
         FileConfiguration config = plugin.getVanishConfig();
