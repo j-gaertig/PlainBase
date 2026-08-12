@@ -3,7 +3,7 @@ vanish:
   enabled: true
   persist-on-rejoin: true         # Keep the vanish state across a rejoin
   no-collision: true              # Let other players walk through the vanished player
-  no-step-sound: true             # Suppress step sounds for other players
+  no-step-sound: true             # Suppress all entity sounds (incl. steps) for the vanished player
   invincible: false               # true = vanished player takes no damage at all
   projectiles-pass-through: true  # Arrows & co. don't hit vanished players
   mobs-ignore: true               # Mobs don't target or look at vanished players

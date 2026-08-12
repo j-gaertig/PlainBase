@@ -65,10 +65,16 @@ public final class PlainBase extends JavaPlugin {
 
         registerPlaceholderExpansion();
 
+        // Register commands unconditionally, independent of which modules are
+        // enabled at startup: the command implementations themselves guard on
+        // their module being enabled. This way /vanish and /menu still work
+        // when a module is enabled later via /plainbase toggle or config reload.
         if (!commandsRegistered) {
             getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
                 var r = event.registrar();
                 r.register("plainbase", new PlainBaseCommand(this));
+                r.register("vanish", new VanishCommand(this));
+                r.register("menu", new MenuCommand(this));
             });
         }
 
@@ -353,13 +359,6 @@ public final class PlainBase extends JavaPlugin {
 
         getServer().getPluginManager().registerEvents(new VanishListener(this), this);
 
-        if (!commandsRegistered) {
-            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-                var r = event.registrar();
-                r.register("vanish", new VanishCommand(this));
-            });
-        }
-
         // Re-apply persisted vanish state for already-online players after a reload
         for (Player player : Bukkit.getOnlinePlayers()) {
             vanishManager.applyOnJoin(player);
@@ -373,13 +372,6 @@ public final class PlainBase extends JavaPlugin {
         menuManager.reloadMenus();
 
         getServer().getPluginManager().registerEvents(new MenuListener(this), this);
-
-        if (!commandsRegistered) {
-            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-                var r = event.registrar();
-                r.register("menu", new MenuCommand(this));
-            });
-        }
     }
 
     /**

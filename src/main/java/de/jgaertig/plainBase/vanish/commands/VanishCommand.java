@@ -54,19 +54,15 @@ public class VanishCommand implements BasicCommand {
 
             List<Player> targets = new ArrayList<>();
             for (Player online : Bukkit.getOnlinePlayers()) {
-                if (!online.equals(player) && online.getWorld().equals(player.getWorld())) {
+                if (online.getWorld().equals(player.getWorld())) {
                     targets.add(online);
                 }
-            }
-            if (targets.isEmpty()) {
-                player.sendMessage(plugin.getMiniMessage().deserialize("<red>No other players found in your world."));
-                return;
             }
             toggleAll(player, targets);
             return;
         }
 
-        // /vanish all — vanish all online players
+        // /vanish all — vanish all online players (including the executor)
         if (args.length == 1 && args[0].equalsIgnoreCase("all")) {
             if (!checkPermission(player, "plainbase.vanish.all")) return;
             if (!plugin.getVanishConfig().getBoolean("vanish.all.enabled", true)) {
@@ -80,11 +76,7 @@ public class VanishCommand implements BasicCommand {
 
             List<Player> targets = new ArrayList<>();
             for (Player online : Bukkit.getOnlinePlayers()) {
-                if (!online.equals(player)) targets.add(online);
-            }
-            if (targets.isEmpty()) {
-                player.sendMessage(plugin.getMiniMessage().deserialize("<red>No other players found."));
-                return;
+                targets.add(online);
             }
             toggleAll(player, targets);
             return;

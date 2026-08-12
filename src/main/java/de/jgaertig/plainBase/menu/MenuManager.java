@@ -59,6 +59,9 @@ public class MenuManager {
         @Override
         @NotNull
         public Inventory getInventory() {
+            if (inventory == null) {
+                throw new IllegalStateException("MenuHolder for '" + menuName + "' has no inventory yet");
+            }
             return inventory;
         }
     }

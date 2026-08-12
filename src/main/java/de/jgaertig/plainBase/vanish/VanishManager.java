@@ -129,8 +129,19 @@ public class VanishManager {
     }
 
     private void savePlayerData(UUID uuid, boolean vanished) {
+        boolean persist = plugin.getVanishConfig().getBoolean("vanish.persist-on-rejoin", true);
+
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
             File file = getPlayerDataFile(uuid);
+
+            if (!persist) {
+                // Never leave stale vanished:true files around when persistence is
+                // disabled — they would re-vanish the player if persistence is
+                // enabled later.
+                if (file.exists()) file.delete();
+                return;
+            }
+
             FileConfiguration config = YamlConfiguration.loadConfiguration(file);
 
             config.set("vanished", vanished);
@@ -170,6 +181,9 @@ public class VanishManager {
         if (canSee(viewer, target)) return;
 
         viewer.getScheduler().run(plugin, (t) -> {
+            // The target or viewer may have disconnected between scheduling and
+            // execution (next tick) — guard against Paper throwing on stale entities.
+            if (!viewer.isOnline() || !target.isOnline()) return;
             // Hiding the entity removes it from view and from the tab list.
             viewer.hideEntity(plugin, target);
         }, null);

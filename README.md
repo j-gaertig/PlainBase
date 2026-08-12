@@ -101,8 +101,8 @@ This is a big one. I finally added a proper teleport system that actually feels 
 | :--- | :--- | :--- |
 | `/vanish` | Toggle your own vanish. | `plainbase.vanish.vanish` |
 | `/vanish <player>` | Vanish another player. | `plainbase.vanish.vanish.other` |
-| `/vanish world` | Vanish all players in your world. | `plainbase.vanish.world` |
-| `/vanish all` | Vanish all online players. | `plainbase.vanish.all` |
+| `/vanish world` | Toggle vanish for all players in your world (including you). | `plainbase.vanish.world` |
+| `/vanish all` | Toggle vanish for all online players (including you). | `plainbase.vanish.all` |
 | *(all Vanish commands)* | Grants every permission of the Vanish module. | `plainbase.vanish.admin` |
 | *(see vanished)* | Allows seeing vanished players (default: OPs only). | `plainbase.vanish.see` |
 </details>

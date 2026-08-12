@@ -19,14 +19,16 @@ public final class PlaceholderBridge {
      * Applies PlaceholderAPI placeholders to the given text, replacing
      * %player% as well. Falls back to the raw text when PlaceholderAPI is
      * not installed. Catches Throwable so a broken PlaceholderAPI can never
-     * break a server thread.
+     * break a server thread. A null player is handled safely (no %player%
+     * replacement, no PlaceholderAPI call) — some callers legitimately have
+     * no player context (console, broadcasts).
      */
     public static String apply(Player player, String text) {
         if (text == null || text.isEmpty()) return text;
 
-        String result = text.replace("%player%", player.getName());
+        String result = player != null ? text.replace("%player%", player.getName()) : text;
 
-        if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
+        if (player != null && Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
             try {
                 result = me.clip.placeholderapi.PlaceholderAPI.setPlaceholders(player, result);
             } catch (Throwable e) {
