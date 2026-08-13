@@ -127,6 +127,31 @@ This is a big one. I finally added a proper teleport system that actually feels 
 | *(all Menu commands)* | Grants every permission of the Menu module. | `plainbase.menu.admin` |
 </details>
 
+### Moderation Module (Ban & Kick)
+<details>
+  <summary>Details & Commands</summary>
+  <ul>
+    <li>Custom ban/tempban/unban/kick system — everything is stored by the player's <strong>UUID</strong>, so name changes can never evade a ban.</li>
+    <li>Full history is kept forever: total ban count, total kick count and the last ban reason are available via <code>/baninfo</code>, even after a ban expires or gets revoked.</li>
+    <li>Bans can be permanent (<code>/ban</code>) or timed (<code>/tempban</code>, e.g. <code>1d</code>, <code>2h30m</code>, <code>7d</code>).</li>
+    <li>Fully configurable ban/kick/broadcast messages (MiniMessage) in <code>modules/moderation.yml</code>.</li>
+    <li>Works for offline players too (pre-emptive bans) — a warning is shown if the target never joined the server before.</li>
+    <li><code>plainbase.moderation.exempt</code> protects a player from being banned/kicked by non-admins (online targets only).</li>
+    <li>All commands work from the console, matching vanilla's <code>/ban</code>/<code>/kick</code> — these commands replace the vanilla ones and use their own UUID-based storage instead of the vanilla ban list.</li>
+  </ul>
+
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/ban <player> [reason]` | Permanently ban a player. | `plainbase.moderation.ban` |
+| `/tempban <player> <duration> [reason]` | Temporarily ban a player. | `plainbase.moderation.tempban` |
+| `/unban <player>` | Revoke an active ban. | `plainbase.moderation.unban` |
+| `/kick <player> [reason]` | Kick an online player. | `plainbase.moderation.kick` |
+| `/banlist [page]` | List all currently active bans. | `plainbase.moderation.banlist` |
+| `/baninfo <player>` | Show ban status, total bans/kicks and the last ban reason. | `plainbase.moderation.baninfo` |
+| *(all Moderation commands)* | Grants every permission of the Moderation module. | `plainbase.moderation.admin` |
+| *(punishment immunity)* | Makes a player immune to `/ban`/`/kick` by non-admins (default: false). | `plainbase.moderation.exempt` |
+</details>
+
 ### PlaceholderAPI
 <details>
   <summary>Details</summary>
@@ -140,6 +165,9 @@ This is a big one. I finally added a proper teleport system that actually feels 
 | :--- | :--- |
 | `%plainbase_version%` | The current PlainBase version. |
 | `%plainbase_vanished%` | Whether the player is currently vanished (`true`/`false`). |
+| `%plainbase_moderation_bancount%` | How many times the player has ever been banned. |
+| `%plainbase_moderation_kickcount%` | How many times the player has ever been kicked. |
+| `%plainbase_moderation_banned%` | Whether the player currently has an active ban (`true`/`false`). |
 </details>
 
 ---
@@ -167,10 +195,8 @@ Use `plainbase.<module>.admin` nodes (or `plainbase.admin` for everything) to gr
 ---
 
 ## Planned
-*   **Homes & Warps:** Its on my list for next updates.
+*   **Claims & Warps:** Its on my list for next updates.
 *   **Tablist & Sidebar:** Some simple stats and custom headers.
-*   **Moderations:** Kick, ban, etc.
-*   **GUIs:** A nice menu so you don't have to type commands for everything.
 *   **And more...**
 
 ---

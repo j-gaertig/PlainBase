@@ -1,0 +1,77 @@
+ban:
+  enabled: true
+
+kick:
+  enabled: true
+
+broadcast:
+  enabled: true
+  # false = broadcast to everyone online. true = only to players with
+  # plainbase.moderation.notify (or plainbase.moderation.admin / plainbase.admin).
+  staff-only: false
+
+messages:
+  default-reason: "No reason specified."
+
+  ban-screen: |-
+    <red><bold>You are banned from this server!</bold>
+    <gray>Reason: <yellow>%reason%
+    <gray>Banned by: <yellow>%staff%
+    <gray>This ban is permanent.
+
+  tempban-screen: |-
+    <red><bold>You are temporarily banned from this server!</bold>
+    <gray>Reason: <yellow>%reason%
+    <gray>Banned by: <yellow>%staff%
+    <gray>Time remaining: <yellow>%remaining%
+
+  kick-screen: |-
+    <red><bold>You have been kicked from the server!</bold>
+    <gray>Reason: <yellow>%reason%
+    <gray>Kicked by: <yellow>%staff%
+
+  already-banned: "<red>%player% is already banned."
+  not-banned: "<red>%player% is not currently banned."
+  ban-success: "<green>%player% has been permanently banned. <gray>(%reason%)"
+  tempban-success: "<green>%player% has been banned for <yellow>%duration%<green>. <gray>(%reason%)"
+  unban-success: "<green>%player% has been unbanned."
+  kick-success: "<green>%player% has been kicked. <gray>(%reason%)"
+  invalid-duration: "<red>Invalid duration. Use e.g. <yellow>1d<red>, <yellow>2h30m<red>, <yellow>7d<red> or <yellow>permanent<red>."
+  never-played: "<yellow>Warning: %player% has never played on this server. Banning by name."
+  player-not-found: "<red>Could not resolve player: %player%"
+  player-not-online: "<red>%player% is not online."
+  exempt: "<red>You cannot punish this player."
+
+  ban-broadcast: "<red>%player% <gray>was permanently banned by <yellow>%staff% <gray>(%reason%)"
+  tempban-broadcast: "<red>%player% <gray>was banned by <yellow>%staff% <gray>for <yellow>%duration% <gray>(%reason%)"
+  unban-broadcast: "<green>%player% <gray>was unbanned by <yellow>%staff%"
+  kick-broadcast: "<yellow>%player% <gray>was kicked by <yellow>%staff% <gray>(%reason%)"
+
+  banlist-header: "<gray>--- <yellow>Active bans (%count%)<gray> ---"
+  banlist-entry: "<yellow>%player% <gray>- %reason% <gray>(%duration%)"
+  banlist-empty: "<gray>There are currently no active bans."
+
+  baninfo-header: "<gray>--- <yellow>Ban info for %player%<gray> ---"
+  baninfo-status-banned: "<gray>Status: <red>Banned <gray>(%duration_left%)"
+  baninfo-status-clear: "<gray>Status: <green>Not banned"
+  baninfo-total-bans: "<gray>Total bans: <yellow>%bans%"
+  baninfo-total-kicks: "<gray>Total kicks: <yellow>%kicks%"
+  baninfo-last-ban: "<gray>Last ban reason: <yellow>%reason% <gray>by <yellow>%staff%"
+  baninfo-no-history: "<gray>No ban or kick history for this player."
+
+commands:
+  ban:
+    enabled: true
+  tempban:
+    enabled: true
+  unban:
+    enabled: true
+  kick:
+    enabled: true
+  banlist:
+    enabled: true
+  baninfo:
+    enabled: true
+
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 1.0

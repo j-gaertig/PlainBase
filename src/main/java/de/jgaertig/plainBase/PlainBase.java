@@ -15,6 +15,9 @@ import de.jgaertig.plainBase.teleport.tpa.commands.*;
 import de.jgaertig.plainBase.menu.MenuListener;
 import de.jgaertig.plainBase.menu.MenuManager;
 import de.jgaertig.plainBase.menu.commands.MenuCommand;
+import de.jgaertig.plainBase.moderation.BanManager;
+import de.jgaertig.plainBase.moderation.ModerationListener;
+import de.jgaertig.plainBase.moderation.commands.*;
 import de.jgaertig.plainBase.placeholder.PlaceholderBridge;
 import de.jgaertig.plainBase.placeholder.PlainBaseExpansion;
 import de.jgaertig.plainBase.vanish.VanishListener;
@@ -45,6 +48,7 @@ public final class PlainBase extends JavaPlugin {
     private RTPManager rtpManager;
     private VanishManager vanishManager;
     private MenuManager menuManager;
+    private BanManager banManager;
     private boolean placeholdersRegistered = false;
 
     private boolean commandsRegistered = false;
@@ -55,13 +59,14 @@ public final class PlainBase extends JavaPlugin {
 
         saveDefaultConfig();
 
-        latestVersions.put("config.yml", 1.5);
+        latestVersions.put("config.yml", 1.6);
         latestVersions.put("spawn.yml", 1.2);
         latestVersions.put("joinitems.yml", 1.1);
         latestVersions.put("messages.yml", 1.0);
         latestVersions.put("teleport.yml", 1.0);
         latestVersions.put("vanish.yml", 1.1);
         latestVersions.put("menu.yml", 1.0);
+        latestVersions.put("moderation.yml", 1.0);
 
         registerPlaceholderExpansion();
 
@@ -75,6 +80,13 @@ public final class PlainBase extends JavaPlugin {
                 r.register("plainbase", new PlainBaseCommand(this));
                 r.register("vanish", new VanishCommand(this));
                 r.register("menu", new MenuCommand(this));
+
+                r.register("ban", new BanCommand(this));
+                r.register("tempban", new TempBanCommand(this));
+                r.register("unban", new UnbanCommand(this));
+                r.register("kick", new KickCommand(this));
+                r.register("banlist", new BanListCommand(this));
+                r.register("baninfo", new BanInfoCommand(this));
             });
         }
 
@@ -194,6 +206,36 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().addPermission(
                 new Permission("plainbase.menu.list", "PlainBase: Allows access to /menu list", PermissionDefault.OP)
         );
+
+        // moderation module
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.admin", "PlainBase: Allows access to all permissions of the moderation module", PermissionDefault.OP)
+        );
+
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.ban", "PlainBase: Allows access to /ban", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.tempban", "PlainBase: Allows access to /tempban", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.unban", "PlainBase: Allows access to /unban", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.kick", "PlainBase: Allows access to /kick", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.banlist", "PlainBase: Allows access to /banlist", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.baninfo", "PlainBase: Allows access to /baninfo", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.notify", "PlainBase: Allows seeing ban/kick broadcasts when broadcast.staff-only is enabled", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.exempt", "PlainBase: Makes a player immune to /ban and /kick by non-admins", PermissionDefault.FALSE)
+        );
     }
 
     public void reloadModules() {
@@ -206,6 +248,7 @@ public final class PlainBase extends JavaPlugin {
         if (getConfig().getBoolean("modules.teleport", true)) setupTeleport();
         if (getConfig().getBoolean("modules.vanish", true)) setupVanish();
         if (getConfig().getBoolean("modules.menu", true)) setupMenu();
+        if (getConfig().getBoolean("modules.moderation", true)) setupModeration();
     }
 
     public void stopModules() {
@@ -229,6 +272,7 @@ public final class PlainBase extends JavaPlugin {
             menuManager.closeAllMenus();
         }
         menuManager = null;
+        banManager = null;
         org.bukkit.event.HandlerList.unregisterAll(this);
     }
 
@@ -380,6 +424,14 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().registerEvents(new MenuListener(this), this);
     }
 
+    public void setupModeration() {
+        loadModuleConfig("moderation.yml");
+
+        banManager = new BanManager(this);
+
+        getServer().getPluginManager().registerEvents(new ModerationListener(this), this);
+    }
+
     /**
      * Registers the %plainbase_*% PlaceholderAPI expansion when PlaceholderAPI
      * is present. Safe no-op otherwise (soft dependency).
@@ -416,6 +468,14 @@ public final class PlainBase extends JavaPlugin {
 
     public FileConfiguration getMenuConfig() {
         return configs.get("menu.yml");
+    }
+
+    public BanManager getBanManager() {
+        return banManager;
+    }
+
+    public FileConfiguration getModerationConfig() {
+        return configs.get("moderation.yml");
     }
 
     public void saveMenuConfig() {

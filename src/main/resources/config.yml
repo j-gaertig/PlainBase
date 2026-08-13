@@ -6,6 +6,7 @@ modules:
   teleport: false # More Settings in teleport.yml
   vanish: false # More Settings in vanish.yml
   menu: false # More Settings in menu.yml
+  moderation: false # More Settings in moderation.yml
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.5
+version: 1.6
