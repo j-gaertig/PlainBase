@@ -1,3 +1,8 @@
+# SAFETY: enabling ban/kick/ip-ban only makes the commands available —
+# nobody gets banned/kicked automatically, a staff member always has to run
+# the command first. The "broadcast" section below only fires as a
+# RESULT of a real staff action (an actual /ban etc.), so it's safe to
+# leave enabled by default, unlike the messages module's example broadcasts.
 ban:
   enabled: true
 

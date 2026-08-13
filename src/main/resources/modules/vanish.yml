@@ -1,4 +1,6 @@
 # Vanish Module
+# SAFETY: enabling this module only makes /vanish available — nobody is
+# vanished automatically, a player/OP always has to run the command first.
 vanish:
   enabled: true
   persist-on-rejoin: true         # Keep the vanish state across a rejoin

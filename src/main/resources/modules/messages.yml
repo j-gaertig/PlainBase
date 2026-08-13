@@ -5,8 +5,10 @@ messages:
   quit: "<gray>[<red>-</red>] <white>%player%</white>"
 
 # Welcome Message of the Day (MOTD)
+# SAFETY: disabled by default — the example line below is generic filler
+# text. Write your own MOTD, then set enabled: true.
 motd:
-  enabled: true
+  enabled: false
   lines:
     - "<gradient:gold:yellow>Welcome to our server!</gradient>"
     - ""

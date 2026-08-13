@@ -1,3 +1,6 @@
+# SAFETY: already opt-in by design. Both spawn points ship disabled and
+# nothing teleports anyone until you actually run /setspawn or
+# /setfirstspawn (which flips "enabled" to true for you automatically).
 spawn:
   enabled: false
   location:
