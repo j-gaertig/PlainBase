@@ -62,9 +62,31 @@ public class TeamManager {
         this.plugin = plugin;
         loadTeamDefinitions();
         loadState();
-        this.scoreboard = Bukkit.getScoreboardManager() != null ? Bukkit.getScoreboardManager().getMainScoreboard() : null;
-        syncScoreboardTeamDefinitions();
-        for (String teamId : memberships.keySet()) refreshScoreboardEntries(teamId);
+
+        // Folia currently considers ALL scoreboard API broken (global state it
+        // hasn't figured out region ownership for yet — not something we can
+        // work around by rescheduling). On Folia we skip the vanilla-scoreboard
+        // mirror entirely: memberships/roles/invites/commands/placeholders keep
+        // working, only the "/gamemode creative @a[team=pb_x]" selector trick
+        // is unavailable there.
+        if (isFolia()) {
+            this.scoreboard = null;
+            plugin.getLogger().info("Team module: running on Folia, scoreboard-based team selectors (@a[team=pb_<id>]) are disabled "
+                    + "because Folia's scoreboard API is currently unsupported. Team membership, roles, commands and placeholders are unaffected.");
+        } else {
+            this.scoreboard = Bukkit.getScoreboardManager() != null ? Bukkit.getScoreboardManager().getMainScoreboard() : null;
+            syncScoreboardTeamDefinitions();
+            for (String teamId : memberships.keySet()) refreshScoreboardEntries(teamId);
+        }
+    }
+
+    private static boolean isFolia() {
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
     }
 
     // ---------------------------------------------------------------
@@ -241,8 +263,12 @@ public class TeamManager {
         }
 
         // Adding directly also clears any pending invite/request for this team.
-        invites.getOrDefault(uuid, Set.of()).remove(id);
-        requests.getOrDefault(id, Set.of()).remove(uuid);
+        // (getOrDefault falls back to the immutable Set.of() when there's no
+        // entry yet — remove() on that throws, so only touch a real set.)
+        Set<String> pendingInvites = invites.get(uuid);
+        if (pendingInvites != null) pendingInvites.remove(id);
+        Set<UUID> pendingRequests = requests.get(id);
+        if (pendingRequests != null) pendingRequests.remove(uuid);
         saveInvites();
         saveRequests();
 
