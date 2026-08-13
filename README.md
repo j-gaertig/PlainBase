@@ -29,7 +29,8 @@
 | **Vanish** | Hide players from other players, the tab list and mobs. |
 | **Menu** | Config-driven, locked GUI menus. |
 | **Moderation** | Ban / tempban / unban / kick / IP-ban with database storage (SQLite/MySQL, cross-server). |
-| **PlaceholderAPI** | Optional `%plainbase_*%` expansion, no hard dependency. |
+
+Also supports **PlaceholderAPI** (optional, not a toggleable module) — auto-detected if installed, adds the `%plainbase_*%` expansion, zero effect if it's missing.
 
 **📖 Full documentation — every module in detail, every config option, permissions, and how the config-versioning/update system works — is in the [GitHub Wiki](https://github.com/j-gaertig/PlainBase/wiki).**
 
