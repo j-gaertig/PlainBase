@@ -104,16 +104,22 @@ public class BanManager {
                 newKicksByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
             }
 
-            bansCache.clear();
-            bansCache.addAll(bans);
-            kicksCache.clear();
-            kicksCache.addAll(kicks);
-            ipBansCache.clear();
-            ipBansCache.addAll(ipBans);
-            bansByUuid.clear();
-            bansByUuid.putAll(newBansByUuid);
-            kicksByUuid.clear();
-            kicksByUuid.putAll(newKicksByUuid);
+            // Swap the cache under the same lock the mutation methods use, so a
+            // ban/unban that commits to the DB between this method's reads and
+            // its cache swap can't have its cache update clobbered by a stale
+            // snapshot read just before it.
+            synchronized (mutationLock) {
+                bansCache.clear();
+                bansCache.addAll(bans);
+                kicksCache.clear();
+                kicksCache.addAll(kicks);
+                ipBansCache.clear();
+                ipBansCache.addAll(ipBans);
+                bansByUuid.clear();
+                bansByUuid.putAll(newBansByUuid);
+                kicksByUuid.clear();
+                kicksByUuid.putAll(newKicksByUuid);
+            }
         } catch (SQLException e) {
             plugin.getLogger().severe("Could not refresh moderation cache: " + e.getMessage());
         }
