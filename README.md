@@ -17,199 +17,23 @@
 
 ## Current Features
 
-### Core System
-*   **Modular Architecture:** You can enable and disable everything in the `config.yml`. No need for 20 different plugins.
-*   **High Performance:** It's built for modern Paper servers and works fine with Folia and Purpur too.
+*   **Modular Architecture:** Enable/disable every feature independently in `config.yml`. No need for 20 different plugins.
+*   **High Performance:** Built for modern Paper servers, works fine with Folia and Purpur too.
 
-### Teleportation Module (TPA & RTP)
-<details open>
-<summary>Details & Commands</summary>
-This is a big one. I finally added a proper teleport system that actually feels good to use.
-<ul>
-  <li><strong>TPA System:</strong> Send requests to players with <code>/tpa</code> or bring them to you with <code>/tpahere</code>.</li>
-  <li><strong>Auto-Accept:</strong> You can toggle auto-accept for your friends with <code>/tpauto</code>. Settings are saved even after you logout.</li>
-  <li><strong>Random Teleport (RTP):</strong> Get a random spot in the world. It has cooldowns and checks if the biome or block is safe (no more drowning in the ocean).</li>
-  <li><strong>Safety Features:</strong> Teleports can have a countdown and will cancel if you move or take damage.</li>
-</ul>
-
-| Command | Description | Permission |
-| :--- | :--- | :--- |
-| `/tpa <player>` | Ask to teleport to someone. | `plainbase.teleport.tpa.tpa` |
-| `/tpahere <player>` | Ask a player to teleport to you. | `plainbase.teleport.tpa.tpahere` |
-| `/tpaccept` | Accept a pending request. | `plainbase.teleport.tpa.tpaccept` |
-| `/tpdeny` | Deny a request. | `plainbase.teleport.tpa.tpdeny` |
-| `/tpacancel` | Cancel your sent request. | `plainbase.teleport.tpa.tpacancel` |
-| `/tpauto` | Toggle auto-accepting teleport requests. | `plainbase.teleport.tpa.tpauto` |
-| `/rtp` | Teleport to a random location. | `plainbase.teleport.rtp.rtp` |
-| *(all TPA commands)* | Grants every TPA permission above. | `plainbase.teleport.tpa.admin` |
-| *(all RTP commands)* | Grants every RTP permission above. | `plainbase.teleport.rtp.admin` |
-| *(all Teleport commands)* | Grants every permission of the Teleport module (TPA + RTP). | `plainbase.teleport.admin` |
-</details>
-
-### Advanced Spawn System
-<details>
-  <summary>Details & Commands</summary>
-  <ul>
-    <li>Set global or first-join spawn points.</li>
-    <li>Use relative coords like <code>~</code> when setting spawns.</li>
-    <li>Auto-teleport players when they join.</li>
-  </ul>
-
-| Command                  | Description                                  | Permission                          |
-|:-------------------------|:---------------------------------------------|:------------------------------------|
-| `/spawn`                 | Go to the spawn point.                       | `plainbase.spawn.spawn`             |
-| `/setspawn [x y z]`      | Set the global spawn.                        | `plainbase.spawn.setspawn`          |
-| `/disablespawn`          | Disable the global spawn.                    | `plainbase.spawn.disablespawn`      |
-| `/setfirstspawn [x y z]` | Set the spawn for new players.               | `plainbase.spawn.setfirstspawn`     |
-| `/disablefirstspawn`     | Disable the spawn for new players.           | `plainbase.spawn.disablefirstspawn` |
-| *(all Spawn commands)*   | Grants every permission of the Spawn module. | `plainbase.spawn.admin`             |
-</details>
-
-### Join Items System
-<details>
-  <summary>Details & Features</summary>
-  <ul>
-    <li>Give items to players on join automatically.</li>
-    <li>Full MiniMessage support for names and lore.</li>
-    <li>Click actions that run commands as the player.</li>
-    <li>Protection so players can't drop or move these items.</li>
-    <li>Supports custom player skulls.</li>
-  </ul>
-</details>
-
-### Messages & Broadcasts
-<details>
-  <summary>Details</summary>
-  <ul>
-    <li>Custom Join and Quit messages.</li>
-    <li>MOTD for when players enter the server.</li>
-    <li>Auto-Broadcast system with custom timers for announcements.</li>
-  </ul>
-</details>
-
-### Vanish Module
-<details>
-  <summary>Details & Commands</summary>
-  <ul>
-    <li>Vanish yourself, specific players, whole worlds or everyone.</li>
-    <li>Vanished players are hidden from the tab list, take no mob attention and projectiles pass through them.</li>
-    <li>Optional: invincibility, persist across rejoin, no collision / step sounds.</li>
-    <li>Players with the <code>plainbase.vanish.see</code> permission (or OPs, configurable) can still see vanished players.</li>
-  </ul>
-
-| Command | Description | Permission |
-| :--- | :--- | :--- |
-| `/vanish` | Toggle your own vanish. | `plainbase.vanish.vanish` |
-| `/vanish <player>` | Vanish another player. | `plainbase.vanish.vanish.other` |
-| `/vanish world` | Toggle vanish for all players in your world (including you). | `plainbase.vanish.world` |
-| `/vanish all` | Toggle vanish for all online players (including you). | `plainbase.vanish.all` |
-| *(all Vanish commands)* | Grants every permission of the Vanish module. | `plainbase.vanish.admin` |
-| *(see vanished)* | Allows seeing vanished players (default: OPs only). | `plainbase.vanish.see` |
-</details>
-
-### Menu Module
-<details>
-  <summary>Details & Commands</summary>
-  <ul>
-    <li>Create, delete and open fully config-driven menus via <code>/menu</code>.</li>
-    <li>Everything lives in <code>modules/menu.yml</code>: title (MiniMessage), size, fill material and per-slot items.</li>
-    <li>Items can run commands, play sounds, show messages and close the menu on click.</li>
-    <li>Menus are locked GUIs — players can't move or take items, and their own inventory below is not usable.</li>
-    <li>Full PlaceholderAPI support (<code>%player_name%</code>, <code>%plainbase_vanished%</code>, ...) in titles, names, lore and messages.</li>
-  </ul>
-
-| Command | Description | Permission |
-| :--- | :--- | :--- |
-| `/menu new <name>` | Creates a new menu template. | `plainbase.menu.new` |
-| `/menu delete <name>` | Deletes a menu. | `plainbase.menu.delete` |
-| `/menu open <name>` | Opens a menu. | `plainbase.menu.open` |
-| `/menu list` | Lists all available menus. | `plainbase.menu.list` |
-| *(all Menu commands)* | Grants every permission of the Menu module. | `plainbase.menu.admin` |
-</details>
-
-### Moderation Module (Ban, Tempban, Kick & IP-Ban)
-<details>
-  <summary>Details & Commands</summary>
-  <ul>
-    <li>Custom ban/tempban/unban/kick/IP-ban system — everything is stored by the player's <strong>UUID</strong> (name changes can never evade a ban) in a real database, not a config file.</li>
-    <li><strong>Cross-server ready:</strong> defaults to a local SQLite file (zero setup), or point every server in your network at the same <strong>MySQL</strong> database and they all enforce the exact same ban/IP-ban list — a ban issued on one server blocks the login on every other server immediately (login checks always query the database live, never a stale cache).</li>
-    <li>Full history is kept forever: total ban count, total kick count and the last ban reason are available via <code>/baninfo</code>, even after a ban expires or gets revoked.</li>
-    <li>Bans can be permanent (<code>/ban</code>) or timed (<code>/tempban</code>, e.g. <code>1d</code>, <code>2h30m</code>, <code>7d</code>).</li>
-    <li><strong>IP bans</strong> (<code>/banip</code>/<code>/unbanip</code>) are checked independently of name/UUID bans on every login — accepts a raw IP or a player name (resolves their last-known IP).</li>
-    <li>Fully configurable ban/kick/IP-ban/broadcast messages (MiniMessage) and storage backend in <code>modules/moderation.yml</code>.</li>
-    <li>Works for offline players too (pre-emptive bans) — a warning is shown if the target never joined the server before.</li>
-    <li><code>plainbase.moderation.exempt</code> protects a player from being banned/kicked by non-admins (online targets only).</li>
-    <li>All commands work from the console, matching vanilla's <code>/ban</code>/<code>/kick</code> — these commands replace the vanilla ones and use their own database instead of the vanilla ban list.</li>
-  </ul>
-
-| Command | Description | Permission |
-| :--- | :--- | :--- |
-| `/ban <player> [reason]` | Permanently ban a player. | `plainbase.moderation.ban` |
-| `/tempban <player> <duration> [reason]` | Temporarily ban a player. | `plainbase.moderation.tempban` |
-| `/unban <player>` | Revoke an active ban. | `plainbase.moderation.unban` |
-| `/kick <player> [reason]` | Kick an online player. | `plainbase.moderation.kick` |
-| `/banip <ip\|player> [reason]` | Ban an IP address (raw or resolved from a player name). | `plainbase.moderation.banip` |
-| `/unbanip <ip>` | Revoke an active IP ban. | `plainbase.moderation.unbanip` |
-| `/banlist [page]` | List all currently active bans and IP bans. | `plainbase.moderation.banlist` |
-| `/baninfo <player>` | Show ban status, total bans/kicks and the last ban reason. | `plainbase.moderation.baninfo` |
-| *(all Moderation commands)* | Grants every permission of the Moderation module. | `plainbase.moderation.admin` |
-| *(punishment immunity)* | Makes a player immune to `/ban`/`/kick` by non-admins (default: false). | `plainbase.moderation.exempt` |
-
-**Storage (`modules/moderation.yml` → `storage:`):**
-```yaml
-storage:
-  type: sqlite      # sqlite (default, local file) or mysql (shared across servers)
-  sqlite:
-    file: moderation.db
-  mysql:
-    host: localhost
-    port: 3306
-    database: plainbase
-    username: root
-    password: ""
-    table-prefix: "pb_"
-```
-</details>
-
-### PlaceholderAPI
-<details>
-  <summary>Details</summary>
-  <ul>
-    <li>Optional soft dependency — PlainBase works fully without it.</li>
-    <li>When installed, the <code>%plainbase_*%</code> expansion is registered automatically.</li>
-    <li>Placeholders are resolved in menu titles, item names/lore, messages and commands.</li>
-  </ul>
-
-| Placeholder | Description |
+| Module | What it does |
 | :--- | :--- |
-| `%plainbase_version%` | The current PlainBase version. |
-| `%plainbase_vanished%` | Whether the player is currently vanished (`true`/`false`). |
-| `%plainbase_moderation_bancount%` | How many times the player has ever been banned. |
-| `%plainbase_moderation_kickcount%` | How many times the player has ever been kicked. |
-| `%plainbase_moderation_banned%` | Whether the player currently has an active ban (`true`/`false`). |
-</details>
+| **Teleport (TPA & RTP)** | Player-to-player teleport requests + safe random teleport. |
+| **Spawn** | Global spawn + first-join spawn, teleport on join. |
+| **Join Items** | Give protected items to players automatically on join. |
+| **Messages & Broadcasts** | Join/quit messages, MOTD, timed chat broadcasts. |
+| **Vanish** | Hide players from other players, the tab list and mobs. |
+| **Menu** | Config-driven, locked GUI menus. |
+| **Moderation** | Ban / tempban / unban / kick / IP-ban with database storage (SQLite/MySQL, cross-server). |
+| **PlaceholderAPI** | Optional `%plainbase_*%` expansion, no hard dependency. |
 
----
+**📖 Full documentation — every module in detail, every config option, permissions, and how the config-versioning/update system works — is in the [GitHub Wiki](https://github.com/j-gaertig/PlainBase/wiki).**
 
-## Permissions
-
-**Default:** Every PlainBase permission defaults to **`OP`** — regular players won't have access to any command out of the box.
-
-To allow non-OP players (or specific ranks/groups) to use a command, grant the permission manually via your permissions plugin, e.g. with LuckPerms:
-`/lp group default permission set plainbase.teleport.tpa.tpa true`
-
-Use `plainbase.<module>.admin` nodes (or `plainbase.admin` for everything) to grant a whole module/module-section at once instead of individual commands.
-
----
-
-## General Management
-
-| Command | Description | Permission |
-| :--- |:--------------------------------------------------------| :--- |
-| `/plainbase reload` | Reloads all configs and modules instantly. | `plainbase.admin` |
-| `/plainbase update` | Checks Modrinth for a newer version. | `plainbase.admin` |
-| `/plainbase toggle <module>` | Enable/Disable modules while the server is running. | `plainbase.admin` |
-| *(everything above)* | Grants *every PlainBase permission across all modules*. | `plainbase.admin` |
+Quick links: [Installation](https://github.com/j-gaertig/PlainBase/wiki/Installation) · [Configuration & Versioning](https://github.com/j-gaertig/PlainBase/wiki/Configuration-and-Versioning) · [Permissions](https://github.com/j-gaertig/PlainBase/wiki/Permissions) · [Commands](https://github.com/j-gaertig/PlainBase/wiki/Commands)
 
 ---
 
