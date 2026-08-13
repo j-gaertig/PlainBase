@@ -29,6 +29,7 @@
 | **Vanish** | Hide players from other players, the tab list and mobs. |
 | **Menu** | Config-driven, locked GUI menus. |
 | **Moderation** | Ban / tempban / unban / kick / IP-ban with database storage (SQLite/MySQL, cross-server). |
+| **Team** | Config-defined player groups with MiniMessage colors (gradients/rainbow included), invite/accept/deny/request flow, per-team Member/Admin roles, and a real vanilla scoreboard mirror for `@a[team=pb_<id>]` selectors. |
 
 Also supports **PlaceholderAPI** (optional, not a toggleable module) — auto-detected if installed, adds the `%plainbase_*%` expansion, zero effect if it's missing.
 

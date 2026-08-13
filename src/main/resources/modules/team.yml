@@ -1,0 +1,120 @@
+team:
+  enabled: true
+
+  # How many teams a single player can be a member of at the same time.
+  max-teams-per-player: 1
+
+  # Every /team subcommand can be individually enabled/disabled here, in
+  # addition to needing its own permission node (see wiki: Module-Team).
+  # "team" is the master switch for the whole /team command tree.
+  commands:
+    team:
+      enabled: true
+    list:
+      enabled: true
+    info:
+      enabled: true
+    invites:
+      enabled: true
+    accept:
+      enabled: true
+    deny:
+      enabled: true
+    leave:
+      enabled: true
+    request:
+      enabled: true
+    requests:
+      enabled: true
+    invite:
+      enabled: true
+    add:
+      enabled: true
+    kick:
+      enabled: true
+    reject:
+      enabled: true
+    setrole:
+      enabled: true
+
+# Teams can ONLY be created/removed here — membership, roles, invites and
+# join requests are all managed at runtime via /team and are stored per
+# player (by UUID) in plugins/PlainBase/data/teams/, not here.
+#
+# "color" is a MiniMessage string used for the team's display name wherever
+# PlainBase shows it (chat, /team list|info, PAPI placeholders) — full
+# gradients and <rainbow> are supported there.
+#
+# Teams are also mirrored to a real vanilla scoreboard team (named "pb_<id>"
+# on the server's main scoreboard), so you can target a team's members in
+# ANY command that accepts a vanilla target selector, e.g.:
+#   /gamemode creative @a[team=pb_team1]
+#   /tp @a[team=pb_team1] 0 100 0
+# Vanilla scoreboard teams only support ONE flat color (no gradients/rainbow)
+# for things like glow/name-tint — PlainBase picks the closest vanilla color
+# to your "color" automatically. This does NOT affect the selector working,
+# only the small vanilla color accent. Not available on Folia (its scoreboard
+# API is currently unsupported there) — everything else still works.
+teams:
+  red:
+    display-name: "<red>Red Team"
+    color: "<red>"
+  blue:
+    display-name: "<blue>Blue Team"
+    color: "<blue>"
+  rainbow-example:
+    display-name: "<rainbow>Rainbow Team"
+    color: "<rainbow>"
+
+# All player-facing text below is MiniMessage. %player%, %team%, %role%,
+# %staff% are simple placeholders resolved before MiniMessage parsing.
+messages:
+  unknown-team: "<red>Unknown team: %team%"
+  not-in-team: "<red>You are not in team %team%."
+  already-in-team: "<red>%player% is already in team %team%."
+  already-member: "<red>You are already a member of %team%."
+  max-teams-reached: "<red>%player% is already in the maximum number of teams (%max%)."
+  not-admin: "<red>You must be a team admin of %team% to do this."
+  player-not-found: "<red>Could not resolve player: %player%"
+
+  invite-sent: "<green>Invited %player% to %team%."
+  invite-received: "<yellow>You have been invited to join <gray>%team%<yellow>! Use <green>/team accept %team% <yellow>or <red>/team deny %team%<yellow>."
+  invite-reminder-on-join: "<yellow>You still have a pending invite to <gray>%team%<yellow>. Use <green>/team accept %team% <yellow>or <red>/team deny %team%<yellow>."
+  invite-not-found: "<red>No pending invite to %team%."
+  invite-accepted: "<green>You joined %team%!"
+  invite-denied: "<gray>You declined the invite to %team%."
+  invite-already-pending: "<yellow>%player% already has a pending invite to %team%."
+
+  add-success: "<green>Added %player% to %team%."
+  kick-success: "<green>Removed %player% from %team%."
+  leave-success: "<gray>You left %team%."
+  leave-usage-multiple: "<red>You're in multiple teams — specify one: /team leave <team>"
+
+  request-sent: "<green>Join request for %team% sent to its admins."
+  request-received: "<yellow>%player% wants to join <gray>%team%<yellow>! Use <green>/team add %team% %player% <yellow>to accept or <red>/team reject %team% %player% <yellow>to reject."
+  request-not-found: "<red>No pending join request from %player% for %team%."
+  request-already-pending: "<yellow>You already have a pending join request for %team%."
+
+  setrole-success: "<green>%player% is now %role% in %team%."
+  invalid-role: "<red>Invalid role. Use <yellow>member <red>or <yellow>admin<red>."
+
+  list-header: "<gray>--- <yellow>Teams<gray> ---"
+  list-entry: "%team-display% <gray>(%count% members)"
+  info-header: "<gray>--- %team-display% <gray>---"
+  info-member: "<gray>- %player% <yellow>(%role%)"
+  info-empty: "<gray>This team has no members yet."
+
+  requests-header: "<gray>--- <yellow>Pending requests: %team%<gray> ---"
+  requests-empty: "<gray>No pending join requests for %team%."
+  requests-entry: "<gray>- %player%"
+
+  invites-header: "<gray>--- <yellow>Your pending invites<gray> ---"
+  invites-empty: "<gray>You have no pending invites."
+  invites-entry: "<gray>- %team%"
+
+  your-teams-header: "<gray>--- <yellow>Your teams<gray> ---"
+  your-teams-empty: "<gray>You are not in any team."
+  your-teams-entry: "<gray>- %team% <yellow>(%role%)"
+
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 1.1
