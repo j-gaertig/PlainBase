@@ -1,3 +1,5 @@
+# Only makes /ban, /kick and /banip available — nobody gets punished
+# automatically, a staff member always has to run the command first.
 ban:
   enabled: true
 

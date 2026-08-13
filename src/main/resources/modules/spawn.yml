@@ -1,5 +1,5 @@
 spawn:
-  enabled: false
+  enabled: false # opt-in — /setspawn flips this to true for you automatically
   location:
     world: world
     x: 0.0
@@ -9,7 +9,7 @@ spawn:
     pitch: 0.0
 
 first-spawn:
-  enabled: false
+  enabled: false # opt-in — /setfirstspawn flips this to true for you automatically
   location:
     world: world
     x: 0.0

@@ -6,11 +6,15 @@ menu:
       enabled: true
 
 # Define your menus here.
-# Each menu needs a unique name (kebab-case works best). Items are placed by
-# slot index. Titles, names and lore support MiniMessage and PlaceholderAPI
-# placeholders (if PlaceholderAPI is installed).
+# Each menu needs a unique name (kebab-case works best) and its own
+# "enabled: true" to actually be usable via /menu open|list — this keeps the
+# shipped example from cluttering /menu list on a fresh install until you've
+# reviewed/customized it. Items are placed by slot index. Titles, names and
+# lore support MiniMessage and PlaceholderAPI placeholders (if PlaceholderAPI
+# is installed).
 menus:
   example:
+    enabled: false
     title: "<yellow>Example Menu"
     size: 27 # 9, 18, 27, 36, 45 or 54
     fill-material: GRAY_STAINED_GLASS_PANE # optional: fills all empty slots
@@ -28,4 +32,4 @@ menus:
           - "spawn"
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.0
+version: 1.1

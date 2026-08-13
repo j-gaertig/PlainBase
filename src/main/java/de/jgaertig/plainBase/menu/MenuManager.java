@@ -79,6 +79,12 @@ public class MenuManager {
         if (section == null) return;
 
         for (String key : section.getKeys(false)) {
+            // A menu must be explicitly enabled to show up in /menu list|open.
+            // Default "true" keeps pre-existing configs (saved before this
+            // flag existed) working unchanged; the shipped example menu ships
+            // disabled so a fresh install doesn't expose an unreviewed demo.
+            if (!section.getBoolean(key + ".enabled", true)) continue;
+
             String title = section.getString(key + ".title", key);
             int size = section.getInt(key + ".size", 27);
 

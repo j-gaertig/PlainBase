@@ -1,5 +1,5 @@
 tpa:
-  enabled: true
+  enabled: true # only makes the commands available — nobody teleports until a player uses one
   request_timeout: 300 # in seconds
   counter:
     enabled: true

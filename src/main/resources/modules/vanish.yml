@@ -1,6 +1,6 @@
 # Vanish Module
 vanish:
-  enabled: true
+  enabled: true # only makes /vanish available — nobody is vanished automatically
   persist-on-rejoin: true         # Keep the vanish state across a rejoin
   no-collision: true              # Let other players walk through the vanished player
   no-step-sound: true             # Suppress all entity sounds (incl. steps) for the vanished player

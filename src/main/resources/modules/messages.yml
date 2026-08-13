@@ -5,15 +5,17 @@ messages:
   quit: "<gray>[<red>-</red>] <white>%player%</white>"
 
 # Welcome Message of the Day (MOTD)
+# Disabled by default — the line below is just generic filler text, write your own first.
 motd:
-  enabled: true
+  enabled: false
   lines:
     - "<gradient:gold:yellow>Welcome to our server!</gradient>"
     - ""
 
 # Broadcast Messages
+# Disabled by default — the examples reference "/report", which likely doesn't exist on your server.
 broadcasts:
-  enabled: true
+  enabled: false
   message1:
     text: "<yellow>Report unserious players by using /report</yellow>"
     cooldown: 300 # in seconds
@@ -22,4 +24,4 @@ broadcasts:
     cooldown: 60 # in seconds
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.0
+version: 1.1

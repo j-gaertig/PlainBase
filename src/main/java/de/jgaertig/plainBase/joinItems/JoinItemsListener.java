@@ -55,6 +55,14 @@ public class JoinItemsListener implements Listener {
         if (itemsSection == null) return;
 
         for (String key : itemsSection.getKeys(false)) {
+            // SAFETY: an item must be explicitly enabled to be handed out.
+            // Default is "true" in code so pre-existing configs (saved before
+            // this flag existed) keep working unchanged after an update; the
+            // shipped example config sets every example item to "false" so
+            // simply enabling this module does not silently overwrite a
+            // player's inventory with items nobody asked for.
+            if (!itemsSection.getBoolean(key + ".enabled", true)) continue;
+
             if (requiredFlag != null) {
                 List<String> flags = itemsSection.getStringList(key + ".flags");
                 if (!flags.contains(requiredFlag)) continue;
