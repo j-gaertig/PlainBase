@@ -63,7 +63,7 @@ public final class PlainBase extends JavaPlugin {
 
         saveDefaultConfig();
 
-        latestVersions.put("config.yml", 1.6);
+        latestVersions.put("config.yml", 1.7);
         latestVersions.put("spawn.yml", 1.2);
         latestVersions.put("joinitems.yml", 1.2);
         latestVersions.put("messages.yml", 1.1);
