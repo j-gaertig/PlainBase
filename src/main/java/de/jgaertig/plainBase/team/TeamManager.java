@@ -18,6 +18,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * Core logic for the Team module: team definitions (config-only), runtime
@@ -186,37 +187,47 @@ public class TeamManager {
         return invites.getOrDefault(uuid, Set.of()).contains(teamId.toLowerCase());
     }
 
+    /** Snapshot of a team's pending join requests (admin-facing). */
+    public Set<UUID> getPendingRequests(String teamId) {
+        return Set.copyOf(requests.getOrDefault(teamId.toLowerCase(), Set.of()));
+    }
+
+    /** Snapshot of a player's own pending invites, across every team. */
+    public Set<String> getPendingInvites(UUID uuid) {
+        return Set.copyOf(invites.getOrDefault(uuid, Set.of()));
+    }
+
     // ---------------------------------------------------------------
     // Actions (send their own feedback messages, matching TPAManager/VanishManager style)
     // ---------------------------------------------------------------
 
     public void invite(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase();
-        OfflinePlayer target = resolveTarget(staff, targetName);
-        if (target == null) return;
-        UUID uuid = target.getUniqueId();
+        resolveTarget(staff, targetName, target -> {
+            UUID uuid = target.getUniqueId();
 
-        if (isMember(uuid, id)) {
-            staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
-            return;
-        }
-        if (invites.getOrDefault(uuid, Set.of()).contains(id)) {
-            staff.sendMessage(msg("invite-already-pending", "player", targetName, "team", id));
-            return;
-        }
-        if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-            staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
-            return;
-        }
+            if (isMember(uuid, id)) {
+                staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
+                return;
+            }
+            if (invites.getOrDefault(uuid, Set.of()).contains(id)) {
+                staff.sendMessage(msg("invite-already-pending", "player", targetName, "team", id));
+                return;
+            }
+            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
+                staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
+                return;
+            }
 
-        invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
-        saveInvites();
-        staff.sendMessage(msg("invite-sent", "player", targetName, "team", id));
+            invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
+            saveInvites();
+            staff.sendMessage(msg("invite-sent", "player", targetName, "team", id));
 
-        Player online = Bukkit.getPlayer(uuid);
-        if (online != null) {
-            online.sendMessage(msg("invite-received", "team", id));
-        }
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) {
+                online.sendMessage(msg("invite-received", "team", id));
+            }
+        });
     }
 
     public void accept(Player player, String teamIdOrNull) {
@@ -249,52 +260,52 @@ public class TeamManager {
 
     public void add(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase();
-        OfflinePlayer target = resolveTarget(staff, targetName);
-        if (target == null) return;
-        UUID uuid = target.getUniqueId();
+        resolveTarget(staff, targetName, target -> {
+            UUID uuid = target.getUniqueId();
 
-        if (isMember(uuid, id)) {
-            staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
-            return;
-        }
-        if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-            staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
-            return;
-        }
+            if (isMember(uuid, id)) {
+                staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
+                return;
+            }
+            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
+                staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
+                return;
+            }
 
-        // Adding directly also clears any pending invite/request for this team.
-        // (getOrDefault falls back to the immutable Set.of() when there's no
-        // entry yet — remove() on that throws, so only touch a real set.)
-        Set<String> pendingInvites = invites.get(uuid);
-        if (pendingInvites != null) pendingInvites.remove(id);
-        Set<UUID> pendingRequests = requests.get(id);
-        if (pendingRequests != null) pendingRequests.remove(uuid);
-        saveInvites();
-        saveRequests();
+            // Adding directly also clears any pending invite/request for this team.
+            // (getOrDefault falls back to the immutable Set.of() when there's no
+            // entry yet — remove() on that throws, so only touch a real set.)
+            Set<String> pendingInvites = invites.get(uuid);
+            if (pendingInvites != null) pendingInvites.remove(id);
+            Set<UUID> pendingRequests = requests.get(id);
+            if (pendingRequests != null) pendingRequests.remove(uuid);
+            saveInvites();
+            saveRequests();
 
-        setMember(uuid, id, Role.MEMBER);
-        staff.sendMessage(msg("add-success", "player", targetName, "team", id));
+            setMember(uuid, id, Role.MEMBER);
+            staff.sendMessage(msg("add-success", "player", targetName, "team", id));
 
-        Player online = Bukkit.getPlayer(uuid);
-        if (online != null) online.sendMessage(msg("add-success", "player", online.getName(), "team", id));
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) online.sendMessage(msg("add-success", "player", online.getName(), "team", id));
+        });
     }
 
     public void kick(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase();
-        OfflinePlayer target = resolveTarget(staff, targetName);
-        if (target == null) return;
-        UUID uuid = target.getUniqueId();
+        resolveTarget(staff, targetName, target -> {
+            UUID uuid = target.getUniqueId();
 
-        if (!isMember(uuid, id)) {
-            staff.sendMessage(msg("not-in-team", "team", id));
-            return;
-        }
+            if (!isMember(uuid, id)) {
+                staff.sendMessage(msg("not-in-team", "team", id));
+                return;
+            }
 
-        removeMember(uuid, id);
-        staff.sendMessage(msg("kick-success", "player", targetName, "team", id));
+            removeMember(uuid, id);
+            staff.sendMessage(msg("kick-success", "player", targetName, "team", id));
 
-        Player online = Bukkit.getPlayer(uuid);
-        if (online != null) online.sendMessage(msg("kick-success", "player", online.getName(), "team", id));
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) online.sendMessage(msg("kick-success", "player", online.getName(), "team", id));
+        });
     }
 
     public void leave(Player player, String teamIdOrNull) {
@@ -352,18 +363,18 @@ public class TeamManager {
 
     public void denyRequest(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase();
-        OfflinePlayer target = resolveTarget(staff, targetName);
-        if (target == null) return;
-        UUID uuid = target.getUniqueId();
+        resolveTarget(staff, targetName, target -> {
+            UUID uuid = target.getUniqueId();
 
-        Set<UUID> pending = requests.getOrDefault(id, Set.of());
-        if (!pending.contains(uuid)) {
-            staff.sendMessage(msg("request-not-found", "player", targetName, "team", id));
-            return;
-        }
-        pending.remove(uuid);
-        saveRequests();
-        staff.sendMessage(msg("kick-success", "player", targetName, "team", id)); // reuse: "removed/rejected"
+            Set<UUID> pending = requests.getOrDefault(id, Set.of());
+            if (!pending.contains(uuid)) {
+                staff.sendMessage(msg("request-not-found", "player", targetName, "team", id));
+                return;
+            }
+            pending.remove(uuid);
+            saveRequests();
+            staff.sendMessage(msg("kick-success", "player", targetName, "team", id)); // reuse: "removed/rejected"
+        });
     }
 
     public void setRole(CommandSender staff, String teamId, String targetName, String roleStr) {
@@ -376,22 +387,22 @@ public class TeamManager {
             return;
         }
 
-        OfflinePlayer target = resolveTarget(staff, targetName);
-        if (target == null) return;
-        UUID uuid = target.getUniqueId();
+        resolveTarget(staff, targetName, target -> {
+            UUID uuid = target.getUniqueId();
 
-        if (!isMember(uuid, id)) {
-            staff.sendMessage(msg("not-in-team", "team", id));
-            return;
-        }
+            if (!isMember(uuid, id)) {
+                staff.sendMessage(msg("not-in-team", "team", id));
+                return;
+            }
 
-        setMember(uuid, id, role);
-        staff.sendMessage(msg("setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase()));
+            setMember(uuid, id, role);
+            staff.sendMessage(msg("setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase()));
 
-        Player online = Bukkit.getPlayer(uuid);
-        if (online != null) {
-            online.sendMessage(msg("setrole-success", "player", online.getName(), "team", id, "role", role.name().toLowerCase()));
-        }
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) {
+                online.sendMessage(msg("setrole-success", "player", online.getName(), "team", id, "role", role.name().toLowerCase()));
+            }
+        });
     }
 
     public void listTeams(CommandSender sender) {
@@ -421,6 +432,51 @@ public class TeamManager {
         for (Map.Entry<UUID, Role> entry : members.entrySet()) {
             String name = Optional.ofNullable(Bukkit.getOfflinePlayer(entry.getKey()).getName()).orElse(entry.getKey().toString());
             sender.sendMessage(msg("info-member", "player", name, "role", entry.getValue().name().toLowerCase()));
+        }
+    }
+
+    /**
+     * Admin-facing: list a team's pending join requests (people who ran
+     * /team &lt;team&gt; request and are waiting on an admin to /team add them).
+     */
+    public void listRequests(CommandSender sender, String teamId) {
+        String id = teamId.toLowerCase();
+        Set<UUID> pending = getPendingRequests(id);
+        sender.sendMessage(msg("requests-header", "team", id));
+        if (pending.isEmpty()) {
+            sender.sendMessage(msg("requests-empty", "team", id));
+            return;
+        }
+        for (UUID uuid : pending) {
+            String name = Optional.ofNullable(Bukkit.getOfflinePlayer(uuid).getName()).orElse(uuid.toString());
+            sender.sendMessage(msg("requests-entry", "player", name));
+        }
+    }
+
+    /** Self-facing: list the invites a player is currently sitting on. */
+    public void listInvites(Player player) {
+        Set<String> pending = getPendingInvites(player.getUniqueId());
+        player.sendMessage(msg("invites-header"));
+        if (pending.isEmpty()) {
+            player.sendMessage(msg("invites-empty"));
+            return;
+        }
+        for (String teamId : pending) {
+            player.sendMessage(msg("invites-entry", "team", teamId));
+        }
+    }
+
+    /** Self-facing summary used by "/team info" with no team argument. */
+    public void infoSelf(Player player) {
+        Set<String> memberOf = getPlayerTeams(player.getUniqueId());
+        player.sendMessage(msg("your-teams-header"));
+        if (memberOf.isEmpty()) {
+            player.sendMessage(msg("your-teams-empty"));
+            return;
+        }
+        for (String teamId : memberOf) {
+            Role role = getRole(player.getUniqueId(), teamId);
+            player.sendMessage(msg("your-teams-entry", "team", teamId, "role", role.name().toLowerCase()));
         }
     }
 
@@ -472,14 +528,39 @@ public class TeamManager {
         return null;
     }
 
-    private OfflinePlayer resolveTarget(CommandSender staff, String name) {
-        @SuppressWarnings("deprecation")
-        OfflinePlayer target = Bukkit.getOfflinePlayer(name);
-        if (target.getName() == null && !target.hasPlayedBefore()) {
-            staff.sendMessage(msg("player-not-found", "player", name));
-            return null;
+    /**
+     * Resolves a target by name without ever blocking the calling thread:
+     * online players and Paper's cached offline-player lookup resolve
+     * instantly; only an uncached, never-joined name falls back to the
+     * deprecated Bukkit#getOfflinePlayer(String), which can block on a
+     * Mojang lookup — so that call always runs on the async scheduler, with
+     * the callback dispatched back onto the main/region thread afterwards
+     * (same pattern as ModerationCommandBase#resolveTarget).
+     */
+    private void resolveTarget(CommandSender staff, String name, Consumer<OfflinePlayer> callback) {
+        Player online = Bukkit.getPlayer(name);
+        if (online != null) {
+            callback.accept(online);
+            return;
         }
-        return target;
+
+        OfflinePlayer cached = Bukkit.getOfflinePlayerIfCached(name);
+        if (cached != null) {
+            callback.accept(cached);
+            return;
+        }
+
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            @SuppressWarnings("deprecation")
+            OfflinePlayer resolved = Bukkit.getOfflinePlayer(name);
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                if (resolved.getName() == null && !resolved.hasPlayedBefore()) {
+                    staff.sendMessage(msg("player-not-found", "player", name));
+                    return;
+                }
+                callback.accept(resolved);
+            });
+        });
     }
 
     private void setMember(UUID uuid, String teamId, Role role) {
