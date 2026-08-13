@@ -43,6 +43,12 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
             case "version" -> plugin.getPluginMeta().getVersion();
             case "vanished" -> player != null && plugin.getVanishManager() != null
                     && plugin.getVanishManager().isVanished(player) ? "true" : "false";
+            case "moderation_bancount" -> player != null && plugin.getBanManager() != null
+                    ? String.valueOf(plugin.getBanManager().getBanCount(player.getUniqueId())) : "0";
+            case "moderation_kickcount" -> player != null && plugin.getBanManager() != null
+                    ? String.valueOf(plugin.getBanManager().getKickCount(player.getUniqueId())) : "0";
+            case "moderation_banned" -> player != null && plugin.getBanManager() != null
+                    && plugin.getBanManager().getActiveBan(player.getUniqueId()).isPresent() ? "true" : "false";
             default -> null;
         };
     }

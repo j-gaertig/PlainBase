@@ -1,0 +1,129 @@
+ban:
+  enabled: true
+
+kick:
+  enabled: true
+
+ip-ban:
+  enabled: true
+
+# Real database backend instead of a plain YAML file — this is what makes
+# bans/kicks/IP-bans shareable across multiple servers.
+storage:
+  # sqlite  = single local file (plugins/PlainBase/data/moderation.db), zero
+  #           extra setup, but only visible to THIS server.
+  # mysql   = point every server in your network at the same database and
+  #           they all enforce the same ban list.
+  type: sqlite
+
+  sqlite:
+    file: moderation.db
+
+  mysql:
+    host: localhost
+    port: 3306
+    database: plainbase
+    username: root
+    password: ""
+    table-prefix: "pb_"
+    useSSL: false
+    pool-size: 5
+
+  # How often the local read cache (used by /banlist, /baninfo, PAPI
+  # placeholders) re-syncs from the database. Login enforcement is NOT
+  # affected by this — it always queries the database directly, so a ban
+  # from another server (MySQL) is enforced immediately regardless of this value.
+  refresh-interval-seconds: 30
+
+broadcast:
+  enabled: true
+  # false = broadcast to everyone online. true = only to players with
+  # plainbase.moderation.notify (or plainbase.moderation.admin / plainbase.admin).
+  staff-only: false
+
+messages:
+  default-reason: "No reason specified."
+
+  ban-screen: |-
+    <red><bold>You are banned from this server!</bold>
+    <gray>Reason: <yellow>%reason%
+    <gray>Banned by: <yellow>%staff%
+    <gray>This ban is permanent.
+
+  tempban-screen: |-
+    <red><bold>You are temporarily banned from this server!</bold>
+    <gray>Reason: <yellow>%reason%
+    <gray>Banned by: <yellow>%staff%
+    <gray>Time remaining: <yellow>%remaining%
+
+  ipban-screen: |-
+    <red><bold>Your IP address is banned from this server!</bold>
+    <gray>Reason: <yellow>%reason%
+    <gray>Banned by: <yellow>%staff%
+    <gray>Time remaining: <yellow>%remaining%
+
+  kick-screen: |-
+    <red><bold>You have been kicked from the server!</bold>
+    <gray>Reason: <yellow>%reason%
+    <gray>Kicked by: <yellow>%staff%
+
+  already-banned: "<red>%player% is already banned."
+  not-banned: "<red>%player% is not currently banned."
+  ban-success: "<green>%player% has been permanently banned. <gray>(%reason%)"
+  tempban-success: "<green>%player% has been banned for <yellow>%duration%<green>. <gray>(%reason%)"
+  unban-success: "<green>%player% has been unbanned."
+  kick-success: "<green>%player% has been kicked. <gray>(%reason%)"
+  invalid-duration: "<red>Invalid duration. Use e.g. <yellow>1d<red>, <yellow>2h30m<red>, <yellow>7d<red> or <yellow>permanent<red>."
+  never-played: "<yellow>Warning: %player% has never played on this server. Banning by name."
+  player-not-found: "<red>Could not resolve player: %player%"
+  player-not-online: "<red>%player% is not online."
+  exempt: "<red>You cannot punish this player."
+
+  ip-already-banned: "<red>%ip% is already banned."
+  ip-not-banned: "<red>%ip% is not currently banned."
+  ip-not-found: "<red>Could not resolve an IP for %player%. They need to have joined at least once."
+  banip-success: "<green>%ip% has been banned. <gray>(%reason%)"
+  unbanip-success: "<green>%ip% has been unbanned."
+
+  ban-broadcast: "<red>%player% <gray>was permanently banned by <yellow>%staff% <gray>(%reason%)"
+  tempban-broadcast: "<red>%player% <gray>was banned by <yellow>%staff% <gray>for <yellow>%duration% <gray>(%reason%)"
+  unban-broadcast: "<green>%player% <gray>was unbanned by <yellow>%staff%"
+  kick-broadcast: "<yellow>%player% <gray>was kicked by <yellow>%staff% <gray>(%reason%)"
+  banip-broadcast: "<red>%ip% <gray>was banned by <yellow>%staff% <gray>(%reason%)"
+  unbanip-broadcast: "<green>%ip% <gray>was unbanned by <yellow>%staff%"
+
+  banlist-header: "<gray>--- <yellow>Active bans (%count%)<gray> ---"
+  banlist-entry: "<yellow>%player% <gray>- %reason% <gray>(%duration%)"
+  banlist-empty: "<gray>There are currently no active bans."
+  banlist-ip-header: "<gray>--- <yellow>Active IP bans (%count%)<gray> ---"
+  banlist-ip-entry: "<yellow>%ip% <gray>- %reason% <gray>(%duration%)"
+
+  baninfo-header: "<gray>--- <yellow>Ban info for %player%<gray> ---"
+  baninfo-status-banned: "<gray>Status: <red>Banned <gray>(%duration_left%)"
+  baninfo-status-clear: "<gray>Status: <green>Not banned"
+  baninfo-total-bans: "<gray>Total bans: <yellow>%bans%"
+  baninfo-total-kicks: "<gray>Total kicks: <yellow>%kicks%"
+  baninfo-last-ban: "<gray>Last ban reason: <yellow>%reason% <gray>by <yellow>%staff%"
+  baninfo-no-history: "<gray>No ban or kick history for this player."
+  baninfo-ip-banned: "<gray>Note: their last known IP address is currently banned too."
+
+commands:
+  ban:
+    enabled: true
+  tempban:
+    enabled: true
+  unban:
+    enabled: true
+  kick:
+    enabled: true
+  banlist:
+    enabled: true
+  baninfo:
+    enabled: true
+  banip:
+    enabled: true
+  unbanip:
+    enabled: true
+
+# DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+version: 2.0

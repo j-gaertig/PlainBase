@@ -127,6 +127,50 @@ This is a big one. I finally added a proper teleport system that actually feels 
 | *(all Menu commands)* | Grants every permission of the Menu module. | `plainbase.menu.admin` |
 </details>
 
+### Moderation Module (Ban, Tempban, Kick & IP-Ban)
+<details>
+  <summary>Details & Commands</summary>
+  <ul>
+    <li>Custom ban/tempban/unban/kick/IP-ban system — everything is stored by the player's <strong>UUID</strong> (name changes can never evade a ban) in a real database, not a config file.</li>
+    <li><strong>Cross-server ready:</strong> defaults to a local SQLite file (zero setup), or point every server in your network at the same <strong>MySQL</strong> database and they all enforce the exact same ban/IP-ban list — a ban issued on one server blocks the login on every other server immediately (login checks always query the database live, never a stale cache).</li>
+    <li>Full history is kept forever: total ban count, total kick count and the last ban reason are available via <code>/baninfo</code>, even after a ban expires or gets revoked.</li>
+    <li>Bans can be permanent (<code>/ban</code>) or timed (<code>/tempban</code>, e.g. <code>1d</code>, <code>2h30m</code>, <code>7d</code>).</li>
+    <li><strong>IP bans</strong> (<code>/banip</code>/<code>/unbanip</code>) are checked independently of name/UUID bans on every login — accepts a raw IP or a player name (resolves their last-known IP).</li>
+    <li>Fully configurable ban/kick/IP-ban/broadcast messages (MiniMessage) and storage backend in <code>modules/moderation.yml</code>.</li>
+    <li>Works for offline players too (pre-emptive bans) — a warning is shown if the target never joined the server before.</li>
+    <li><code>plainbase.moderation.exempt</code> protects a player from being banned/kicked by non-admins (online targets only).</li>
+    <li>All commands work from the console, matching vanilla's <code>/ban</code>/<code>/kick</code> — these commands replace the vanilla ones and use their own database instead of the vanilla ban list.</li>
+  </ul>
+
+| Command | Description | Permission |
+| :--- | :--- | :--- |
+| `/ban <player> [reason]` | Permanently ban a player. | `plainbase.moderation.ban` |
+| `/tempban <player> <duration> [reason]` | Temporarily ban a player. | `plainbase.moderation.tempban` |
+| `/unban <player>` | Revoke an active ban. | `plainbase.moderation.unban` |
+| `/kick <player> [reason]` | Kick an online player. | `plainbase.moderation.kick` |
+| `/banip <ip\|player> [reason]` | Ban an IP address (raw or resolved from a player name). | `plainbase.moderation.banip` |
+| `/unbanip <ip>` | Revoke an active IP ban. | `plainbase.moderation.unbanip` |
+| `/banlist [page]` | List all currently active bans and IP bans. | `plainbase.moderation.banlist` |
+| `/baninfo <player>` | Show ban status, total bans/kicks and the last ban reason. | `plainbase.moderation.baninfo` |
+| *(all Moderation commands)* | Grants every permission of the Moderation module. | `plainbase.moderation.admin` |
+| *(punishment immunity)* | Makes a player immune to `/ban`/`/kick` by non-admins (default: false). | `plainbase.moderation.exempt` |
+
+**Storage (`modules/moderation.yml` → `storage:`):**
+```yaml
+storage:
+  type: sqlite      # sqlite (default, local file) or mysql (shared across servers)
+  sqlite:
+    file: moderation.db
+  mysql:
+    host: localhost
+    port: 3306
+    database: plainbase
+    username: root
+    password: ""
+    table-prefix: "pb_"
+```
+</details>
+
 ### PlaceholderAPI
 <details>
   <summary>Details</summary>
@@ -140,6 +184,9 @@ This is a big one. I finally added a proper teleport system that actually feels 
 | :--- | :--- |
 | `%plainbase_version%` | The current PlainBase version. |
 | `%plainbase_vanished%` | Whether the player is currently vanished (`true`/`false`). |
+| `%plainbase_moderation_bancount%` | How many times the player has ever been banned. |
+| `%plainbase_moderation_kickcount%` | How many times the player has ever been kicked. |
+| `%plainbase_moderation_banned%` | Whether the player currently has an active ban (`true`/`false`). |
 </details>
 
 ---
@@ -167,10 +214,8 @@ Use `plainbase.<module>.admin` nodes (or `plainbase.admin` for everything) to gr
 ---
 
 ## Planned
-*   **Homes & Warps:** Its on my list for next updates.
+*   **Claims & Warps:** Its on my list for next updates.
 *   **Tablist & Sidebar:** Some simple stats and custom headers.
-*   **Moderations:** Kick, ban, etc.
-*   **GUIs:** A nice menu so you don't have to type commands for everything.
 *   **And more...**
 
 ---
