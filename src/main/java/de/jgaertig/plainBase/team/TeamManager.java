@@ -704,38 +704,54 @@ public class TeamManager {
         }
     }
 
+    // Each save*() schedules an independent async task; without a per-file
+    // lock, two near-simultaneous mutations to the same team could produce
+    // two tasks racing to write the same YAML file concurrently, risking an
+    // interleaved/corrupted write. Serializing per file (not one lock for
+    // all three) keeps members/invites/requests writes from blocking each
+    // other while still ruling out that race for each file individually.
+    private final Object membersFileLock = new Object();
+    private final Object invitesFileLock = new Object();
+    private final Object requestsFileLock = new Object();
+
     private void saveMemberships() {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            YamlConfiguration config = new YamlConfiguration();
-            for (Map.Entry<String, Map<UUID, Role>> teamEntry : memberships.entrySet()) {
-                for (Map.Entry<UUID, Role> memberEntry : teamEntry.getValue().entrySet()) {
-                    config.set(teamEntry.getKey() + "." + memberEntry.getKey(), memberEntry.getValue().name());
+            synchronized (membersFileLock) {
+                YamlConfiguration config = new YamlConfiguration();
+                for (Map.Entry<String, Map<UUID, Role>> teamEntry : memberships.entrySet()) {
+                    for (Map.Entry<UUID, Role> memberEntry : teamEntry.getValue().entrySet()) {
+                        config.set(teamEntry.getKey() + "." + memberEntry.getKey(), memberEntry.getValue().name());
+                    }
                 }
+                saveQuietly(config, "members.yml");
             }
-            saveQuietly(config, "members.yml");
         });
     }
 
     private void saveInvites() {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            YamlConfiguration config = new YamlConfiguration();
-            for (Map.Entry<UUID, Set<String>> entry : invites.entrySet()) {
-                if (!entry.getValue().isEmpty()) config.set(entry.getKey().toString(), new ArrayList<>(entry.getValue()));
+            synchronized (invitesFileLock) {
+                YamlConfiguration config = new YamlConfiguration();
+                for (Map.Entry<UUID, Set<String>> entry : invites.entrySet()) {
+                    if (!entry.getValue().isEmpty()) config.set(entry.getKey().toString(), new ArrayList<>(entry.getValue()));
+                }
+                saveQuietly(config, "invites.yml");
             }
-            saveQuietly(config, "invites.yml");
         });
     }
 
     private void saveRequests() {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            YamlConfiguration config = new YamlConfiguration();
-            for (Map.Entry<String, Set<UUID>> entry : requests.entrySet()) {
-                if (!entry.getValue().isEmpty()) {
-                    List<String> uuids = entry.getValue().stream().map(UUID::toString).toList();
-                    config.set(entry.getKey(), uuids);
+            synchronized (requestsFileLock) {
+                YamlConfiguration config = new YamlConfiguration();
+                for (Map.Entry<String, Set<UUID>> entry : requests.entrySet()) {
+                    if (!entry.getValue().isEmpty()) {
+                        List<String> uuids = entry.getValue().stream().map(UUID::toString).toList();
+                        config.set(entry.getKey(), uuids);
+                    }
                 }
+                saveQuietly(config, "requests.yml");
             }
-            saveQuietly(config, "requests.yml");
         });
     }
 
