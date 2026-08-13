@@ -1,8 +1,5 @@
-# SAFETY: enabling tpa/rtp only makes the commands available — nothing
-# teleports anyone automatically, every teleport still needs a player to
-# run a command (and, for TPA, the other side to accept). Safe to enable.
 tpa:
-  enabled: true
+  enabled: true # only makes the commands available — nobody teleports until a player uses one
   request_timeout: 300 # in seconds
   counter:
     enabled: true

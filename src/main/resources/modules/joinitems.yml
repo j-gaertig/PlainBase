@@ -2,10 +2,9 @@
 # You can change the items, their position, name, lore and commands as you like.
 # You can also add more items if you want to.
 #
-# SAFETY: every item needs "enabled: true" to actually be given to players.
-# All example items below ship DISABLED on purpose — simply turning this
-# module on will NOT overwrite anything in a player's inventory until you
-# explicitly enable the items you want.
+# Every item needs "enabled: true" to actually be given out — the examples
+# below ship disabled so enabling this module doesn't overwrite anything in
+# a player's inventory until you choose which items you actually want.
 
 items:
   spawn-teleporter:

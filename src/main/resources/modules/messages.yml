@@ -5,8 +5,7 @@ messages:
   quit: "<gray>[<red>-</red>] <white>%player%</white>"
 
 # Welcome Message of the Day (MOTD)
-# SAFETY: disabled by default — the example line below is generic filler
-# text. Write your own MOTD, then set enabled: true.
+# Disabled by default — the line below is just generic filler text, write your own first.
 motd:
   enabled: false
   lines:
@@ -14,9 +13,7 @@ motd:
     - ""
 
 # Broadcast Messages
-# SAFETY: disabled by default. The examples below reference things like
-# "/report" that likely don't exist on your server — write your own text
-# first, then set enabled: true.
+# Disabled by default — the examples reference "/report", which likely doesn't exist on your server.
 broadcasts:
   enabled: false
   message1:
