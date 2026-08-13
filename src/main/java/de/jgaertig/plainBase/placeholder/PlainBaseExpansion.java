@@ -97,7 +97,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
             case "team_primary" -> player != null && plugin.getTeamManager() != null
                     ? plugin.getTeamManager().getPlayerTeams(player.getUniqueId()).stream().findFirst().orElse("") : "";
             case "team_pending_invites" -> player != null && plugin.getTeamManager() != null
-                    ? String.valueOf(pendingInviteCount(player)) : "0";
+                    ? String.valueOf(plugin.getTeamManager().getPendingInvites(player.getUniqueId()).size()) : "0";
             case "teams_count" -> plugin.getTeamManager() != null
                     ? String.valueOf(plugin.getTeamManager().getTeams().size()) : "0";
 
@@ -122,15 +122,5 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
         }
 
         return null;
-    }
-
-    private int pendingInviteCount(Player player) {
-        int count = 0;
-        for (var def : plugin.getTeamManager().getTeams()) {
-            // getPlayerTeams only returns confirmed memberships, so we count
-            // invites the same way the manager tracks them per team below.
-            if (plugin.getTeamManager().isInvited(player.getUniqueId(), def.id())) count++;
-        }
-        return count;
     }
 }

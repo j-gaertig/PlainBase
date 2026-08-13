@@ -4,13 +4,42 @@ team:
   # How many teams a single player can be a member of at the same time.
   max-teams-per-player: 1
 
+  # Every /team subcommand can be individually enabled/disabled here, in
+  # addition to needing its own permission node (see wiki: Module-Team).
+  # "team" is the master switch for the whole /team command tree.
   commands:
     team:
+      enabled: true
+    list:
+      enabled: true
+    info:
+      enabled: true
+    invites:
+      enabled: true
+    accept:
+      enabled: true
+    deny:
+      enabled: true
+    leave:
+      enabled: true
+    request:
+      enabled: true
+    requests:
+      enabled: true
+    invite:
+      enabled: true
+    add:
+      enabled: true
+    kick:
+      enabled: true
+    reject:
+      enabled: true
+    setrole:
       enabled: true
 
 # Teams can ONLY be created/removed here — membership, roles, invites and
 # join requests are all managed at runtime via /team and are stored per
-# player (by UUID) in plugins/PlainBase/data/playerdata/<uuid>.yml, not here.
+# player (by UUID) in plugins/PlainBase/data/teams/, not here.
 #
 # "color" is a MiniMessage string used for the team's display name wherever
 # PlainBase shows it (chat, /team list|info, PAPI placeholders) — full
@@ -24,7 +53,8 @@ team:
 # Vanilla scoreboard teams only support ONE flat color (no gradients/rainbow)
 # for things like glow/name-tint — PlainBase picks the closest vanilla color
 # to your "color" automatically. This does NOT affect the selector working,
-# only the small vanilla color accent.
+# only the small vanilla color accent. Not available on Folia (its scoreboard
+# API is currently unsupported there) — everything else still works.
 teams:
   red:
     display-name: "<red>Red Team"
@@ -61,7 +91,7 @@ messages:
   leave-usage-multiple: "<red>You're in multiple teams — specify one: /team leave <team>"
 
   request-sent: "<green>Join request for %team% sent to its admins."
-  request-received: "<yellow>%player% wants to join <gray>%team%<yellow>! Use <green>/team %team% add %player% <yellow>to accept or <red>/team %team% deny %player% <yellow>to reject."
+  request-received: "<yellow>%player% wants to join <gray>%team%<yellow>! Use <green>/team add %team% %player% <yellow>to accept or <red>/team reject %team% %player% <yellow>to reject."
   request-not-found: "<red>No pending join request from %player% for %team%."
   request-already-pending: "<yellow>You already have a pending join request for %team%."
 
@@ -74,29 +104,17 @@ messages:
   info-member: "<gray>- %player% <yellow>(%role%)"
   info-empty: "<gray>This team has no members yet."
 
-commands:
-  team:
-    enabled: true
-  invite:
-    enabled: true
-  add:
-    enabled: true
-  kick:
-    enabled: true
-  leave:
-    enabled: true
-  request:
-    enabled: true
-  accept:
-    enabled: true
-  deny:
-    enabled: true
-  setrole:
-    enabled: true
-  list:
-    enabled: true
-  info:
-    enabled: true
+  requests-header: "<gray>--- <yellow>Pending requests: %team%<gray> ---"
+  requests-empty: "<gray>No pending join requests for %team%."
+  requests-entry: "<gray>- %player%"
+
+  invites-header: "<gray>--- <yellow>Your pending invites<gray> ---"
+  invites-empty: "<gray>You have no pending invites."
+  invites-entry: "<gray>- %team%"
+
+  your-teams-header: "<gray>--- <yellow>Your teams<gray> ---"
+  your-teams-empty: "<gray>You are not in any team."
+  your-teams-entry: "<gray>- %team% <yellow>(%role%)"
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.0
+version: 1.1
