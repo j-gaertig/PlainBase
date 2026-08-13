@@ -12,8 +12,11 @@ motd:
     - ""
 
 # Broadcast Messages
+# SAFETY: disabled by default. The examples below reference things like
+# "/report" that likely don't exist on your server — write your own text
+# first, then set enabled: true.
 broadcasts:
-  enabled: true
+  enabled: false
   message1:
     text: "<yellow>Report unserious players by using /report</yellow>"
     cooldown: 300 # in seconds
@@ -22,4 +25,4 @@ broadcasts:
     cooldown: 60 # in seconds
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.0
+version: 1.1
