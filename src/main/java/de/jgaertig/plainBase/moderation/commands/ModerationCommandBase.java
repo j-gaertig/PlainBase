@@ -10,9 +10,10 @@ import org.bukkit.entity.Player;
 import java.util.function.Consumer;
 
 /**
- * Shared helpers for the moderation commands (ban/tempban/unban/kick/banlist/baninfo):
- * module/permission/command-enabled checks (repo check-order convention), async
- * offline-player resolution and broadcast handling. Not a command itself.
+ * Shared helpers for the moderation commands (ban/tempban/unban/kick/banip/unbanip/
+ * banlist/baninfo): module/permission/command-enabled checks (repo check-order
+ * convention), async offline-player resolution, Folia-safe entity kicks, and
+ * broadcast handling. Not a command itself.
  */
 abstract class ModerationCommandBase {
 
@@ -33,6 +34,14 @@ abstract class ModerationCommandBase {
 
         if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.moderation.admin") && !sender.hasPermission(permissionNode)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
+            return false;
+        }
+
+        // Both null briefly during /plainbase reload (stopModules() clears the
+        // manager, setupModeration() re-creates it right after) — reject
+        // cleanly instead of NPE-ing on a null BanManager/config.
+        if (plugin.getModerationConfig() == null || plugin.getBanManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
             return false;
         }
 
@@ -87,6 +96,19 @@ abstract class ModerationCommandBase {
         // player object (no permissions plugin lookup for pure OfflinePlayer) —
         // documented limitation, matches the rest of the module's offline-ban scope.
         return online != null && online.hasPermission("plainbase.moderation.exempt");
+    }
+
+    /**
+     * Kicks an online player Folia-safely: Player#kick() mutates the target's
+     * connection/entity state, which on Folia must happen on THAT player's own
+     * region thread — not necessarily the thread the command executed on
+     * (which is the SENDER's region). Matches VanishManager's
+     * target.getScheduler().run(plugin, t -> ..., null) pattern.
+     */
+    protected void kickSafely(Player target, Component message) {
+        target.getScheduler().run(plugin, t -> {
+            if (target.isOnline()) target.kick(message);
+        }, null);
     }
 
     protected void broadcast(String message) {

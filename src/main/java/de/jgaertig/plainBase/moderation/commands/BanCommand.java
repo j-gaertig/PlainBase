@@ -30,6 +30,11 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
 
         if (!checkPreconditions(sender, "plainbase.moderation.ban", "ban")) return;
 
+        if (!plugin.getModerationConfig().getBoolean("ban.enabled", true)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Banning is currently disabled."));
+            return;
+        }
+
         if (args.length < 1) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/ban <player> [reason]"));
             return;
@@ -51,38 +56,38 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
             }
 
             String name = displayName(offlinePlayer, targetName);
-            BanManager manager = plugin.getBanManager();
-
-            if (manager.getActiveBan(offlinePlayer.getUniqueId()).isPresent()) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("already-banned", "<red>%player% is already banned.").replace("%player%", name)));
-                return;
-            }
 
             if (isExempt(offlinePlayer, sender)) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
                 return;
             }
 
-            manager.banPlayer(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, -1L);
+            BanManager manager = plugin.getBanManager();
+            manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, -1L, result -> {
+                if (result.isEmpty()) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("already-banned", "<red>%player% is already banned.").replace("%player%", name)));
+                    return;
+                }
 
-            Player online = offlinePlayer.getPlayer();
-            if (online != null) {
-                online.kick(plugin.getMiniMessage().deserialize(
-                        message("ban-screen", "<red>You are banned.\n<gray>Reason: %reason%")
-                                .replace("%reason%", reason)
-                                .replace("%staff%", staffName)));
-            } else if (!offlinePlayer.hasPlayedBefore()) {
+                Player online = offlinePlayer.getPlayer();
+                if (online != null) {
+                    kickSafely(online, plugin.getMiniMessage().deserialize(
+                            message("ban-screen", "<red>You are banned.\n<gray>Reason: %reason%")
+                                    .replace("%reason%", reason)
+                                    .replace("%staff%", staffName)));
+                } else if (!offlinePlayer.hasPlayedBefore()) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", name)));
+                }
+
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", name)));
-            }
+                        message("ban-success", "<green>%player% has been permanently banned. <gray>(%reason%)")
+                                .replace("%player%", name).replace("%reason%", reason)));
 
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("ban-success", "<green>%player% has been permanently banned. <gray>(%reason%)")
-                            .replace("%player%", name).replace("%reason%", reason)));
-
-            broadcast(message("ban-broadcast", "")
-                    .replace("%player%", name).replace("%staff%", staffName).replace("%reason%", reason));
+                broadcast(message("ban-broadcast", "")
+                        .replace("%player%", name).replace("%staff%", staffName).replace("%reason%", reason));
+            });
         });
     }
 

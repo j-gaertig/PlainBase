@@ -47,17 +47,18 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
             String name = displayName(offlinePlayer, targetName);
             BanManager manager = plugin.getBanManager();
 
-            boolean unbanned = manager.unbanPlayer(offlinePlayer.getUniqueId(), staffUuid, staffName);
-            if (!unbanned) {
+            manager.unbanPlayerAsync(offlinePlayer.getUniqueId(), staffUuid, staffName, unbanned -> {
+                if (!unbanned) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("not-banned", "<red>%player% is not currently banned.").replace("%player%", name)));
+                    return;
+                }
+
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("not-banned", "<red>%player% is not currently banned.").replace("%player%", name)));
-                return;
-            }
+                        message("unban-success", "<green>%player% has been unbanned.").replace("%player%", name)));
 
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("unban-success", "<green>%player% has been unbanned.").replace("%player%", name)));
-
-            broadcast(message("unban-broadcast", "").replace("%player%", name).replace("%staff%", staffName));
+                broadcast(message("unban-broadcast", "").replace("%player%", name).replace("%staff%", staffName));
+            });
         });
     }
 

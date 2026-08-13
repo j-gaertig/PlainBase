@@ -17,7 +17,8 @@ import java.util.stream.Collectors;
 
 /**
  * /baninfo <player> — current ban status + total ban/kick counts + last ban
- * reason. Everything keyed by UUID, so this survives name changes.
+ * reason + whether their last-known IP is currently banned too. Everything
+ * keyed by UUID, so this survives name changes.
  */
 public class BanInfoCommand extends ModerationCommandBase implements BasicCommand {
 
@@ -80,6 +81,20 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                             message("baninfo-last-ban", "<gray>Last ban reason: <yellow>%reason% by %staff%")
                                     .replace("%reason%", last.reason())
                                     .replace("%staff%", last.staffName()))));
+
+            // findLastIpByName() does blocking JDBC I/O — never call it directly
+            // on this main/region thread. Hop to the async scheduler, then back.
+            org.bukkit.Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+                String lastIp = manager.findLastIpByName(name);
+                if (lastIp == null) return;
+
+                long now = System.currentTimeMillis();
+                boolean ipBanned = manager.getActiveIpBans().stream().anyMatch(r -> r.ip().equals(lastIp) && r.isActive(now));
+                if (!ipBanned) return;
+
+                org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("baninfo-ip-banned", "<gray>Note: their last known IP address is currently banned too."))));
+            });
         });
     }
 

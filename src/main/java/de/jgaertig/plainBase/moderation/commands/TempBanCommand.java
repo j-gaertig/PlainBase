@@ -31,6 +31,11 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
 
         if (!checkPreconditions(sender, "plainbase.moderation.tempban", "tempban")) return;
 
+        if (!plugin.getModerationConfig().getBoolean("ban.enabled", true)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Banning is currently disabled."));
+            return;
+        }
+
         if (args.length < 2) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/tempban <player> <duration> [reason]"));
             return;
@@ -62,41 +67,42 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
             }
 
             String name = displayName(offlinePlayer, targetName);
-            BanManager manager = plugin.getBanManager();
-
-            if (manager.getActiveBan(offlinePlayer.getUniqueId()).isPresent()) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("already-banned", "<red>%player% is already banned.").replace("%player%", name)));
-                return;
-            }
 
             if (isExempt(offlinePlayer, sender)) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
                 return;
             }
 
-            manager.banPlayer(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration);
-            String durationText = DurationParser.format(finalDuration);
+            BanManager manager = plugin.getBanManager();
+            manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, result -> {
+                if (result.isEmpty()) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("already-banned", "<red>%player% is already banned.").replace("%player%", name)));
+                    return;
+                }
 
-            Player online = offlinePlayer.getPlayer();
-            if (online != null) {
-                online.kick(plugin.getMiniMessage().deserialize(
-                        message("tempban-screen", "<red>You are temporarily banned.\n<gray>Reason: %reason%\n<gray>Remaining: %remaining%")
-                                .replace("%reason%", reason)
-                                .replace("%staff%", staffName)
-                                .replace("%remaining%", durationText)));
-            } else if (!offlinePlayer.hasPlayedBefore()) {
+                String durationText = DurationParser.format(finalDuration);
+
+                Player online = offlinePlayer.getPlayer();
+                if (online != null) {
+                    kickSafely(online, plugin.getMiniMessage().deserialize(
+                            message("tempban-screen", "<red>You are temporarily banned.\n<gray>Reason: %reason%\n<gray>Remaining: %remaining%")
+                                    .replace("%reason%", reason)
+                                    .replace("%staff%", staffName)
+                                    .replace("%remaining%", durationText)));
+                } else if (!offlinePlayer.hasPlayedBefore()) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", name)));
+                }
+
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", name)));
-            }
+                        message("tempban-success", "<green>%player% has been banned for %duration%. <gray>(%reason%)")
+                                .replace("%player%", name).replace("%duration%", durationText).replace("%reason%", reason)));
 
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("tempban-success", "<green>%player% has been banned for %duration%. <gray>(%reason%)")
-                            .replace("%player%", name).replace("%duration%", durationText).replace("%reason%", reason)));
-
-            broadcast(message("tempban-broadcast", "")
-                    .replace("%player%", name).replace("%staff%", staffName)
-                    .replace("%duration%", durationText).replace("%reason%", reason));
+                broadcast(message("tempban-broadcast", "")
+                        .replace("%player%", name).replace("%staff%", staffName)
+                        .replace("%duration%", durationText).replace("%reason%", reason));
+            });
         });
     }
 

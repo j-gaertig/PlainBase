@@ -1,13 +1,11 @@
 package de.jgaertig.plainBase.moderation;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.moderation.storage.ModerationDatabase;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
-import org.bukkit.configuration.ConfigurationSection;
-import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.configuration.file.YamlConfiguration;
 
-import java.io.File;
-import java.io.IOException;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -15,47 +13,113 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
- * Holds every ban/kick record (active + historic) in memory, keyed by UUID
- * so a name change never evades a ban. Reads/writes go to
- * {@code plugins/PlainBase/data/bans.yml} and {@code data/kicks.yml}.
+ * Ban/kick/IP-ban storage backed by a real database (SQLite by default,
+ * MySQL opt-in for cross-server bans — see {@link ModerationDatabase}).
  * <p>
- * Loading happens once, synchronously, during {@code setupModeration()} —
- * i.e. at plugin/module startup, before any player can connect. That is the
- * same timing as {@code loadModuleConfig()} and is NOT a join-event read.
- * All later mutations are persisted via {@code Bukkit.getAsyncScheduler()},
- * matching {@code TPAManager#savePlayerData}. Lookups
- * (getActiveBan/getBanCount/...) are pure in-memory map reads and are safe
- * to call from {@code AsyncPlayerPreLoginEvent} (which runs off the main
- * thread) because {@link ConcurrentHashMap} and
- * {@link CopyOnWriteArrayList} are used throughout.
+ * Two read paths, deliberately different in freshness guarantee:
+ * <ul>
+ *   <li><b>Cached reads</b> (getActiveBan/getBanCount/getActiveBans/...) — an
+ *       in-memory snapshot refreshed at startup and on a periodic timer
+ *       (storage.refresh-interval-seconds). Fast, safe to call from any
+ *       thread, but on a MySQL/cross-server setup can be up to one refresh
+ *       interval stale. Used by commands (banlist, baninfo) where that's fine.</li>
+ *   <li><b>Live queries</b> (queryActiveBanNow/queryActiveIpBanNow) — hit the
+ *       DB directly, no caching. Used by ModerationListener's login check,
+ *       which is the one place staleness would actually matter (a ban issued
+ *       on another server must block a login on THIS server immediately).
+ *       Safe to call from AsyncPlayerPreLoginEvent because that event is
+ *       already off the main thread — blocking JDBC I/O there is the
+ *       intended use of that event, not a violation of the repo's
+ *       "no sync IO in join events" rule (which targets the main-thread
+ *       PlayerJoinEvent, not this async pre-login hook).</li>
+ * </ul>
+ * All WRITES (tryBanAsync/unbanPlayerAsync/recordKickAsync/tryBanIpAsync/
+ * unbanIpAsync) run on Bukkit.getAsyncScheduler() and report back to the
+ * caller via Bukkit.getGlobalRegionScheduler().run() — the same
+ * async-then-region-hop pattern PlainBaseCommand uses for the Modrinth
+ * update check — because a direct DB write from the command's own thread
+ * would block the main/region thread on Paper/Folia.
  */
 public class BanManager {
 
     private final PlainBase plugin;
+    private final ModerationDatabase db;
 
-    private final List<BanRecord> bans = new CopyOnWriteArrayList<>();
-    private final List<KickRecord> kicks = new CopyOnWriteArrayList<>();
+    private final List<BanRecord> bansCache = new CopyOnWriteArrayList<>();
+    private final List<KickRecord> kicksCache = new CopyOnWriteArrayList<>();
+    private final List<IpBanRecord> ipBansCache = new CopyOnWriteArrayList<>();
     private final Map<UUID, List<BanRecord>> bansByUuid = new ConcurrentHashMap<>();
     private final Map<UUID, List<KickRecord>> kicksByUuid = new ConcurrentHashMap<>();
 
-    private final AtomicInteger nextBanId = new AtomicInteger(1);
-    private final AtomicInteger nextKickId = new AtomicInteger(1);
+    // Guards check-then-act ban/unban mutations on THIS server instance so two
+    // near-simultaneous /ban calls on the same target can't both pass the
+    // "not already banned" check. Does NOT protect against a genuinely
+    // simultaneous ban from a second server on a shared MySQL backend — that
+    // is an accepted, documented limitation for this beta (last-write-wins).
+    private final Object mutationLock = new Object();
 
-    // Serializes the actual file writes so two save calls in quick succession
-    // (e.g. ban immediately followed by unban) can never interleave their
-    // writes to the same bans.yml/kicks.yml on different async-scheduler threads.
-    private final Object bansFileLock = new Object();
-    private final Object kicksFileLock = new Object();
+    private ScheduledTask refreshTask;
 
-    public BanManager(PlainBase plugin) {
+    public BanManager(PlainBase plugin) throws SQLException {
         this.plugin = plugin;
-        load();
+        this.db = new ModerationDatabase(plugin);
+        db.connect();
+        refreshCacheBlocking();
+        startPeriodicRefresh();
     }
 
-    // ---- Queries (thread-safe, safe to call async) ----
+    public void shutdown() {
+        if (refreshTask != null) refreshTask.cancel();
+        db.close();
+    }
+
+    // ---- Cache refresh ----
+
+    private void startPeriodicRefresh() {
+        long seconds = Math.max(5, plugin.getModerationConfig().getLong("storage.refresh-interval-seconds", 30));
+        refreshTask = Bukkit.getAsyncScheduler().runAtFixedRate(plugin, task -> refreshCacheBlocking(), seconds, seconds, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Blocking DB read — only call from an async context (constructor runs at
+     * startup before players can connect, same as loadModuleConfig(); the
+     * periodic task runs on Bukkit.getAsyncScheduler()).
+     */
+    private void refreshCacheBlocking() {
+        try {
+            List<BanRecord> bans = db.loadAllBans();
+            List<KickRecord> kicks = db.loadAllKicks();
+            List<IpBanRecord> ipBans = db.loadAllIpBans();
+
+            Map<UUID, List<BanRecord>> newBansByUuid = new ConcurrentHashMap<>();
+            for (BanRecord record : bans) {
+                newBansByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
+            }
+            Map<UUID, List<KickRecord>> newKicksByUuid = new ConcurrentHashMap<>();
+            for (KickRecord record : kicks) {
+                newKicksByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
+            }
+
+            bansCache.clear();
+            bansCache.addAll(bans);
+            kicksCache.clear();
+            kicksCache.addAll(kicks);
+            ipBansCache.clear();
+            ipBansCache.addAll(ipBans);
+            bansByUuid.clear();
+            bansByUuid.putAll(newBansByUuid);
+            kicksByUuid.clear();
+            kicksByUuid.putAll(newKicksByUuid);
+        } catch (SQLException e) {
+            plugin.getLogger().severe("Could not refresh moderation cache: " + e.getMessage());
+        }
+    }
+
+    // ---- Cached queries (thread-safe, safe to call from any thread) ----
 
     public Optional<BanRecord> getActiveBan(UUID uuid) {
         long now = System.currentTimeMillis();
@@ -96,210 +160,188 @@ public class BanManager {
     public List<BanRecord> getActiveBans() {
         long now = System.currentTimeMillis();
         List<BanRecord> active = new ArrayList<>();
-        for (BanRecord record : bans) {
+        for (BanRecord record : bansCache) {
             if (record.isActive(now)) active.add(record);
         }
         active.sort((a, b) -> Long.compare(b.bannedAt(), a.bannedAt()));
         return active;
     }
 
-    // ---- Mutations ----
+    public List<IpBanRecord> getActiveIpBans() {
+        long now = System.currentTimeMillis();
+        List<IpBanRecord> active = new ArrayList<>();
+        for (IpBanRecord record : ipBansCache) {
+            if (record.isActive(now)) active.add(record);
+        }
+        active.sort((a, b) -> Long.compare(b.bannedAt(), a.bannedAt()));
+        return active;
+    }
 
-    public BanRecord banPlayer(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long durationMillis) {
-        BanRecord record = new BanRecord(
-                nextBanId.getAndIncrement(), uuid, name, reason, staffUuid, staffName,
-                System.currentTimeMillis(), durationMillis, false, null, "", 0L
-        );
-        bans.add(record);
-        bansByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
-        saveBans();
-        return record;
+    // ---- Live, uncached DB queries — used for login enforcement ----
+
+    /**
+     * Authoritative check, hits the DB directly (no cache). Only call from an
+     * already-async context (AsyncPlayerPreLoginEvent, or your own async task).
+     */
+    public BanRecord queryActiveBanNow(UUID uuid) throws SQLException {
+        return db.findActiveBan(uuid, System.currentTimeMillis());
+    }
+
+    public IpBanRecord queryActiveIpBanNow(String ip) throws SQLException {
+        return db.findActiveIpBan(ip, System.currentTimeMillis());
     }
 
     /**
-     * @return true if an active ban was found and revoked, false if the player wasn't banned
+     * Records the player's current IP for later "/banip <name>" resolution.
+     * Blocking DB write — only call from an already-async context.
      */
-    public boolean unbanPlayer(UUID uuid, UUID staffUuid, String staffName) {
-        Optional<BanRecord> active = getActiveBan(uuid);
-        if (active.isEmpty()) return false;
-
-        BanRecord old = active.get();
-        BanRecord revoked = old.withRevoked(staffUuid, staffName, System.currentTimeMillis());
-
-        List<BanRecord> history = bansByUuid.get(uuid);
-        int idx = history.indexOf(old);
-        if (idx >= 0) history.set(idx, revoked);
-
-        int allIdx = bans.indexOf(old);
-        if (allIdx >= 0) bans.set(allIdx, revoked);
-
-        saveBans();
-        return true;
-    }
-
-    public KickRecord recordKick(UUID uuid, String name, String reason, UUID staffUuid, String staffName) {
-        KickRecord record = new KickRecord(nextKickId.getAndIncrement(), uuid, name, reason, staffUuid, staffName, System.currentTimeMillis());
-        kicks.add(record);
-        kicksByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
-        saveKicks();
-        return record;
-    }
-
-    // ---- Persistence ----
-
-    private File bansFile() {
-        return new File(plugin.getDataFolder(), "data/bans.yml");
-    }
-
-    private File kicksFile() {
-        return new File(plugin.getDataFolder(), "data/kicks.yml");
-    }
-
-    private void load() {
-        File bf = bansFile();
-        if (bf.exists()) {
-            FileConfiguration config = YamlConfiguration.loadConfiguration(bf);
-            nextBanId.set(config.getInt("next-id", 1));
-            ConfigurationSection section = config.getConfigurationSection("bans");
-            if (section != null) {
-                for (String key : section.getKeys(false)) {
-                    try {
-                        BanRecord record = readBan(section, key);
-                        bans.add(record);
-                        bansByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
-                    } catch (Exception e) {
-                        plugin.getLogger().warning("Could not read ban entry " + key + ": " + e.getMessage());
-                    }
-                }
-            }
-        }
-
-        File kf = kicksFile();
-        if (kf.exists()) {
-            FileConfiguration config = YamlConfiguration.loadConfiguration(kf);
-            nextKickId.set(config.getInt("next-id", 1));
-            ConfigurationSection section = config.getConfigurationSection("kicks");
-            if (section != null) {
-                for (String key : section.getKeys(false)) {
-                    try {
-                        KickRecord record = readKick(section, key);
-                        kicks.add(record);
-                        kicksByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
-                    } catch (Exception e) {
-                        plugin.getLogger().warning("Could not read kick entry " + key + ": " + e.getMessage());
-                    }
-                }
-            }
-        }
-    }
-
-    private BanRecord readBan(ConfigurationSection section, String key) {
-        String p = key + ".";
-        return new BanRecord(
-                Integer.parseInt(key),
-                UUID.fromString(section.getString(p + "uuid")),
-                section.getString(p + "name", "?"),
-                section.getString(p + "reason", "No reason specified."),
-                parseUuidOrNull(section.getString(p + "staff-uuid")),
-                section.getString(p + "staff-name", "Console"),
-                section.getLong(p + "banned-at"),
-                section.getLong(p + "duration", -1L),
-                section.getBoolean(p + "revoked", false),
-                parseUuidOrNull(section.getString(p + "unbanned-by-uuid")),
-                section.getString(p + "unbanned-by-name", ""),
-                section.getLong(p + "unbanned-at", 0L)
-        );
-    }
-
-    private KickRecord readKick(ConfigurationSection section, String key) {
-        String p = key + ".";
-        return new KickRecord(
-                Integer.parseInt(key),
-                UUID.fromString(section.getString(p + "uuid")),
-                section.getString(p + "name", "?"),
-                section.getString(p + "reason", "No reason specified."),
-                parseUuidOrNull(section.getString(p + "staff-uuid")),
-                section.getString(p + "staff-name", "Console"),
-                section.getLong(p + "kicked-at")
-        );
-    }
-
-    private UUID parseUuidOrNull(String s) {
-        if (s == null || s.isEmpty()) return null;
+    public void trackPlayerIp(UUID uuid, String name, String ip) {
         try {
-            return UUID.fromString(s);
-        } catch (IllegalArgumentException e) {
+            db.trackPlayerIp(uuid, name, ip);
+        } catch (SQLException e) {
+            plugin.getLogger().warning("Could not track player IP for " + name + ": " + e.getMessage());
+        }
+    }
+
+    public String findLastIpByName(String name) {
+        try {
+            return db.findLastIpByName(name);
+        } catch (SQLException e) {
+            plugin.getLogger().warning("Could not look up last IP for " + name + ": " + e.getMessage());
             return null;
         }
     }
 
-    /**
-     * Persisted off the main thread (Bukkit.getAsyncScheduler()), same pattern as
-     * TPAManager#savePlayerData — never blocks the caller's thread with file IO.
-     */
-    private void saveBans() {
-        // Snapshot is taken INSIDE the async task (at execution time), not
-        // before scheduling: multiple ban/unban calls in quick succession
-        // each schedule their own save, and async tasks are not guaranteed
-        // to finish in submission order. Reading the CopyOnWriteArrayList
-        // fresh when the task actually runs means every write reflects
-        // whatever is truly current at that moment (mutations always happen
-        // synchronously on the calling thread before scheduling), so a
-        // late-finishing older task can never clobber a newer one's data.
+    // ---- Async mutations — always call back via the global region scheduler ----
+
+    public void tryBanAsync(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long durationMillis, Consumer<Optional<BanRecord>> callback) {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            synchronized (bansFileLock) {
-                List<BanRecord> snapshot = List.copyOf(bans);
-                YamlConfiguration config = new YamlConfiguration();
-                config.set("next-id", nextBanId.get());
-                for (BanRecord record : snapshot) {
-                    String p = "bans." + record.id() + ".";
-                    config.set(p + "uuid", record.uuid().toString());
-                    config.set(p + "name", record.name());
-                    config.set(p + "reason", record.reason());
-                    config.set(p + "staff-uuid", record.staffUuid() == null ? "" : record.staffUuid().toString());
-                    config.set(p + "staff-name", record.staffName());
-                    config.set(p + "banned-at", record.bannedAt());
-                    config.set(p + "duration", record.duration());
-                    config.set(p + "revoked", record.revoked());
-                    config.set(p + "unbanned-by-uuid", record.unbannedByUuid() == null ? "" : record.unbannedByUuid().toString());
-                    config.set(p + "unbanned-by-name", record.unbannedByName());
-                    config.set(p + "unbanned-at", record.unbannedAt());
-                }
-                try {
-                    File file = bansFile();
-                    file.getParentFile().mkdirs();
-                    config.save(file);
-                } catch (IOException e) {
-                    plugin.getLogger().severe("Could not save bans.yml: " + e.getMessage());
+            Optional<BanRecord> result;
+            synchronized (mutationLock) {
+                if (getActiveBan(uuid).isPresent()) {
+                    result = Optional.empty();
+                } else {
+                    try {
+                        BanRecord record = db.insertBan(uuid, name, reason, staffUuid, staffName, durationMillis);
+                        bansCache.add(record);
+                        bansByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
+                        result = Optional.of(record);
+                    } catch (SQLException e) {
+                        plugin.getLogger().severe("Could not insert ban for " + name + ": " + e.getMessage());
+                        result = Optional.empty();
+                    }
                 }
             }
+            Optional<BanRecord> finalResult = result;
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalResult));
         });
     }
 
-    private void saveKicks() {
-        // Same execution-time-snapshot reasoning as saveBans() above.
+    public void unbanPlayerAsync(UUID uuid, UUID staffUuid, String staffName, Consumer<Boolean> callback) {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            synchronized (kicksFileLock) {
-                List<KickRecord> snapshot = List.copyOf(kicks);
-                YamlConfiguration config = new YamlConfiguration();
-                config.set("next-id", nextKickId.get());
-                for (KickRecord record : snapshot) {
-                    String p = "kicks." + record.id() + ".";
-                    config.set(p + "uuid", record.uuid().toString());
-                    config.set(p + "name", record.name());
-                    config.set(p + "reason", record.reason());
-                    config.set(p + "staff-uuid", record.staffUuid() == null ? "" : record.staffUuid().toString());
-                    config.set(p + "staff-name", record.staffName());
-                    config.set(p + "kicked-at", record.kickedAt());
-                }
-                try {
-                    File file = kicksFile();
-                    file.getParentFile().mkdirs();
-                    config.save(file);
-                } catch (IOException e) {
-                    plugin.getLogger().severe("Could not save kicks.yml: " + e.getMessage());
+            boolean success;
+            synchronized (mutationLock) {
+                Optional<BanRecord> active = getActiveBan(uuid);
+                if (active.isEmpty()) {
+                    success = false;
+                } else {
+                    BanRecord old = active.get();
+                    long now = System.currentTimeMillis();
+                    try {
+                        db.revokeBan(old.id(), staffUuid, staffName, now);
+                        BanRecord revoked = old.withRevoked(staffUuid, staffName, now);
+                        replaceBanById(bansByUuid.get(uuid), old.id(), revoked);
+                        replaceBanById(bansCache, old.id(), revoked);
+                        success = true;
+                    } catch (SQLException e) {
+                        plugin.getLogger().severe("Could not revoke ban for " + uuid + ": " + e.getMessage());
+                        success = false;
+                    }
                 }
             }
+            boolean finalSuccess = success;
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalSuccess));
         });
+    }
+
+    public void recordKickAsync(UUID uuid, String name, String reason, UUID staffUuid, String staffName, Runnable onDone) {
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            try {
+                KickRecord record = db.insertKick(uuid, name, reason, staffUuid, staffName);
+                kicksCache.add(record);
+                kicksByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
+            } catch (SQLException e) {
+                plugin.getLogger().severe("Could not record kick for " + name + ": " + e.getMessage());
+            }
+            if (onDone != null) Bukkit.getGlobalRegionScheduler().run(plugin, t -> onDone.run());
+        });
+    }
+
+    public void tryBanIpAsync(String ip, String reason, UUID staffUuid, String staffName, long durationMillis, Consumer<Optional<IpBanRecord>> callback) {
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            Optional<IpBanRecord> result;
+            synchronized (mutationLock) {
+                long now = System.currentTimeMillis();
+                boolean alreadyBanned = ipBansCache.stream().anyMatch(r -> r.ip().equals(ip) && r.isActive(now));
+                if (alreadyBanned) {
+                    result = Optional.empty();
+                } else {
+                    try {
+                        IpBanRecord record = db.insertIpBan(ip, reason, staffUuid, staffName, durationMillis);
+                        ipBansCache.add(record);
+                        result = Optional.of(record);
+                    } catch (SQLException e) {
+                        plugin.getLogger().severe("Could not insert IP ban for " + ip + ": " + e.getMessage());
+                        result = Optional.empty();
+                    }
+                }
+            }
+            Optional<IpBanRecord> finalResult = result;
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalResult));
+        });
+    }
+
+    public void unbanIpAsync(String ip, UUID staffUuid, String staffName, Consumer<Boolean> callback) {
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            boolean success;
+            synchronized (mutationLock) {
+                long now = System.currentTimeMillis();
+                IpBanRecord old = ipBansCache.stream().filter(r -> r.ip().equals(ip) && r.isActive(now)).findFirst().orElse(null);
+                if (old == null) {
+                    success = false;
+                } else {
+                    try {
+                        db.revokeIpBan(old.id(), staffUuid, staffName, now);
+                        IpBanRecord revoked = old.withRevoked(staffUuid, staffName, now);
+                        replaceIpBanById(ipBansCache, old.id(), revoked);
+                        success = true;
+                    } catch (SQLException e) {
+                        plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
+                        success = false;
+                    }
+                }
+            }
+            boolean finalSuccess = success;
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalSuccess));
+        });
+    }
+
+    private void replaceBanById(List<BanRecord> list, int id, BanRecord replacement) {
+        if (list == null) return;
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i).id() == id) {
+                list.set(i, replacement);
+                return;
+            }
+        }
+    }
+
+    private void replaceIpBanById(List<IpBanRecord> list, int id, IpBanRecord replacement) {
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i).id() == id) {
+                list.set(i, replacement);
+                return;
+            }
+        }
     }
 }

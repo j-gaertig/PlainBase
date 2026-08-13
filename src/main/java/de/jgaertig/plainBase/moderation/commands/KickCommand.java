@@ -15,7 +15,7 @@ import java.util.stream.Collectors;
 
 /**
  * /kick <player> [reason] — only works on online players (kicks are not
- * persistent bans), but is still recorded in kicks.yml for /baninfo history.
+ * persistent bans), but is still recorded in the database for /baninfo history.
  */
 public class KickCommand extends ModerationCommandBase implements BasicCommand {
 
@@ -58,20 +58,24 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
         String targetName = target.getName();
+        UUID targetUuid = target.getUniqueId();
 
-        plugin.getBanManager().recordKick(target.getUniqueId(), targetName, reason, staffUuid, staffName);
+        plugin.getBanManager().recordKickAsync(targetUuid, targetName, reason, staffUuid, staffName, () -> {
+            Player stillOnline = Bukkit.getPlayer(targetUuid);
+            if (stillOnline != null) {
+                kickSafely(stillOnline, plugin.getMiniMessage().deserialize(
+                        message("kick-screen", "<red>You have been kicked.\n<gray>Reason: %reason%")
+                                .replace("%reason%", reason)
+                                .replace("%staff%", staffName)));
+            }
 
-        target.kick(plugin.getMiniMessage().deserialize(
-                message("kick-screen", "<red>You have been kicked.\n<gray>Reason: %reason%")
-                        .replace("%reason%", reason)
-                        .replace("%staff%", staffName)));
+            sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    message("kick-success", "<green>%player% has been kicked. <gray>(%reason%)")
+                            .replace("%player%", targetName).replace("%reason%", reason)));
 
-        sender.sendMessage(plugin.getMiniMessage().deserialize(
-                message("kick-success", "<green>%player% has been kicked. <gray>(%reason%)")
-                        .replace("%player%", targetName).replace("%reason%", reason)));
-
-        broadcast(message("kick-broadcast", "")
-                .replace("%player%", targetName).replace("%staff%", staffName).replace("%reason%", reason));
+            broadcast(message("kick-broadcast", "")
+                    .replace("%player%", targetName).replace("%staff%", staffName).replace("%reason%", reason));
+        });
     }
 
     @Override

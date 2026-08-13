@@ -66,7 +66,7 @@ public final class PlainBase extends JavaPlugin {
         latestVersions.put("teleport.yml", 1.0);
         latestVersions.put("vanish.yml", 1.1);
         latestVersions.put("menu.yml", 1.0);
-        latestVersions.put("moderation.yml", 1.0);
+        latestVersions.put("moderation.yml", 2.0);
 
         registerPlaceholderExpansion();
 
@@ -87,6 +87,8 @@ public final class PlainBase extends JavaPlugin {
                 r.register("kick", new KickCommand(this));
                 r.register("banlist", new BanListCommand(this));
                 r.register("baninfo", new BanInfoCommand(this));
+                r.register("banip", new IpBanCommand(this));
+                r.register("unbanip", new UnbanIpCommand(this));
             });
         }
 
@@ -236,6 +238,12 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().addPermission(
                 new Permission("plainbase.moderation.exempt", "PlainBase: Makes a player immune to /ban and /kick by non-admins", PermissionDefault.FALSE)
         );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.banip", "PlainBase: Allows access to /banip", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.moderation.unbanip", "PlainBase: Allows access to /unbanip", PermissionDefault.OP)
+        );
     }
 
     public void reloadModules() {
@@ -272,6 +280,12 @@ public final class PlainBase extends JavaPlugin {
             menuManager.closeAllMenus();
         }
         menuManager = null;
+
+        // Cancels the periodic cache-refresh task and closes the JDBC
+        // connection pool cleanly instead of just dropping the reference.
+        if (banManager != null) {
+            banManager.shutdown();
+        }
         banManager = null;
         org.bukkit.event.HandlerList.unregisterAll(this);
     }
@@ -427,7 +441,15 @@ public final class PlainBase extends JavaPlugin {
     public void setupModeration() {
         loadModuleConfig("moderation.yml");
 
-        banManager = new BanManager(this);
+        try {
+            banManager = new BanManager(this);
+        } catch (java.sql.SQLException e) {
+            getLogger().severe("Could not connect the moderation database (storage.type=" +
+                    getModerationConfig().getString("storage.type", "sqlite") + "): " + e.getMessage());
+            getLogger().severe("The moderation module is disabled until this is fixed and /plainbase reload is run.");
+            banManager = null;
+            return;
+        }
 
         getServer().getPluginManager().registerEvents(new ModerationListener(this), this);
     }
