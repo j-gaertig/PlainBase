@@ -92,6 +92,15 @@ public class TPAManager {
         clearSession(target.getUniqueId());
     }
 
+    /**
+     * Whether this player currently has TP-Auto (auto-accept incoming
+     * teleport requests) enabled. Used by the %plainbase_teleport_tpa_autoaccept%
+     * placeholder as well as internally.
+     */
+    public boolean isTpAutoEnabled(UUID uuid) {
+        return tpAutoPlayers.contains(uuid);
+    }
+
     public void toggleTpAuto(Player player) {
         UUID uuid = player.getUniqueId();
         boolean newStatus;
