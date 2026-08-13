@@ -7,6 +7,7 @@ modules:
   vanish: false # More Settings in vanish.yml
   menu: false # More Settings in menu.yml
   moderation: false # More Settings in moderation.yml
+  team: false # More Settings in team.yml
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.6
+version: 1.7

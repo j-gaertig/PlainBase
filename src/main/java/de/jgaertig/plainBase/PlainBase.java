@@ -20,6 +20,9 @@ import de.jgaertig.plainBase.moderation.ModerationListener;
 import de.jgaertig.plainBase.moderation.commands.*;
 import de.jgaertig.plainBase.placeholder.PlaceholderBridge;
 import de.jgaertig.plainBase.placeholder.PlainBaseExpansion;
+import de.jgaertig.plainBase.team.TeamListener;
+import de.jgaertig.plainBase.team.TeamManager;
+import de.jgaertig.plainBase.team.commands.TeamCommand;
 import de.jgaertig.plainBase.vanish.VanishListener;
 import de.jgaertig.plainBase.vanish.VanishManager;
 import de.jgaertig.plainBase.vanish.commands.VanishCommand;
@@ -49,6 +52,7 @@ public final class PlainBase extends JavaPlugin {
     private VanishManager vanishManager;
     private MenuManager menuManager;
     private BanManager banManager;
+    private TeamManager teamManager;
     private boolean placeholdersRegistered = false;
 
     private boolean commandsRegistered = false;
@@ -67,6 +71,7 @@ public final class PlainBase extends JavaPlugin {
         latestVersions.put("vanish.yml", 1.1);
         latestVersions.put("menu.yml", 1.1);
         latestVersions.put("moderation.yml", 2.0);
+        latestVersions.put("team.yml", 1.0);
 
         registerPlaceholderExpansion();
 
@@ -80,6 +85,7 @@ public final class PlainBase extends JavaPlugin {
                 r.register("plainbase", new PlainBaseCommand(this));
                 r.register("vanish", new VanishCommand(this));
                 r.register("menu", new MenuCommand(this));
+                r.register("team", new TeamCommand(this));
 
                 r.register("ban", new BanCommand(this));
                 r.register("tempban", new TempBanCommand(this));
@@ -244,6 +250,41 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().addPermission(
                 new Permission("plainbase.moderation.unbanip", "PlainBase: Allows access to /unbanip", PermissionDefault.OP)
         );
+
+        // team module
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.admin", "PlainBase: Bypass — acts as team-admin on any team regardless of membership", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.invite", "PlainBase: Allows access to /team <team> invite", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.add", "PlainBase: Allows access to /team <team> add", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.kick", "PlainBase: Allows access to /team <team> kick", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.setrole", "PlainBase: Allows access to /team <team> setrole", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.request", "PlainBase: Allows access to /team <team> request", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.accept", "PlainBase: Allows access to /team accept", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.deny", "PlainBase: Allows access to /team deny (and /team <team> deny-request)", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.leave", "PlainBase: Allows access to /team leave", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.list", "PlainBase: Allows access to /team list", PermissionDefault.OP)
+        );
+        getServer().getPluginManager().addPermission(
+                new Permission("plainbase.team.info", "PlainBase: Allows access to /team <team> info", PermissionDefault.OP)
+        );
     }
 
     public void reloadModules() {
@@ -257,6 +298,7 @@ public final class PlainBase extends JavaPlugin {
         if (getConfig().getBoolean("modules.vanish", true)) setupVanish();
         if (getConfig().getBoolean("modules.menu", true)) setupMenu();
         if (getConfig().getBoolean("modules.moderation", true)) setupModeration();
+        if (getConfig().getBoolean("modules.team", true)) setupTeam();
     }
 
     public void stopModules() {
@@ -287,6 +329,14 @@ public final class PlainBase extends JavaPlugin {
             banManager.shutdown();
         }
         banManager = null;
+
+        // Unregisters the mirrored vanilla scoreboard teams so a disabled/reloaded
+        // team module doesn't leave stale "pb_<id>" teams around.
+        if (teamManager != null) {
+            teamManager.shutdown();
+        }
+        teamManager = null;
+
         org.bukkit.event.HandlerList.unregisterAll(this);
     }
 
@@ -454,6 +504,21 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().registerEvents(new ModerationListener(this), this);
     }
 
+    public void setupTeam() {
+        loadModuleConfig("team.yml");
+
+        teamManager = new TeamManager(this);
+
+        getServer().getPluginManager().registerEvents(new TeamListener(this), this);
+
+        // Re-sync scoreboard entries for already-online players after a reload
+        // (their teams were just re-loaded from disk into a fresh TeamManager).
+        // No invite reminders here — they don't need to be re-notified on reload.
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            teamManager.resyncScoreboard(player);
+        }
+    }
+
     /**
      * Registers the %plainbase_*% PlaceholderAPI expansion when PlaceholderAPI
      * is present. Safe no-op otherwise (soft dependency).
@@ -498,6 +563,14 @@ public final class PlainBase extends JavaPlugin {
 
     public FileConfiguration getModerationConfig() {
         return configs.get("moderation.yml");
+    }
+
+    public TeamManager getTeamManager() {
+        return teamManager;
+    }
+
+    public FileConfiguration getTeamConfig() {
+        return configs.get("team.yml");
     }
 
     public void saveMenuConfig() {
