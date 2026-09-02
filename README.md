@@ -1,12 +1,10 @@
 # <p align="center">PlainBase</p>
-
 <p align="center">
     <a href="https://papermc.io"><img src="https://img.shields.io/badge/Platform-Paper%20%7C%20Purpur%20%7C%20Folia-blue.svg" alt="Platform"></a>
   <a href="https://modrinth.com/plugin/plainbase"><img src="https://img.shields.io/badge/Minecraft-1.21.6%20--%2026.2-3fb58e?style=flat&logo=minecraft&logoColor=white" alt="Minecraft Version"></a>
   <a href="https://github.com/j-gaertig/PlainBase/releases/latest"><img src="https://img.shields.io/github/v/tag/j-gaertig/PlainBase?label=Version&color=orange" alt="Version"></a>
   <a href="https://github.com/j-gaertig/PlainBase/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
 </p>
-
 <p align="center">
   <strong>PlainBase</strong> - The lightweight all-in-one core for your Minecraft server.
   <br>
@@ -16,9 +14,8 @@
 ---
 
 ## Current Features
-
 *   **Modular Architecture:** Enable/disable every feature independently in `config.yml`. No need for 20 different plugins.
-*   **High Performance:** Built for modern Paper servers, works fine with Folia and Purpur too.
+*   **Runs Light:** Built for modern Paper servers, and plays nice with Folia and Purpur too.
 
 | Module | What it does |
 | :--- | :--- |
@@ -39,14 +36,14 @@ Quick links: [Installation](https://github.com/j-gaertig/PlainBase/wiki/Installa
 ---
 
 ## Planned
-*   **Claims & Warps:** Its on my list for next updates.
+*   **Claims & Warps:** It's on my list for future updates.
 *   **Tablist & Sidebar:** Some simple stats and custom headers.
 *   **And more...**
 
 ---
 
 ## Support & Community
-I'm doing this all by myself, so if you find a bug or have an idea, let me know. Every star on GitHub helps a lot!
+I'm doing this all by myself (AI helped me a little bit), so if you find a bug or have an idea, let me know. Every star on GitHub helps a lot!
 
 *   **Issues:** Found a bug? Open an [Issue](https://github.com/jgaertig/PlainBase/issues).
 *   **GitHub:** Leave a **Star**!
@@ -55,4 +52,5 @@ I'm doing this all by myself, so if you find a bug or have an idea, let me know.
 *   **Share:** Tell people about it!
 
 ---
+
 <p align="center">Built with ❤️ by j-gaertig</p>
