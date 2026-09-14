@@ -89,7 +89,38 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
             case "menu_count" -> plugin.getMenuManager() != null
                     ? String.valueOf(plugin.getMenuManager().getMenuNames().size()) : "0";
 
-            default -> null;
+            // Team module (static placeholders)
+            case "team_names" -> player != null && plugin.getTeamManager() != null
+                    ? String.join(", ", plugin.getTeamManager().getPlayerTeams(player.getUniqueId())) : "";
+            case "team_count" -> player != null && plugin.getTeamManager() != null
+                    ? String.valueOf(plugin.getTeamManager().getPlayerTeams(player.getUniqueId()).size()) : "0";
+            case "team_primary" -> player != null && plugin.getTeamManager() != null
+                    ? plugin.getTeamManager().getPlayerTeams(player.getUniqueId()).stream().findFirst().orElse("") : "";
+            case "team_pending_invites" -> player != null && plugin.getTeamManager() != null
+                    ? String.valueOf(plugin.getTeamManager().getPendingInvites(player.getUniqueId()).size()) : "0";
+            case "teams_count" -> plugin.getTeamManager() != null
+                    ? String.valueOf(plugin.getTeamManager().getTeams().size()) : "0";
+
+            // Team module (parameterized: %plainbase_team_role_<team>% / %plainbase_team_members_<team>%)
+            default -> handleTeamParameterized(player, params.toLowerCase());
         };
+    }
+
+    private String handleTeamParameterized(Player player, String params) {
+        if (plugin.getTeamManager() == null) return null;
+
+        if (params.startsWith("team_role_")) {
+            String teamId = params.substring("team_role_".length());
+            if (player == null) return "none";
+            var role = plugin.getTeamManager().getRole(player.getUniqueId(), teamId);
+            return role != null ? role.name().toLowerCase() : "none";
+        }
+
+        if (params.startsWith("team_members_")) {
+            String teamId = params.substring("team_members_".length());
+            return String.valueOf(plugin.getTeamManager().getMembers(teamId).size());
+        }
+
+        return null;
     }
 }
