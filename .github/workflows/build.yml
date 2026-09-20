@@ -33,7 +33,7 @@ jobs:
           if ! unzip -p "$JAR" paper-plugin.yml | grep -q "version: '0.3.0-Beta'"; then
             echo "::error::Check failed: paper-plugin.yml version was not filtered to 0.3.0-Beta"; fail=1
           fi
-          if ! unzip -p "$JAR" paper-plugin.yml | grep -q "description: The lightweight all-in-one core"; then
+          if ! unzip -p "$JAR" paper-plugin.yml | grep -q "description: 'The lightweight all-in-one core"; then
             echo "::error::Check failed: paper-plugin.yml description was not filtered"; fail=1
           fi
           # ...and no unresolved placeholder may remain.
