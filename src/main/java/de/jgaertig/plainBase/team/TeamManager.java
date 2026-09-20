@@ -373,7 +373,14 @@ public class TeamManager {
             }
             pending.remove(uuid);
             saveRequests();
-            staff.sendMessage(msg("kick-success", "player", targetName, "team", id)); // reuse: "removed/rejected"
+            staff.sendMessage(msgDefault("reject-success",
+                    "<green>Rejected %player%'s join request for %team%.", "player", targetName, "team", id));
+
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) {
+                online.sendMessage(msgDefault("request-rejected",
+                        "<red>Your join request for %team% was rejected.", "team", id));
+            }
         });
     }
 
@@ -589,7 +596,16 @@ public class TeamManager {
     }
 
     private Component msg(String key, String... placeholders) {
-        String raw = plugin.getTeamConfig().getString("messages." + key, key);
+        return msgDefault(key, key, placeholders);
+    }
+
+    /**
+     * Like {@link #msg(String, String...)} but with a proper fallback for
+     * configs that don't have the (newer) message key yet — plain msg() would
+     * print the raw key name as the message text.
+     */
+    private Component msgDefault(String key, String fallback, String... placeholders) {
+        String raw = plugin.getTeamConfig().getString("messages." + key, fallback);
         for (int i = 0; i + 1 < placeholders.length; i += 2) {
             raw = raw.replace("%" + placeholders[i] + "%", placeholders[i + 1]);
         }

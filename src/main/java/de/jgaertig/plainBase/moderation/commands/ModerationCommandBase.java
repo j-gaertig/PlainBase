@@ -79,6 +79,9 @@ abstract class ModerationCommandBase {
         }
 
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            // Deliberately deprecated: can block on a Mojang name lookup —
+            // which is exactly why it runs on the async scheduler.
+            @SuppressWarnings("deprecation")
             OfflinePlayer resolved = Bukkit.getOfflinePlayer(name);
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(resolved));
         });

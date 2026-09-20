@@ -1,6 +1,8 @@
 package de.jgaertig.plainBase.menu;
 
 import de.jgaertig.plainBase.PlainBase;
+import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -63,10 +65,10 @@ public class MenuListener implements Listener {
 
         String sound = def.sound();
         if (sound != null && !sound.isEmpty()) {
-            try {
-                Sound s = Sound.valueOf(sound.toUpperCase());
+            Sound s = resolveSound(sound);
+            if (s != null) {
                 player.playSound(player.getLocation(), s, 1.0f, 1.0f);
-            } catch (IllegalArgumentException e) {
+            } else {
                 plugin.getLogger().warning("Invalid sound '" + sound + "' in menu '" + menu.name() + "'");
             }
         }
@@ -100,5 +102,15 @@ public class MenuListener implements Listener {
         // Dragging inside or into our menu is always cancelled — the bottom
         // inventory is locked too, so nothing can move in or out of the menu.
         event.setCancelled(true);
+    }
+
+    /**
+     * Resolves a sound by key (e.g. "BLOCK_NOTE_BLOCK_PLING",
+     * "block_note_block_pling" or "minecraft:block_note_block_pling") via the
+     * sound registry — Sound#valueOf(String) is deprecated for removal.
+     */
+    private Sound resolveSound(String input) {
+        NamespacedKey key = NamespacedKey.fromString(input.toLowerCase(java.util.Locale.ROOT));
+        return key != null ? Registry.SOUNDS.get(key) : null;
     }
 }

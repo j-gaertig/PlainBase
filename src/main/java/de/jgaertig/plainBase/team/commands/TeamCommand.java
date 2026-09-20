@@ -211,6 +211,15 @@ public class TeamCommand implements BasicCommand {
         return plugin.getMiniMessage().deserialize(s);
     }
 
+    /** Reads a message from team.yml (messages.<key>) with placeholder substitution. */
+    private net.kyori.adventure.text.Component msgFromConfig(String key, String fallback, String... placeholders) {
+        String raw = plugin.getTeamConfig().getString("messages." + key, fallback);
+        for (int i = 0; i + 1 < placeholders.length; i += 2) {
+            raw = raw.replace("%" + placeholders[i] + "%", placeholders[i + 1]);
+        }
+        return plugin.getMiniMessage().deserialize(raw);
+    }
+
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         TeamManager teams = plugin.getTeamManager();

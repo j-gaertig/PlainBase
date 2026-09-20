@@ -95,6 +95,8 @@ messages:
   request-received: "<yellow>%player% wants to join <gray>%team%<yellow>! Use <green>/team add %team% %player% <yellow>to accept or <red>/team reject %team% %player% <yellow>to reject."
   request-not-found: "<red>No pending join request from %player% for %team%."
   request-already-pending: "<yellow>You already have a pending join request for %team%."
+  reject-success: "<green>Rejected %player%'s join request for %team%."
+  request-rejected: "<red>Your join request for %team% was rejected."
 
   setrole-success: "<green>%player% is now %role% in %team%."
   invalid-role: "<red>Invalid role. Use <yellow>member <red>or <yellow>admin<red>."

@@ -100,7 +100,18 @@ public class JoinItemsListener implements Listener {
                         if (owner.equals("%player%")) {
                             skullMeta.setOwningPlayer(player);
                         } else {
-                            skullMeta.setOwningPlayer(org.bukkit.Bukkit.getOfflinePlayer(owner));
+                            // Resolve from the local cache only — the deprecated
+                            // Bukkit#getOfflinePlayer(String) can do a blocking
+                            // Mojang API lookup for names that never joined this
+                            // server, and this code runs on the main thread
+                            // inside PlayerJoinEvent.
+                            org.bukkit.OfflinePlayer ownerPlayer = Bukkit.getOfflinePlayerIfCached(owner);
+                            if (ownerPlayer != null) {
+                                skullMeta.setOwningPlayer(ownerPlayer);
+                            } else {
+                                plugin.getLogger().warning("Join item '" + key + "': skull-owner '" + owner
+                                        + "' has never played on this server — head stays untextured (no blocking lookup on the main thread).");
+                            }
                         }
                     }
                 }
