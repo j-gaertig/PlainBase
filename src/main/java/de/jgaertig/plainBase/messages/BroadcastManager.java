@@ -26,20 +26,43 @@ public class BroadcastManager {
         for (String key : section.getKeys(false)) {
             if (key.equals("enabled")) continue;
 
-            String text = section.getString(key + ".text");
+            // "text" may be a single string or a list of lines; skip (with a
+            // warning) instead of NPE-ing the repeating task every interval
+            // when the entry is malformed.
+            List<String> lines = resolveBroadcastLines(section, key);
+            if (lines.isEmpty()) {
+                plugin.getLogger().warning("Broadcast '" + key + "' has no (valid) text — skipped. Add a 'text' entry in messages.yml.");
+                continue;
+            }
+
             long cooldownSeconds = section.getLong(key + ".cooldown", 60);
             long ticks = Math.max(1, cooldownSeconds * 20); // Mindestens 1 Tick
 
             ScheduledTask task = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, (t) -> {
-                Component message = plugin.getMiniMessage().deserialize(text);
+                List<Component> messages = new ArrayList<>(lines.size());
+                for (String line : lines) {
+                    messages.add(plugin.getMiniMessage().deserialize(line));
+                }
 
                 for (Player player : Bukkit.getOnlinePlayers()) {
-                    player.sendMessage(message);
+                    for (Component message : messages) {
+                        player.sendMessage(message);
+                    }
                 }
             }, ticks, ticks);
 
             activeTasks.add(task);
         }
+    }
+
+    private List<String> resolveBroadcastLines(ConfigurationSection section, String key) {
+        List<String> lines = section.getStringList(key + ".text");
+        if (!lines.isEmpty()) return lines;
+
+        String single = section.getString(key + ".text");
+        if (single != null && !single.isEmpty()) return List.of(single);
+
+        return List.of();
     }
 
     public void stopBroadcasts() {

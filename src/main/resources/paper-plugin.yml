@@ -1,5 +1,5 @@
 name: PlainBase
-description: $description
+description: '${project.description}'
 version: '${version}'
 
 main: de.jgaertig.plainBase.PlainBase

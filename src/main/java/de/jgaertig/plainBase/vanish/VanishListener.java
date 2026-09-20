@@ -42,10 +42,20 @@ public class VanishListener implements Listener {
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
+        VanishManager manager = plugin.getVanishManager();
 
-        if (plugin.getVanishManager().isVanished(player)
+        if (manager.isVanished(player)
                 && plugin.getVanishConfig().getBoolean("vanish.hide-join-quit-messages", true)) {
             event.quitMessage(null);
+        }
+
+        // Without persist-on-rejoin, the in-memory vanish flag must not
+        // survive the session: hideEntity() resets on reconnect anyway, so a
+        // surviving flag would leave the player in a zombie state after
+        // rejoining — visible to everyone, but still treated as vanished by
+        // listeners (mob-ignore, projectile pass-through) and placeholders.
+        if (!plugin.getVanishConfig().getBoolean("vanish.persist-on-rejoin", true)) {
+            manager.getVanishedPlayers().remove(player.getUniqueId());
         }
     }
 

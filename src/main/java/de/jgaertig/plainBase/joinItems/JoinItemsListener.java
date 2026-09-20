@@ -75,6 +75,14 @@ public class JoinItemsListener implements Listener {
 
             if (material == null) continue;
 
+            // Player inventory: 0-35 storage (incl. hotbar), 36-39 armor, 40
+            // offhand. An out-of-range slot would throw
+            // IndexOutOfBoundsException inside the PlayerJoinEvent.
+            if (slot < 0 || slot > 40) {
+                plugin.getLogger().warning("Join item '" + key + "' has invalid slot " + slot + " (must be 0-40) — item skipped.");
+                continue;
+            }
+
             ItemStack item = new ItemStack(material);
             ItemMeta meta = item.getItemMeta();
 

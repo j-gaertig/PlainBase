@@ -233,7 +233,7 @@ public class TeamManager {
     public void accept(Player player, String teamIdOrNull) {
         UUID uuid = player.getUniqueId();
         Set<String> pending = invites.getOrDefault(uuid, Set.of());
-        String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
+        String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found", "accept");
         if (id == null) return;
 
         if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
@@ -250,7 +250,7 @@ public class TeamManager {
     public void deny(Player player, String teamIdOrNull) {
         UUID uuid = player.getUniqueId();
         Set<String> pending = invites.getOrDefault(uuid, Set.of());
-        String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
+        String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found", "deny");
         if (id == null) return;
 
         invites.get(uuid).remove(id);
@@ -510,7 +510,7 @@ public class TeamManager {
     // Internal helpers
     // ---------------------------------------------------------------
 
-    private String resolveSingle(Player player, Set<String> pending, String teamIdOrNull, String notFoundKey) {
+    private String resolveSingle(Player player, Set<String> pending, String teamIdOrNull, String notFoundKey, String action) {
         if (teamIdOrNull != null) {
             String id = teamIdOrNull.toLowerCase();
             if (!pending.contains(id)) {
@@ -524,7 +524,12 @@ public class TeamManager {
             player.sendMessage(msg(notFoundKey, "team", "?"));
             return null;
         }
-        player.sendMessage(msg("leave-usage-multiple"));
+        // Multiple pending invites and no team specified — the generic
+        // "leave-usage-multiple" text would tell the player to run
+        // "/team leave", which is wrong for accept/deny, so this gets its
+        // own action-aware message.
+        player.sendMessage(msgDefault("invite-usage-multiple",
+                "<red>You have pending invites from multiple teams — specify one: <yellow>/team %action% <team>", "action", action));
         return null;
     }
 
@@ -598,10 +603,18 @@ public class TeamManager {
     private void syncScoreboardTeamDefinitions() {
         if (scoreboard == null) return;
 
-        Set<String> validNames = new HashSet<>();
+        Map<String, String> nameToTeamId = new HashMap<>();
         for (TeamDefinition def : teams.values()) {
             String name = scoreboardName(def.id());
-            validNames.add(name);
+            String previousId = nameToTeamId.putIfAbsent(name, def.id());
+            if (previousId != null) {
+                // Two very long team ids can collide after the name cap —
+                // warn instead of silently overwriting the first team's
+                // color/prefix with the second's.
+                plugin.getLogger().warning("Team module: teams '" + previousId + "' and '" + def.id()
+                        + "' both map to mirrored scoreboard team '" + name + "' — only '" + previousId + "' is mirrored.");
+                continue;
+            }
             Team team = scoreboard.getTeam(name);
             if (team == null) team = scoreboard.registerNewTeam(name);
             team.color(def.vanillaColor());
@@ -609,7 +622,7 @@ public class TeamManager {
         }
 
         for (Team team : new ArrayList<>(scoreboard.getTeams())) {
-            if (team.getName().startsWith("pb_") && !validNames.contains(team.getName())) {
+            if (team.getName().startsWith("pb_") && !nameToTeamId.containsKey(team.getName())) {
                 team.unregister();
             }
         }

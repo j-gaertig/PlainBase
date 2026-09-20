@@ -34,7 +34,8 @@ public class DisableFirstSpawn implements BasicCommand {
         }
 
         var config = plugin.getSpawnConfig();
-        config.set("firstspawn.enabled", false);
+        // NOTE: must match the key used by SpawnListener ("first-spawn.enabled").
+        config.set("first-spawn.enabled", false);
         plugin.saveSpawnConfig();
 
         sender.sendMessage(plugin.getMiniMessage().deserialize("<green>First Spawn has been disabled!"));

@@ -135,7 +135,7 @@ public class TeamCommand implements BasicCommand {
             if (args.length > idx) {
                 String candidate = args[idx].toLowerCase(Locale.ROOT);
                 if (!teams.teamExists(candidate)) {
-                    sender.sendMessage(mm("<red>Unknown team: " + args[idx]));
+                    sender.sendMessage(msgFromConfig("unknown-team", "<red>Unknown team: %team%", "team", args[idx]));
                     return;
                 }
                 teamId = candidate;
@@ -146,7 +146,7 @@ public class TeamCommand implements BasicCommand {
             }
         }
         if (spec.adminGated() && !teams.isTeamAdmin(sender, teamId)) {
-            sender.sendMessage(mm("<red>You must be a team admin of " + teamId + " to do this."));
+            sender.sendMessage(msgFromConfig("not-admin", "<red>You must be a team admin of %team% to do this.", "team", teamId));
             return;
         }
 
@@ -214,13 +214,15 @@ public class TeamCommand implements BasicCommand {
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         TeamManager teams = plugin.getTeamManager();
-        if (teams == null) return List.of();
+        if (teams == null || plugin.getTeamConfig() == null) return List.of();
         CommandSender sender = stack.getSender();
 
         if (args.length <= 1) {
             String input = args.length == 1 ? args[0].toLowerCase(Locale.ROOT) : "";
             return ACTIONS.values().stream()
                     .filter(spec -> hasPermission(sender, spec.permission()))
+                    // Don't suggest subcommands the admin disabled in team.yml.
+                    .filter(spec -> plugin.getTeamConfig().getBoolean("team.commands." + spec.name() + ".enabled", true))
                     .map(ActionSpec::name)
                     .filter(name -> name.startsWith(input))
                     .toList();

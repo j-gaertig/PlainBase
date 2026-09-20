@@ -10,6 +10,7 @@
     <packaging>jar</packaging>
 
     <name>PlainBase</name>
+    <description>The lightweight all-in-one core for your Minecraft server. Essential features, zero bloat.</description>
 
     <properties>
         <java.version>25</java.version>

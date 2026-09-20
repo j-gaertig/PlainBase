@@ -37,6 +37,11 @@ public class PlainBaseCommand implements BasicCommand {
             return;
         }
 
+        if (args.length == 0) {
+            sendUsage(sender);
+            return;
+        }
+
         if (args.length >= 2 && args[0].equalsIgnoreCase("toggle")) {
             String moduleName = args[1];
             String path = "modules." + moduleName;
@@ -95,7 +100,17 @@ public class PlainBaseCommand implements BasicCommand {
                     }
                 });
             });
+            return;
         }
+
+        // Unknown subcommand (or "toggle" without a module name)
+        sendUsage(sender);
+    }
+
+    private void sendUsage(CommandSender sender) {
+        sender.sendMessage(plugin.getMiniMessage().deserialize(
+                "<gray>PlainBase <white>v" + plugin.getPluginMeta().getVersion()
+                        + " <gray>— /plainbase <reload|toggle <module>|update>"));
     }
 
     @Override

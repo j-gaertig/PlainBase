@@ -76,6 +76,7 @@ messages:
   max-teams-reached: "<red>%player% is already in the maximum number of teams (%max%)."
   not-admin: "<red>You must be a team admin of %team% to do this."
   player-not-found: "<red>Could not resolve player: %player%"
+  invite-usage-multiple: "<red>You have pending invites from multiple teams — specify one: <yellow>/team %action% <team>"
 
   invite-sent: "<green>Invited %player% to %team%."
   invite-received: "<yellow>You have been invited to join <gray>%team%<yellow>! Use <green>/team accept %team% <yellow>or <red>/team deny %team%<yellow>."
@@ -117,4 +118,5 @@ messages:
   your-teams-entry: "<gray>- %team% <yellow>(%role%)"
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.1
+# 1.2: added messages "invite-usage-multiple", "reject-success", "request-rejected"
+version: 1.2

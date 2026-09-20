@@ -16,10 +16,13 @@ public class TPAManager {
 
     private final PlainBase plugin;
 
-
-    private final Map<UUID, TpaSession> activeSessions = new HashMap<>();
-    private final Set<UUID> tpAutoPlayers = new HashSet<>();
-    private final Map<UUID, ScheduledTask> activeWarmups = new HashMap<>();
+    // Concurrent collections: sessions are created/removed from different
+    // region threads (Folia) and from the async request-timeout task;
+    // tp-auto state is loaded from an async task. Plain HashMap/HashSet
+    // could corrupt or lose entries under that concurrency.
+    private final Map<UUID, TpaSession> activeSessions = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Set<UUID> tpAutoPlayers = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Map<UUID, ScheduledTask> activeWarmups = new java.util.concurrent.ConcurrentHashMap<>();
 
     public enum RequestType { TPA, TPAHERE }
 

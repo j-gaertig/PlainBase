@@ -146,13 +146,18 @@ public class MenuManager {
      * Closes every open menu inventory. Called on module stop/reload before
      * the MenuListener is unregistered: an open menu whose clicks are no
      * longer cancelled would let players take items out of the GUI
-     * (duplication/exploit risk).
+     * (duplication/exploit risk). The close itself is scheduled on each
+     * player's own scheduler so it also runs on the right region thread on
+     * Folia (the reload command executes on the sender's region, not
+     * necessarily the viewers').
      */
     public void closeAllMenus() {
         for (Player player : Bukkit.getOnlinePlayers()) {
             Inventory top = player.getOpenInventory().getTopInventory();
             if (top != null && top.getHolder() instanceof MenuHolder) {
-                player.closeInventory();
+                player.getScheduler().run(plugin, t -> {
+                    if (player.isOnline()) player.closeInventory();
+                }, null);
             }
         }
     }

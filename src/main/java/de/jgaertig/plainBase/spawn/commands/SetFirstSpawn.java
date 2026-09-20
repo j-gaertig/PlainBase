@@ -74,13 +74,14 @@ public class SetFirstSpawn implements BasicCommand {
 
     private void saveToSpawnConfig(Location loc) {
         var config = plugin.getSpawnConfig();
-        config.set("firstspawn.location.world", loc.getWorld().getName());
-        config.set("firstspawn.location.x", loc.getX());
-        config.set("firstspawn.location.y", loc.getY());
-        config.set("firstspawn.location.z", loc.getZ());
-        config.set("firstspawn.location.yaw", (double) loc.getYaw());
-        config.set("firstspawn.location.pitch", (double) loc.getPitch());
-        config.set("firstspawn.enabled", true);
+        // NOTE: paths must match the keys in spawn.yml / SpawnListener ("first-spawn.*").
+        config.set("first-spawn.location.world", loc.getWorld().getName());
+        config.set("first-spawn.location.x", loc.getX());
+        config.set("first-spawn.location.y", loc.getY());
+        config.set("first-spawn.location.z", loc.getZ());
+        config.set("first-spawn.location.yaw", (double) loc.getYaw());
+        config.set("first-spawn.location.pitch", (double) loc.getPitch());
+        config.set("first-spawn.enabled", true);
         plugin.saveSpawnConfig();
     }
 }
