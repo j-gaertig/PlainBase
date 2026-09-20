@@ -23,6 +23,27 @@ jobs:
       - name: Build with Maven
         run: mvn -B -ntp --no-transfer-progress clean verify
 
+      - name: Verify packaged resources
+        run: |
+          JAR=$(ls target/PlainBase-*.jar)
+          echo "--- paper-plugin.yml (as packaged) ---"
+          unzip -p "$JAR" paper-plugin.yml
+
+          # Resource filtering must have resolved ${version} / ${project.description}...
+          unzip -p "$JAR" paper-plugin.yml | grep -q "version: '0.3.0-Beta'"
+          unzip -p "$JAR" paper-plugin.yml | grep -q "description: The lightweight all-in-one core"
+          # ...and no unresolved placeholder may remain.
+          ! unzip -p "$JAR" paper-plugin.yml | grep -q '\${'
+
+          # Vanilla target selectors in the shipped configs must survive
+          # resource filtering untouched.
+          unzip -p "$JAR" modules/team.yml | grep -q '@a\[team=pb_team1\]'
+
+          # Shaded runtime deps must be present and relocated.
+          unzip -l "$JAR" | grep -q "de/jgaertig/plainBase/libs/gson"
+          unzip -l "$JAR" | grep -q "de/jgaertig/plainBase/libs/hikari"
+          unzip -l "$JAR" | grep -q "org/sqlite/JDBC.class"
+
       - name: Upload plugin jar
         uses: actions/upload-artifact@v6
         with:

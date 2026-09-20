@@ -31,6 +31,23 @@
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+                <configuration>
+                    <!-- Restrict resource filtering to ${...} expressions only.
+                         Maven's default delimiters ALSO include @...@, and the
+                         shipped module configs contain vanilla target selectors
+                         like "@a[team=pb_team1]" — currently harmless only
+                         because such tokens never resolve to a property;
+                         pinning the delimiter makes sure they can never be
+                         mangled by filtering. -->
+                    <delimiters>
+                        <delimiter>${*}</delimiter>
+                    </delimiters>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
                 <version>3.6.2</version>
                 <executions>
