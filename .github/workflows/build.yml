@@ -26,23 +26,40 @@ jobs:
       - name: Verify packaged resources
         run: |
           JAR=$(ls target/PlainBase-*.jar)
-          echo "--- paper-plugin.yml (as packaged) ---"
-          unzip -p "$JAR" paper-plugin.yml
+          echo "JAR=$JAR"
+          fail=0
 
           # Resource filtering must have resolved ${version} / ${project.description}...
-          unzip -p "$JAR" paper-plugin.yml | grep -q "version: '0.3.0-Beta'"
-          unzip -p "$JAR" paper-plugin.yml | grep -q "description: The lightweight all-in-one core"
+          if ! unzip -p "$JAR" paper-plugin.yml | grep -q "version: '0.3.0-Beta'"; then
+            echo "::error::Check failed: paper-plugin.yml version was not filtered to 0.3.0-Beta"; fail=1
+          fi
+          if ! unzip -p "$JAR" paper-plugin.yml | grep -q "description: The lightweight all-in-one core"; then
+            echo "::error::Check failed: paper-plugin.yml description was not filtered"; fail=1
+          fi
           # ...and no unresolved placeholder may remain.
-          ! unzip -p "$JAR" paper-plugin.yml | grep -q '\${'
-
+          if unzip -p "$JAR" paper-plugin.yml | grep -q '\${'; then
+            echo "::error::Check failed: unresolved \${...} placeholder left in paper-plugin.yml"; fail=1
+          fi
           # Vanilla target selectors in the shipped configs must survive
           # resource filtering untouched.
-          unzip -p "$JAR" modules/team.yml | grep -q '@a\[team=pb_team1\]'
-
+          if ! unzip -p "$JAR" modules/team.yml | grep -q '@a\[team=pb_team1\]'; then
+            echo "::error::Check failed: team.yml target selector '@a[team=...]' missing"; fail=1
+          fi
           # Shaded runtime deps must be present and relocated.
-          unzip -l "$JAR" | grep -q "de/jgaertig/plainBase/libs/gson"
-          unzip -l "$JAR" | grep -q "de/jgaertig/plainBase/libs/hikari"
-          unzip -l "$JAR" | grep -q "org/sqlite/JDBC.class"
+          if ! unzip -l "$JAR" | grep -q 'de/jgaertig/plainBase/libs/gson'; then
+            echo "::error::Check failed: gson not relocated under de/jgaertig/plainBase/libs/gson"; fail=1
+          fi
+          if ! unzip -l "$JAR" | grep -q 'de/jgaertig/plainBase/libs/hikari'; then
+            echo "::error::Check failed: hikari not relocated under de/jgaertig/plainBase/libs/hikari"; fail=1
+          fi
+          if ! unzip -l "$JAR" | grep -q 'org/sqlite/JDBC.class'; then
+            echo "::error::Check failed: sqlite driver missing from shaded jar"; fail=1
+          fi
+
+          echo "--- paper-plugin.yml (as packaged) ---"
+          unzip -p "$JAR" paper-plugin.yml
+          echo "--- fail=$fail ---"
+          exit $fail
 
       - name: Upload plugin jar
         uses: actions/upload-artifact@v6
