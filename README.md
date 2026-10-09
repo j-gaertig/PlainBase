@@ -1,61 +1,54 @@
-# <p align="center">PlainBase</p>
-<p align="center">
-    <a href="https://papermc.io"><img src="https://img.shields.io/badge/Platform-Paper%20%7C%20Purpur%20%7C%20Folia-blue.svg" alt="Platform"></a>
-  <a href="https://modrinth.com/plugin/plainbase"><img src="https://img.shields.io/badge/Minecraft-1.21.6%20--%2026.3-3fb58e?style=flat&logo=minecraft&logoColor=white" alt="Minecraft Version"></a>
-  <a href="https://github.com/j-gaertig/PlainBase/releases/latest"><img src="https://img.shields.io/github/v/tag/j-gaertig/PlainBase?label=Version&color=orange" alt="Version"></a>
-  <a href="https://github.com/j-gaertig/PlainBase/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-</p>
-<p align="center">
-  <strong>PlainBase</strong> - The lightweight all-in-one core for your Minecraft server.
-  <br>
-  Essential features, zero bloat.
-</p>
+# PlainBase
+
+PlainBase is a modular core plugin for Paper based servers. It includes spawn management, teleport requests, random teleport, join items, messages, menus, vanish, moderation, and configurable player teams.
+
+The plugin metadata marks Folia as supported. PlaceholderAPI is optional and adds the `%plainbase_*%` expansion when installed. PlainBase requires Paper APIs and does not support standalone Bukkit or Spigot.
 
 <!-- RELEASE-SYNC:START -->
-> **Latest release:** [0.3.0-Beta](https://github.com/j-gaertig/PlainBase/releases/tag/0.3.0-Beta) — 2026-10-09 · [Modrinth](https://modrinth.com/project/plainbase/version/b1B7eoWJ) · [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase/versions/0.3.0-Beta)
+> Latest release: [0.3.0-Beta](https://github.com/j-gaertig/PlainBase/releases/tag/0.3.0-Beta) (2026-10-09) | [Modrinth](https://modrinth.com/project/plainbase/version/b1B7eoWJ) | [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase/versions/0.3.0-Beta)
 <!-- RELEASE-SYNC:END -->
 
----
+## Requirements
 
-## Current Features
-*   **Modular Architecture:** Enable/disable every feature independently in `config.yml`. No need for 20 different plugins.
-*   **Runs Light:** Built for modern Paper servers, and plays nice with Folia and Purpur too.
+- Paper, Purpur, or Folia with Minecraft 1.21.6 or newer. The build currently targets Paper API 26.2 or newer.
+- Java 25, as configured by the Maven build.
 
-| Module | What it does |
-| :--- | :--- |
-| **Teleport (TPA & RTP)** | Player-to-player teleport requests + safe random teleport. |
-| **Spawn** | Global spawn + first-join spawn, teleport on join. |
-| **Join Items** | Give protected items to players automatically on join. |
-| **Messages & Broadcasts** | Join/quit messages, MOTD, timed chat broadcasts. |
-| **Vanish** | Hide players from other players, the tab list and mobs. |
-| **Menu** | Config-driven, locked GUI menus. |
-| **Moderation** | Ban / tempban / unban / kick / IP-ban with database storage (SQLite/MySQL, cross-server). |
-| **Team** | Config-defined player groups with MiniMessage colors (gradients/rainbow included), invite/accept/deny/request flow, per-team Member/Admin roles, and a real vanilla scoreboard mirror for `@a[team=pb_<id>]` selectors. |
+Check the release notes for the versions supported by a specific release.
 
-Also supports **PlaceholderAPI** (optional, not a toggleable module) — auto-detected if installed, adds the `%plainbase_*%` expansion, zero effect if it's missing.
+## Install
 
-**📖 Full documentation — every module in detail, every config option, permissions, and how the config-versioning/update system works — is in the [GitHub Wiki](https://github.com/j-gaertig/PlainBase/wiki).**
+1. Download the JAR from [GitHub Releases](https://github.com/j-gaertig/PlainBase/releases), [Modrinth](https://modrinth.com/plugin/plainbase), or [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase).
+2. Put it in the server's `plugins` directory and start the server.
+3. Set the modules you want to use to `true` in `plugins/PlainBase/config.yml`. They are disabled by default.
+4. Configure each enabled module in `plugins/PlainBase/modules/` and run `/plainbase reload`.
 
-Quick links: [Installation](https://github.com/j-gaertig/PlainBase/wiki/Installation) · [Configuration & Versioning](https://github.com/j-gaertig/PlainBase/wiki/Configuration-and-Versioning) · [Permissions](https://github.com/j-gaertig/PlainBase/wiki/Permissions) · [Commands](https://github.com/j-gaertig/PlainBase/wiki/Commands)
+## Modules
 
----
+| Module | Features |
+| --- | --- |
+| Spawn | Main spawn and first-join spawn locations |
+| Teleport | TPA requests, auto-accept, and safe random teleport |
+| Join Items | Configurable items with click commands and inventory protections |
+| Messages | Join and quit messages, MOTD, scheduled broadcasts |
+| Vanish | Player visibility controls and configurable vanish behavior |
+| Menu | Configured inventory menus and click actions |
+| Moderation | Ban, tempban, unban, kick, IP bans, and SQLite or MySQL storage |
+| Team | Configured teams, membership, roles, requests, and optional scoreboard integration |
 
-## Planned
-*   **Claims & Warps:** It's on my list for future updates.
-*   **Tablist & Sidebar:** Some simple stats and custom headers.
-*   **And more...**
+See the [Wiki](https://github.com/j-gaertig/PlainBase/wiki) for setup, commands, permissions, and module configuration.
 
----
+## Build from source
 
-## Support & Community
-I'm doing this all by myself (AI helped me a little bit), so if you find a bug or have an idea, let me know. Every star on GitHub helps a lot!
+The project uses Maven. Run `mvn clean package` with JDK 25. The plugin JAR is written to `target/`.
 
-*   **Issues:** Found a bug? Open an [Issue](https://github.com/jgaertig/PlainBase/issues).
-*   **GitHub:** Leave a **Star**!
-*   **Modrinth:** Leave a **Heart** [here](https://modrinth.com/plugin/plainbase).
-*   **Hangar:** Leave a **Star** [here](https://hangar.papermc.io/j-gaertig/PlainBase).
-*   **Share:** Tell people about it!
+## Links
 
----
+- [Wiki](https://github.com/j-gaertig/PlainBase/wiki)
+- [Releases](https://github.com/j-gaertig/PlainBase/releases)
+- [Modrinth](https://modrinth.com/plugin/plainbase)
+- [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase)
+- [Issues](https://github.com/j-gaertig/PlainBase/issues)
 
-<p align="center">Built with ❤️ by j-gaertig</p>
+## License
+
+PlainBase is licensed under the MIT License. See [LICENSE](LICENSE).
