@@ -9,6 +9,7 @@ import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 import org.jspecify.annotations.NonNull;
 
@@ -49,8 +50,9 @@ public class PlainBaseCommand implements BasicCommand {
                 plugin.saveConfig();
 
                 String statusColor = newStatus ? "<green>enabled" : "<red>disabled";
+                String safeModule = plugin.getMiniMessage().escapeTags(moduleName);
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        "<gray>The module <yellow>" + moduleName + "</yellow> has been " + statusColor + "<gray>."
+                        "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
                 ));
                 plugin.reloadModules();
             } else {
@@ -67,35 +69,46 @@ public class PlainBaseCommand implements BasicCommand {
 
         if (args.length >= 1 && args[0].equalsIgnoreCase("update")) {
             String serverVersion = Bukkit.getMinecraftVersion();
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<gray>Checking for updates for Minecraft " + serverVersion + "..."));
+            String safeVersion = plugin.getMiniMessage().escapeTags(serverVersion);
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<gray>Checking for updates for Minecraft " + safeVersion + "..."));
 
             Bukkit.getAsyncScheduler().runNow(plugin, task -> {
                 String latestVersion = getLatestVersionFromModrinth("yfx0z1Sw", serverVersion);
 
                 // Send result on the global region scheduler (main thread) - thread-safe on Paper and Folia
                 Bukkit.getGlobalRegionScheduler().run(plugin, scheduledTask -> {
+                    if (sender instanceof Player player && !player.isOnline()) {
+                        return;
+                    }
                     if (latestVersion == null) {
                         sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reach Modrinth. Please try again later."));
                         return;
                     }
 
                     if (latestVersion.equals("NOT_FOUND")) {
-                        sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>No compatible version found for Minecraft " + serverVersion + "."));
+                        sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>No compatible version found for Minecraft " + safeVersion + "."));
                         return;
                     }
 
                     String currentVersion = plugin.getPluginMeta().getVersion();
+                    String safeLatest = plugin.getMiniMessage().escapeTags(latestVersion);
+                    String safeCurrent = plugin.getMiniMessage().escapeTags(currentVersion);
                     if (currentVersion.equalsIgnoreCase(latestVersion)) {
-                        sender.sendMessage(plugin.getMiniMessage().deserialize("<green>You are running the latest version! (" + currentVersion + ")"));
+                        sender.sendMessage(plugin.getMiniMessage().deserialize("<green>You are running the latest version! (" + safeCurrent + ")"));
                     } else {
                         sender.sendMessage(plugin.getMiniMessage().deserialize(
-                                "<yellow>A new version is available: <bold>" + latestVersion + "</bold>\n" +
+                                "<yellow>A new version is available: <bold>" + safeLatest + "</bold>\n" +
                                         "<gray>Download here: <click:open_url:'https://modrinth.com/plugin/plainbase'><underlined><blue>modrinth.com/plugin/plainbase</blue></underlined></click>"
                         ));
                     }
                 });
             });
+            return;
         }
+
+        sender.sendMessage(plugin.getMiniMessage().deserialize(
+                "<gray>Usage: <yellow>/plainbase <toggle <module>|reload|update>"
+        ));
     }
 
     @Override

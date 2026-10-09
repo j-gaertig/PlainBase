@@ -6,6 +6,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 
 import java.sql.SQLException;
+import java.util.Objects;
 
 /**
  * Blocks logins for banned players/IPs. This event runs OFF the main thread
@@ -33,7 +34,9 @@ public class ModerationListener implements Listener {
         BanManager manager = plugin.getBanManager();
         if (manager == null) return;
 
-        String ip = event.getAddress().getHostAddress();
+        // getAddress() can be null on some proxies/edge cases — never let a
+        // null address NPE into a fail-open bypass; skip only the IP-ban check.
+        String ip = event.getAddress() == null ? "unknown" : event.getAddress().getHostAddress();
 
         // Always record the IP (even for a player we're about to reject) so
         // staff can /banip a name later even if this exact login is denied.
@@ -48,27 +51,36 @@ public class ModerationListener implements Listener {
                 return;
             }
 
-            if (plugin.getModerationConfig().getBoolean("ip-ban.enabled", true)) {
+            if (!"unknown".equals(ip) && plugin.getModerationConfig().getBoolean("ip-ban.enabled", true)) {
                 IpBanRecord ipBan = manager.queryActiveIpBanNow(ip);
                 if (ipBan != null) {
                     disallowForIpBan(event, ipBan);
                 }
             }
-        } catch (SQLException e) {
-            plugin.getLogger().severe("Could not check ban status for " + event.getName() + ": " + e.getMessage());
+        } catch (SQLException | RuntimeException e) {
+            plugin.getLogger().severe("Could not check ban status for " + Objects.toString(event.getName(), "?") + ": " + e.getMessage());
             // Fail open: a DB hiccup must never lock every player out of the server.
+            // (NPEs can no longer bypass bans: all nullable ban/template fields
+            // are handled via Objects.toString below, so this path only triggers
+            // on genuine DB/runtime failures.)
         }
     }
 
     private void disallowForBan(AsyncPlayerPreLoginEvent event, BanRecord ban) {
         long now = System.currentTimeMillis();
-        String template = ban.isPermanent()
-                ? plugin.getModerationConfig().getString("messages.ban-screen", "<red>You are banned.")
-                : plugin.getModerationConfig().getString("messages.tempban-screen", "<red>You are banned.");
+        String template = Objects.toString(
+                plugin.getModerationConfig().getString(
+                        ban.isPermanent() ? "messages.ban-screen" : "messages.tempban-screen",
+                        "<red>You are banned."),
+                "<red>You are banned.");
 
+        // Escape user-controlled values BEFORE substitution so a reason like
+        // "<click:run_command:...>" can never inject MiniMessage tags.
+        String reason = plugin.getMiniMessage().escapeTags(Objects.toString(ban.reason(), ""));
+        String staff = plugin.getMiniMessage().escapeTags(Objects.toString(ban.staffName(), ""));
         String text = template
-                .replace("%reason%", ban.reason())
-                .replace("%staff%", ban.staffName())
+                .replace("%reason%", reason)
+                .replace("%staff%", staff)
                 .replace("%remaining%", DurationParser.format(ban.remainingMillis(now)));
 
         event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, plugin.getMiniMessage().deserialize(text));
@@ -76,11 +88,15 @@ public class ModerationListener implements Listener {
 
     private void disallowForIpBan(AsyncPlayerPreLoginEvent event, IpBanRecord ban) {
         long now = System.currentTimeMillis();
-        String template = plugin.getModerationConfig().getString("messages.ipban-screen", "<red>Your IP address is banned.");
+        String template = Objects.toString(
+                plugin.getModerationConfig().getString("messages.ipban-screen", "<red>Your IP address is banned."),
+                "<red>Your IP address is banned.");
 
+        String reason = plugin.getMiniMessage().escapeTags(Objects.toString(ban.reason(), ""));
+        String staff = plugin.getMiniMessage().escapeTags(Objects.toString(ban.staffName(), ""));
         String text = template
-                .replace("%reason%", ban.reason())
-                .replace("%staff%", ban.staffName())
+                .replace("%reason%", reason)
+                .replace("%staff%", staff)
                 .replace("%remaining%", DurationParser.format(ban.remainingMillis(now)));
 
         event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, plugin.getMiniMessage().deserialize(text));

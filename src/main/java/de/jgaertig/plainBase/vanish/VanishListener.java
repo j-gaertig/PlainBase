@@ -10,7 +10,9 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
+import org.bukkit.event.player.PlayerAdvancementDoneEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 
@@ -22,7 +24,7 @@ public class VanishListener implements Listener {
         this.plugin = plugin;
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         FileConfiguration config = plugin.getVanishConfig();
@@ -31,26 +33,65 @@ public class VanishListener implements Listener {
         // Done synchronously because the join message is broadcast right after
         // the event — the single read source is VanishManager.hasPersistedVanish
         // (file is tiny; the actual vanish state application stays async).
-        if (config.getBoolean("vanish.hide-join-quit-messages", true)
-                && plugin.getVanishManager().hasPersistedVanish(player.getUniqueId())) {
-            event.joinMessage(null);
+        // HIGHEST so this runs after MessagesListener and cannot be overwritten.
+        try {
+            if (config.getBoolean("vanish.hide-join-quit-messages", true)
+                    && plugin.getVanishManager() != null
+                    && plugin.getVanishManager().hasPersistedVanish(player.getUniqueId())) {
+                event.joinMessage(null);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to handle vanish join state for " + player.getName());
         }
 
-        plugin.getVanishManager().applyOnJoin(player);
+        if (plugin.getVanishManager() != null) {
+            plugin.getVanishManager().applyOnJoin(player);
+        }
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
 
-        if (plugin.getVanishManager().isVanished(player)
-                && plugin.getVanishConfig().getBoolean("vanish.hide-join-quit-messages", true)) {
-            event.quitMessage(null);
+        try {
+            if (plugin.getVanishManager() != null
+                    && (plugin.getVanishManager().isVanished(player)
+                        || plugin.getVanishManager().hasPersistedVanish(player.getUniqueId()))
+                    && plugin.getVanishConfig() != null
+                    && plugin.getVanishConfig().getBoolean("vanish.hide-join-quit-messages", true)) {
+                event.quitMessage(null);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onDeath(PlayerDeathEvent event) {
+        // A vanished player must not leak via the death message.
+        try {
+            if (plugin.getVanishManager() != null
+                    && plugin.getVanishManager().isVanished(event.getEntity())) {
+                event.deathMessage(null);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onAdvancement(PlayerAdvancementDoneEvent event) {
+        // A vanished player must not leak via the advancement announcement.
+        try {
+            if (plugin.getVanishManager() != null
+                    && plugin.getVanishManager().isVanished(event.getPlayer())) {
+                event.message(null);
+            }
+        } catch (Exception ignored) {
         }
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onProjectileHit(ProjectileHitEvent event) {
+        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
         if (!plugin.getVanishConfig().getBoolean("vanish.projectiles-pass-through", true)) return;
         if (!(event.getHitEntity() instanceof Player player)) return;
 
@@ -66,6 +107,7 @@ public class VanishListener implements Listener {
         // so projectiles really pass through vanished players. (Deliberately
         // mirrors the PROJECTILE branch in onDamage: arrows without a shooter
         // only fire EntityDamageEvent, shots with a shooter fire this event.)
+        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
         if (!plugin.getVanishConfig().getBoolean("vanish.projectiles-pass-through", true)) return;
         if (!(event.getEntity() instanceof Player player)) return;
         if (!(event.getDamager() instanceof Projectile)) return;
@@ -78,6 +120,7 @@ public class VanishListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onTarget(EntityTargetLivingEntityEvent event) {
+        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
         if (!plugin.getVanishConfig().getBoolean("vanish.mobs-ignore", true)) return;
         if (!(event.getTarget() instanceof Player player)) return;
 
@@ -88,6 +131,7 @@ public class VanishListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onDamage(EntityDamageEvent event) {
+        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
         if (!(event.getEntity() instanceof Player player)) return;
 
         // projectiles-pass-through: damage from arrows/eggs/etc. is dealt via

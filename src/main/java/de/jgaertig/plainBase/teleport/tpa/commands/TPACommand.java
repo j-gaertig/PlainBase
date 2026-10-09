@@ -29,6 +29,11 @@ public class TPACommand implements BasicCommand {
             return;
         }
 
+        if (plugin.getTeleportConfig() == null || plugin.getTPAManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
+            return;
+        }
+
         if (!plugin.getTeleportConfig().getBoolean("tpa.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA has been disabled."));
             return;
@@ -61,8 +66,18 @@ public class TPACommand implements BasicCommand {
             return;
         }
 
+        if (!player.canSee(target)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Player not found!"));
+            return;
+        }
+
         if (target.equals(player)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>You cannot teleport to yourself!"));
+            return;
+        }
+
+        if (plugin.getTPAManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA is currently unavailable."));
             return;
         }
 
@@ -73,9 +88,18 @@ public class TPACommand implements BasicCommand {
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
         if (args.length <= 1) {
+            String prefix = args.length == 0 ? "" : args[0].toLowerCase();
+            CommandSender sender = stack.getSender();
+            if (sender instanceof Player player) {
+                return Bukkit.getOnlinePlayers().stream()
+                        .filter(player::canSee)
+                        .map(Player::getName)
+                        .filter(name -> name.toLowerCase().startsWith(prefix))
+                        .toList();
+            }
             return Bukkit.getOnlinePlayers().stream()
                     .map(Player::getName)
-                    .filter(name -> name.toLowerCase().startsWith(args.length == 0 ? "" : args[0].toLowerCase()))
+                    .filter(name -> name.toLowerCase().startsWith(prefix))
                     .toList();
         }
         return List.of();

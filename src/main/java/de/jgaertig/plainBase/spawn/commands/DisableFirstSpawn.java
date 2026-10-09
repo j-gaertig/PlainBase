@@ -23,6 +23,11 @@ public class DisableFirstSpawn implements BasicCommand {
             return;
         }
 
+        if (plugin.getSpawnConfig() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+            return;
+        }
+
         if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.spawn.admin") && !sender.hasPermission("plainbase.spawn.disablefirstspawn")) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
             return;
@@ -34,7 +39,7 @@ public class DisableFirstSpawn implements BasicCommand {
         }
 
         var config = plugin.getSpawnConfig();
-        config.set("firstspawn.enabled", false);
+        config.set("first-spawn.enabled", false);
         plugin.saveSpawnConfig();
 
         sender.sendMessage(plugin.getMiniMessage().deserialize("<green>First Spawn has been disabled!"));

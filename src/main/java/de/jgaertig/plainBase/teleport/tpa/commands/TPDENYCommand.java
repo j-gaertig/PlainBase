@@ -24,6 +24,11 @@ public class TPDENYCommand implements BasicCommand {
             return;
         }
 
+        if (plugin.getTeleportConfig() == null || plugin.getTPAManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
+            return;
+        }
+
         if (!plugin.getTeleportConfig().getBoolean("tpa.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA has been disabled."));
             return;
@@ -41,6 +46,11 @@ public class TPDENYCommand implements BasicCommand {
 
         if (!(sender instanceof Player player)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command can only be executed by players."));
+            return;
+        }
+
+        if (plugin.getTPAManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA is currently unavailable."));
             return;
         }
 

@@ -1,6 +1,6 @@
 name: PlainBase
-description: $description
-version: '${version}'
+description: ${project.description}
+version: '${project.version}'
 
 main: de.jgaertig.plainBase.PlainBase
 bootstrapper: de.jgaertig.plainBase.PlainBaseBootstrap

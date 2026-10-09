@@ -30,21 +30,30 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
             return;
         }
 
-        String ip = args[0];
+        String rawIp = args[0];
+        // Normalize to canonical form so "1.2.3.4", "::ffff:1.2.3.4" etc.
+        // match the stored ban row regardless of input spelling.
+        String ip = normalizeIp(rawIp);
+        if (ip == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    message("invalid-ip", "<red>Invalid IP address: %ip%").replace("%ip%", esc(rawIp))));
+            return;
+        }
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
+        String finalIp = ip;
 
-        plugin.getBanManager().unbanIpAsync(ip, staffUuid, staffName, unbanned -> {
+        plugin.getBanManager().unbanIpAsync(finalIp, staffUuid, staffName, unbanned -> {
             if (!unbanned) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("ip-not-banned", "<red>%ip% is not currently banned.").replace("%ip%", ip)));
+                        message("ip-not-banned", "<red>%ip% is not currently banned.").replace("%ip%", esc(finalIp))));
                 return;
             }
 
             sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("unbanip-success", "<green>%ip% has been unbanned.").replace("%ip%", ip)));
+                    message("unbanip-success", "<green>%ip% has been unbanned.").replace("%ip%", esc(finalIp))));
 
-            broadcast(message("unbanip-broadcast", "").replace("%ip%", ip).replace("%staff%", staffName));
+            broadcast(message("unbanip-broadcast", "").replace("%ip%", esc(finalIp)).replace("%staff%", esc(staffName)));
         });
     }
 

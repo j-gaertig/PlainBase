@@ -4,6 +4,8 @@ import de.jgaertig.plainBase.PlainBase;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.Mob;
 import org.bukkit.entity.Player;
 
 import java.io.File;
@@ -57,6 +59,21 @@ public class VanishManager {
             hideFrom(viewer, player);
         }
 
+        // De-target nearby mobs that are currently targeting this player so
+        // they stop chasing/attacking a now-vanished player. Runs directly:
+        // vanish() is called from the entity/region thread (command or join),
+        // where nearby-entity lookups are safe. Guarded so a Folia/thread
+        // violation can never break the vanish itself.
+        try {
+            for (Entity entity : player.getWorld().getNearbyEntities(player.getLocation(), 32, 32, 32)) {
+                if (entity instanceof Mob mob && player.equals(mob.getTarget())) {
+                    mob.setTarget(null);
+                }
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to de-target mobs for vanished player " + player.getName());
+        }
+
         savePlayerData(player.getUniqueId(), true);
     }
 
@@ -101,6 +118,7 @@ public class VanishManager {
     }
 
     public void loadPlayerData(Player player) {
+        if (plugin.getVanishConfig() == null) return;
         if (!plugin.getVanishConfig().getBoolean("vanish.persist-on-rejoin", true)) return;
 
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
@@ -129,6 +147,7 @@ public class VanishManager {
     }
 
     private void savePlayerData(UUID uuid, boolean vanished) {
+        if (plugin.getVanishConfig() == null) return;
         boolean persist = plugin.getVanishConfig().getBoolean("vanish.persist-on-rejoin", true);
 
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
@@ -161,10 +180,14 @@ public class VanishManager {
     }
 
     private boolean canSee(Player viewer, Player target) {
-        if (viewer.equals(target)) return true;
-        if (viewer.hasPermission("plainbase.vanish.see")) return true;
-        if (plugin.getVanishConfig().getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
-        return isVanished(viewer); // Staff who is vanished can see other vanished players
+        try {
+            if (viewer.equals(target)) return true;
+            if (viewer.hasPermission("plainbase.vanish.see")) return true;
+            if (plugin.getVanishConfig() != null && plugin.getVanishConfig().getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
+            return isVanished(viewer); // Staff who is vanished can see other vanished players
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
@@ -231,18 +254,26 @@ public class VanishManager {
      * Reveals all currently vanished players (used when the module is stopped/reloaded).
      */
     public void resetAll() {
-        for (UUID uuid : vanishedPlayers) {
-            Player player = Bukkit.getPlayer(uuid);
-            if (player != null) {
-                vanishedPlayers.remove(uuid);
-                resetSelfState(player);
-
-                for (Player viewer : Bukkit.getOnlinePlayers()) {
-                    if (viewer.equals(player)) continue;
-                    showTo(viewer, player);
+        for (UUID uuid : new java.util.HashSet<>(vanishedPlayers)) {
+            try {
+                Player player = Bukkit.getPlayer(uuid);
+                if (player != null) {
+                    vanishedPlayers.remove(uuid);
+                    try {
+                        resetSelfState(player);
+                    } catch (Exception ignored) {
+                    }
+                    try {
+                        for (Player viewer : Bukkit.getOnlinePlayers()) {
+                            if (viewer.equals(player)) continue;
+                            showTo(viewer, player);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                } else {
+                    vanishedPlayers.remove(uuid);
                 }
-            } else {
-                vanishedPlayers.remove(uuid);
+            } catch (Exception ignored) {
             }
         }
     }

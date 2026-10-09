@@ -27,14 +27,27 @@ public class BroadcastManager {
             if (key.equals("enabled")) continue;
 
             String text = section.getString(key + ".text");
-            long cooldownSeconds = section.getLong(key + ".cooldown", 60);
-            long ticks = Math.max(1, cooldownSeconds * 20); // Mindestens 1 Tick
+            if (text == null || text.isBlank()) {
+                plugin.getLogger().warning("Empty broadcast text for '" + key + "', skipping.");
+                continue;
+            }
 
+            long cooldownSeconds = Math.max(5, section.getLong(key + ".cooldown", 60));
+            long ticks = cooldownSeconds * 20L; // Mindestens 5 Sekunden Cooldown
+
+            final String broadcastKey = key;
+            final String broadcastText = text;
             ScheduledTask task = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, (t) -> {
-                Component message = plugin.getMiniMessage().deserialize(text);
-
-                for (Player player : Bukkit.getOnlinePlayers()) {
-                    player.sendMessage(message);
+                try {
+                    // Placeholders are resolved per recipient so player-specific
+                    // placeholders (e.g. %player%) are correct for everyone.
+                    for (Player player : Bukkit.getOnlinePlayers()) {
+                        Component message = plugin.getMiniMessage()
+                                .deserialize(plugin.applyPlaceholders(player, broadcastText));
+                        player.sendMessage(message);
+                    }
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to send broadcast '" + broadcastKey + "': " + e.getMessage());
                 }
             }, ticks, ticks);
 

@@ -25,23 +25,32 @@ public class SpawnListener implements Listener {
 
         if (!player.hasPlayedBefore()) {
             if (config.getBoolean("first-spawn.enabled", false)) {
-                teleportToConfigLocation(player, "first-spawn.location");
+                player.getScheduler().runDelayed(plugin, t -> teleportToConfigLocation(player, "first-spawn.location"), null, 1L);
                 return; // Wenn First-Spawn, dann kein normaler Spawn Teleport nötig
             }
         }
 
         if (config.getBoolean("spawn.enabled", false)) {
-            teleportToConfigLocation(player, "spawn.location");
+            player.getScheduler().runDelayed(plugin, t -> teleportToConfigLocation(player, "spawn.location"), null, 1L);
         }
     }
 
     private void teleportToConfigLocation(Player player, String path) {
+        if (player == null || !player.isOnline()) return;
         FileConfiguration config = plugin.getSpawnConfig();
         String worldName = config.getString(path + ".world");
-        if (worldName == null) return;
+        if (worldName == null) {
+            player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn location is not set correctly. Contact an admin!"));
+            plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": missing world at '" + path + ".world'.");
+            return;
+        }
 
         World world = Bukkit.getWorld(worldName);
-        if (world == null) return;
+        if (world == null) {
+            player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn world '" + worldName + "' not found. Contact an admin!"));
+            plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": world '" + worldName + "' not found (path '" + path + "').");
+            return;
+        }
 
         Location loc = new Location(
                 world,

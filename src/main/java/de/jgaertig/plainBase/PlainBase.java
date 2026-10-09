@@ -50,6 +50,7 @@ public final class PlainBase extends JavaPlugin {
     private MenuManager menuManager;
     private BanManager banManager;
     private boolean placeholdersRegistered = false;
+    private GlobalListener globalListener;
 
     private boolean commandsRegistered = false;
 
@@ -70,10 +71,11 @@ public final class PlainBase extends JavaPlugin {
 
         registerPlaceholderExpansion();
 
-        // Register commands unconditionally, independent of which modules are
-        // enabled at startup: the command implementations themselves guard on
-        // their module being enabled. This way /vanish and /menu still work
-        // when a module is enabled later via /plainbase toggle or config reload.
+        // Register ALL commands unconditionally at startup, independent of which
+        // modules are enabled: the command implementations themselves guard on
+        // their module being enabled. This way /vanish, /menu, /spawn, /tpa etc.
+        // still work when a module is enabled later via /plainbase toggle or reload.
+        // setupSpawn()/setupTeleport() only register listeners and managers.
         if (!commandsRegistered) {
             getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
                 var r = event.registrar();
@@ -89,12 +91,26 @@ public final class PlainBase extends JavaPlugin {
                 r.register("baninfo", new BanInfoCommand(this));
                 r.register("banip", new IpBanCommand(this));
                 r.register("unbanip", new UnbanIpCommand(this));
+
+                r.register("spawn", new Spawn(this));
+                r.register("setspawn", new SetSpawn(this));
+                r.register("setfirstspawn", new SetFirstSpawn(this));
+                r.register("disablespawn", new DisableSpawn(this));
+                r.register("disablefirstspawn", new DisableFirstSpawn(this));
+
+                r.register("tpa", new TPACommand(this));
+                r.register("tpaccept", new TPACCEPTCommand(this));
+                r.register("tpahere", new TPAHERECommand(this));
+                r.register("tpauto", new TPAUTOCommand(this));
+                r.register("tpdeny", new TPDENYCommand(this));
+                r.register("tpacancel", new TPACANCELCommand(this));
+
+                r.register("rtp", new RTPCommand(this));
             });
         }
 
         reloadModules();
 
-        getServer().getPluginManager().registerEvents(new GlobalListener(this), this);
         checkAllConfigVersions();
 
         commandsRegistered = true;
@@ -105,6 +121,14 @@ public final class PlainBase extends JavaPlugin {
     @Override
     public void onDisable() {
         stopModules();
+
+        if (placeholdersRegistered) {
+            try {
+                new PlainBaseExpansion(this).unregister();
+            } catch (Exception ignored) {
+            }
+            placeholdersRegistered = false;
+        }
 
         getLogger().info("Successfully Disabled!");
     }
@@ -121,7 +145,7 @@ public final class PlainBase extends JavaPlugin {
         );
 
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.spawn.spawn", "PlainBase: Allows access to /spawn", PermissionDefault.OP)
+                new Permission("plainbase.spawn.spawn", "PlainBase: Allows access to /spawn", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
                 new Permission("plainbase.spawn.setspawn", "PlainBase: Allows access to /setspawn", PermissionDefault.OP)
@@ -145,29 +169,29 @@ public final class PlainBase extends JavaPlugin {
                 new Permission("plainbase.teleport.rtp.admin", "PlainBase: Allows access to all permissions of rtp of the teleport module", PermissionDefault.OP)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.teleport.rtp.rtp", "PlainBase: Allows access to /rtp", PermissionDefault.OP)
+                new Permission("plainbase.teleport.rtp.rtp", "PlainBase: Allows access to /rtp", PermissionDefault.TRUE)
         );
 
         getServer().getPluginManager().addPermission(
                 new Permission("plainbase.teleport.tpa.admin", "PlainBase: Allows access to all permissions of tpa of the teleport module", PermissionDefault.OP)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.teleport.tpa.tpa", "PlainBase: Allows access to /tpa", PermissionDefault.OP)
+                new Permission("plainbase.teleport.tpa.tpa", "PlainBase: Allows access to /tpa", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.teleport.tpa.tpaccept", "PlainBase: Allows access to /tpaccept", PermissionDefault.OP)
+                new Permission("plainbase.teleport.tpa.tpaccept", "PlainBase: Allows access to /tpaccept", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.teleport.tpa.tpdeny", "PlainBase: Allows access to /tpdeny", PermissionDefault.OP)
+                new Permission("plainbase.teleport.tpa.tpdeny", "PlainBase: Allows access to /tpdeny", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.teleport.tpa.tpacancel", "PlainBase: Allows access to /tpacancel", PermissionDefault.OP)
+                new Permission("plainbase.teleport.tpa.tpacancel", "PlainBase: Allows access to /tpacancel", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.teleport.tpa.tpahere", "PlainBase: Allows access to /tpahere", PermissionDefault.OP)
+                new Permission("plainbase.teleport.tpa.tpahere", "PlainBase: Allows access to /tpahere", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.teleport.tpa.tpauto", "PlainBase: Allows access to /tpauto", PermissionDefault.OP)
+                new Permission("plainbase.teleport.tpa.tpauto", "PlainBase: Allows access to /tpauto", PermissionDefault.TRUE)
         );
 
         // vanish module
@@ -203,10 +227,10 @@ public final class PlainBase extends JavaPlugin {
                 new Permission("plainbase.menu.delete", "PlainBase: Allows access to /menu delete", PermissionDefault.OP)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.menu.open", "PlainBase: Allows access to /menu open", PermissionDefault.OP)
+                new Permission("plainbase.menu.open", "PlainBase: Allows access to /menu open", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.menu.list", "PlainBase: Allows access to /menu list", PermissionDefault.OP)
+                new Permission("plainbase.menu.list", "PlainBase: Allows access to /menu list", PermissionDefault.TRUE)
         );
 
         // moderation module
@@ -257,19 +281,39 @@ public final class PlainBase extends JavaPlugin {
         if (getConfig().getBoolean("modules.vanish", true)) setupVanish();
         if (getConfig().getBoolean("modules.menu", true)) setupMenu();
         if (getConfig().getBoolean("modules.moderation", true)) setupModeration();
+
+        ensureGlobalListener();
+    }
+
+    /**
+     * Registers the global listener exactly once. After {@link #stopModules()}
+     * unregisters all listeners, the reference is cleared so the next
+     * {@link #reloadModules()} re-registers it (e.g. after /plainbase reload).
+     */
+    private void ensureGlobalListener() {
+        if (globalListener == null) {
+            globalListener = new GlobalListener(this);
+            getServer().getPluginManager().registerEvents(globalListener, this);
+        }
     }
 
     public void stopModules() {
+        // Cache the vanish config BEFORE configs.clear() below: after clearing,
+        // getVanishConfig() returns null and the persist check would NPE.
+        FileConfiguration vanishConfig = getVanishConfig();
+        boolean vanishEnabled = getConfig().getBoolean("modules.vanish", true);
+        boolean persist = vanishConfig != null && vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
+
         if (broadcastManager != null) {
             broadcastManager.stopBroadcasts();
+            broadcastManager = null;
         }
 
         // Reveal everyone when the vanish module is switched off, or when
         // persist-on-rejoin is disabled (reload must not keep anyone hidden).
         // A plain reload with persist enabled keeps vanished players hidden
         // and setupVanish() re-applies their state.
-        if (vanishManager != null && (!getConfig().getBoolean("modules.vanish", true)
-                || !getVanishConfig().getBoolean("vanish.persist-on-rejoin", true))) {
+        if (vanishManager != null && (!vanishEnabled || !persist)) {
             vanishManager.resetAll();
         }
 
@@ -287,7 +331,30 @@ public final class PlainBase extends JavaPlugin {
             banManager.shutdown();
         }
         banManager = null;
+
+        // Pending TPA/RTP warmups, searches and request timeouts must not
+        // survive a reload or module toggle-off.
+        if (tpaManager != null) {
+            try {
+                tpaManager.cancelAll();
+            } catch (Exception ignored) {
+            }
+        }
+        tpaManager = null;
+        if (rtpManager != null) {
+            try {
+                rtpManager.cancelAll();
+            } catch (Exception ignored) {
+            }
+        }
+        rtpManager = null;
+
+        // Vanish config is cached locally above, so unregistering first is safe.
         org.bukkit.event.HandlerList.unregisterAll(this);
+        configs.clear();
+        // The unregister above also removed the global listener: drop the
+        // reference so reloadModules() re-registers it via ensureGlobalListener().
+        globalListener = null;
     }
 
     public FileConfiguration loadModuleConfig(String fileName) {
@@ -354,19 +421,12 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupSpawn() {
-        loadModuleConfig("spawn.yml");
-        getServer().getPluginManager().registerEvents(new SpawnListener(this), this);
-
-        if (!commandsRegistered) {
-            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-                var r = event.registrar();
-                r.register("spawn", new Spawn(this));
-                r.register("setspawn", new SetSpawn(this));
-                r.register("setfirstspawn", new SetFirstSpawn(this));
-                r.register("disablespawn", new DisableSpawn(this));
-                r.register("disablefirstspawn", new DisableFirstSpawn(this));
-            });
+        FileConfiguration spawnConfig = loadModuleConfig("spawn.yml");
+        if (spawnConfig == null) {
+            getLogger().severe("Could not load spawn.yml! The spawn module stays disabled until this is fixed.");
+            return;
         }
+        getServer().getPluginManager().registerEvents(new SpawnListener(this), this);
     }
 
     public void saveSpawnConfig() {
@@ -381,12 +441,20 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupJoinItems() {
-        loadModuleConfig("joinitems.yml");
+        FileConfiguration joinItemsConfig = loadModuleConfig("joinitems.yml");
+        if (joinItemsConfig == null) {
+            getLogger().severe("Could not load joinitems.yml! The joinitems module stays disabled until this is fixed.");
+            return;
+        }
         getServer().getPluginManager().registerEvents(new JoinItemsListener(this), this);
     }
 
     public void setupMessages() {
-        loadModuleConfig("messages.yml");
+        FileConfiguration messagesConfig = loadModuleConfig("messages.yml");
+        if (messagesConfig == null) {
+            getLogger().severe("Could not load messages.yml! The messages module stays disabled until this is fixed.");
+            return;
+        }
         getServer().getPluginManager().registerEvents(new MessagesListener(this), this);
 
         broadcastManager = new BroadcastManager(this);
@@ -394,30 +462,24 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupTeleport() {
-        loadModuleConfig("teleport.yml");
+        FileConfiguration teleportConfig = loadModuleConfig("teleport.yml");
+        if (teleportConfig == null) {
+            getLogger().severe("Could not load teleport.yml! The teleport module stays disabled until this is fixed.");
+            return;
+        }
 
         tpaManager = new TPAManager(this);
         rtpManager = new RTPManager(this);
 
         getServer().getPluginManager().registerEvents(new TeleportListener(this), this);
-
-        if (!commandsRegistered) {
-            getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-                var r = event.registrar();
-                r.register("tpa", new TPACommand(this));
-                r.register("tpaccept", new TPACCEPTCommand(this));
-                r.register("tpahere", new TPAHERECommand(this));
-                r.register("tpauto", new TPAUTOCommand(this));
-                r.register("tpdeny", new TPDENYCommand(this));
-                r.register("tpacancel", new TPACANCELCommand(this));
-
-                r.register("rtp", new RTPCommand(this));
-            });
-        }
     }
 
     public void setupVanish() {
-        loadModuleConfig("vanish.yml");
+        FileConfiguration vanishCfg = loadModuleConfig("vanish.yml");
+        if (vanishCfg == null) {
+            getLogger().severe("Could not load vanish.yml! The vanish module stays disabled until this is fixed.");
+            return;
+        }
 
         vanishManager = new VanishManager(this);
 
@@ -430,7 +492,11 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupMenu() {
-        loadModuleConfig("menu.yml");
+        FileConfiguration menuCfg = loadModuleConfig("menu.yml");
+        if (menuCfg == null) {
+            getLogger().severe("Could not load menu.yml! The menu module stays disabled until this is fixed.");
+            return;
+        }
 
         menuManager = new MenuManager(this);
         menuManager.reloadMenus();
@@ -439,13 +505,19 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupModeration() {
-        loadModuleConfig("moderation.yml");
+        FileConfiguration moderationCfg = loadModuleConfig("moderation.yml");
+        if (moderationCfg == null) {
+            getLogger().severe("Could not load moderation.yml! The moderation module stays disabled until this is fixed.");
+            return;
+        }
 
         try {
             banManager = new BanManager(this);
-        } catch (java.sql.SQLException e) {
+        } catch (Exception e) {
+            FileConfiguration moderationConfig = getModerationConfig();
+            String storageType = moderationConfig != null ? moderationConfig.getString("storage.type", "sqlite") : "<unknown>";
             getLogger().severe("Could not connect the moderation database (storage.type=" +
-                    getModerationConfig().getString("storage.type", "sqlite") + "): " + e.getMessage());
+                    storageType + "): " + e.getMessage());
             getLogger().severe("The moderation module is disabled until this is fixed and /plainbase reload is run.");
             banManager = null;
             return;

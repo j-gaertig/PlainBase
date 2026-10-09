@@ -24,6 +24,11 @@ public class RTPCommand implements BasicCommand {
             return;
         }
 
+        if (plugin.getTeleportConfig() == null || plugin.getRTPManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
+            return;
+        }
+
         if (!plugin.getTeleportConfig().getBoolean("rtp.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP has been disabled."));
             return;
@@ -46,6 +51,11 @@ public class RTPCommand implements BasicCommand {
 
         if (!(args.length == 0)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/rtp"));
+            return;
+        }
+
+        if (plugin.getRTPManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP is currently unavailable."));
             return;
         }
 

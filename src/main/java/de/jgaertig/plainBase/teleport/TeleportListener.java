@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.teleport;
 
 import de.jgaertig.plainBase.PlainBase;
+import org.bukkit.Location;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageEvent;
@@ -8,6 +9,7 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.entity.Player;
 
 import java.util.List;
@@ -21,14 +23,43 @@ public class TeleportListener implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
-        plugin.getTPAManager().loadPlayerData(event.getPlayer());
+        if (plugin.getTPAManager() != null) {
+            plugin.getTPAManager().loadPlayerData(event.getPlayer());
+        }
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        if (!plugin.getConfig().getBoolean("modules.teleport", true)) return;
+        Player player = event.getPlayer();
+        try {
+            if (plugin.getTPAManager() != null) {
+                plugin.getTPAManager().handleQuit(player);
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            if (plugin.getRTPManager() != null) {
+                plugin.getRTPManager().cancelWarmup(player, "You left!");
+                try {
+                    plugin.getRTPManager().cancelSearch(player);
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     @EventHandler
     public void onMove(PlayerMoveEvent event) {
-        if (event.getFrom().getBlockX() == event.getTo().getBlockX() &&
-                event.getFrom().getBlockY() == event.getTo().getBlockY() &&
-                event.getFrom().getBlockZ() == event.getTo().getBlockZ()) return;
+        Location from = event.getFrom();
+        Location to = event.getTo();
+        if (to == null || from.getWorld() == null || to.getWorld() == null) return;
+        if (!from.getWorld().equals(to.getWorld())) {
+            checkAndCancel(event.getPlayer(), "move");
+            return;
+        }
+        if (from.distanceSquared(to) < 0.01) return;
 
         checkAndCancel(event.getPlayer(), "move");
     }
@@ -51,14 +82,18 @@ public class TeleportListener implements Listener {
     }
 
     private void checkAndCancel(Player p, String flag) {
-        List<String> tpaCancelFlags = plugin.getTeleportConfig().getStringList("tpa.counter.cancel_on");
-        if (tpaCancelFlags.contains(flag)) {
-            plugin.getTPAManager().cancelWarmup(p, generateReason(flag));
-        }
+        if (p == null) return;
+        try {
+            List<String> tpaCancelFlags = plugin.getTeleportConfig().getStringList("tpa.counter.cancel_on");
+            if (tpaCancelFlags.contains(flag) && plugin.getTPAManager() != null) {
+                plugin.getTPAManager().cancelWarmup(p, generateReason(flag));
+            }
 
-        List<String> rtpCancelFlags = plugin.getTeleportConfig().getStringList("rtp.counter.cancel_on");
-        if (rtpCancelFlags.contains(flag)) {
-            plugin.getRTPManager().cancelWarmup(p, generateReason(flag));
+            List<String> rtpCancelFlags = plugin.getTeleportConfig().getStringList("rtp.counter.cancel_on");
+            if (rtpCancelFlags.contains(flag) && plugin.getRTPManager() != null) {
+                plugin.getRTPManager().cancelWarmup(p, generateReason(flag));
+            }
+        } catch (Exception ignored) {
         }
     }
 

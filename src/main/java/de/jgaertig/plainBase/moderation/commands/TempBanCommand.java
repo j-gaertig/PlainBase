@@ -62,22 +62,34 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
         resolveTarget(targetName, offlinePlayer -> {
             if (offlinePlayer == null) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", targetName)));
+                        message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
                 return;
             }
 
             String name = displayName(offlinePlayer, targetName);
 
-            if (isExempt(offlinePlayer, sender)) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+            // Never allow self-bans (would instantly lock the staffer out).
+            if (staffUuid != null && offlinePlayer.getUniqueId().equals(staffUuid)) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("self-ban", "<red>You cannot ban yourself.")));
                 return;
+            }
+
+            Player onlineTarget = offlinePlayer.getPlayer();
+            if (onlineTarget != null) {
+                if (isExempt(offlinePlayer, sender) || isProtectedTarget(onlineTarget, sender)) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+                    return;
+                }
+            } else if (!isAdmin(sender)) {
+                warnOfflineExemptUnchecked(name);
             }
 
             BanManager manager = plugin.getBanManager();
             manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, result -> {
                 if (result.isEmpty()) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
-                            message("already-banned", "<red>%player% is already banned.").replace("%player%", name)));
+                            message("already-banned", "<red>%player% is already banned.").replace("%player%", esc(name))));
                     return;
                 }
 
@@ -87,21 +99,21 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                 if (online != null) {
                     kickSafely(online, plugin.getMiniMessage().deserialize(
                             message("tempban-screen", "<red>You are temporarily banned.\n<gray>Reason: %reason%\n<gray>Remaining: %remaining%")
-                                    .replace("%reason%", reason)
-                                    .replace("%staff%", staffName)
-                                    .replace("%remaining%", durationText)));
+                                    .replace("%reason%", esc(reason))
+                                    .replace("%staff%", esc(staffName))
+                                    .replace("%remaining%", esc(durationText))));
                 } else if (!offlinePlayer.hasPlayedBefore()) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
-                            message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", name)));
+                            message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", esc(name))));
                 }
 
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("tempban-success", "<green>%player% has been banned for %duration%. <gray>(%reason%)")
-                                .replace("%player%", name).replace("%duration%", durationText).replace("%reason%", reason)));
+                                .replace("%player%", esc(name)).replace("%duration%", esc(durationText)).replace("%reason%", esc(reason))));
 
                 broadcast(message("tempban-broadcast", "")
-                        .replace("%player%", name).replace("%staff%", staffName)
-                        .replace("%duration%", durationText).replace("%reason%", reason));
+                        .replace("%player%", esc(name)).replace("%staff%", esc(staffName))
+                        .replace("%duration%", esc(durationText)).replace("%reason%", esc(reason)));
             });
         });
     }

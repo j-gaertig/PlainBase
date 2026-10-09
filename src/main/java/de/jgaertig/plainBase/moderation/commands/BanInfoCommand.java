@@ -42,7 +42,7 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
         resolveTarget(targetName, offlinePlayer -> {
             if (offlinePlayer == null) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", targetName)));
+                        message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
                 return;
             }
 
@@ -53,13 +53,13 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
 
             if (bans == 0 && kicks == 0) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", name)));
+                        message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", esc(name))));
                 sender.sendMessage(plugin.getMiniMessage().deserialize(message("baninfo-no-history", "<gray>No ban or kick history.")));
                 return;
             }
 
             sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", name)));
+                    message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", esc(name))));
 
             Optional<BanRecord> active = manager.getActiveBan(offlinePlayer.getUniqueId());
             if (active.isPresent()) {
@@ -79,8 +79,8 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             manager.getLastBan(offlinePlayer.getUniqueId()).ifPresent(last ->
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("baninfo-last-ban", "<gray>Last ban reason: <yellow>%reason% by %staff%")
-                                    .replace("%reason%", last.reason())
-                                    .replace("%staff%", last.staffName()))));
+                                    .replace("%reason%", esc(last.reason()))
+                                    .replace("%staff%", esc(last.staffName())))));
 
             // findLastIpByName() does blocking JDBC I/O — never call it directly
             // on this main/region thread. Hop to the async scheduler, then back.

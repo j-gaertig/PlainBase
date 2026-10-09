@@ -55,15 +55,49 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
         resolveIp(target, ip -> {
             if (ip == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("ip-not-found", "<red>Could not resolve an IP for %player%.").replace("%player%", target)));
+                if (isIpLike(target)) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("invalid-ip", "<red>Invalid IP address: %ip%").replace("%ip%", esc(target))));
+                } else {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("ip-not-found", "<red>Could not resolve an IP for %player%.").replace("%player%", esc(target))));
+                }
                 return;
+            }
+
+            // Self-IP warning: banning your own address locks YOU out on next login.
+            if (sender instanceof Player self && self.getAddress() != null
+                    && ip.equals(self.getAddress().getAddress().getHostAddress())) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("self-ip-warning", "<yellow>Warning: this is your own IP address — you will lock yourself out.")));
+            }
+
+            // Exempt/admin check for online players currently on this IP.
+            // Offline owners of the IP cannot be permission-checked (documented
+            // limitation) — logged for audit when the sender is no admin.
+            if (!isAdmin(sender)) {
+                boolean protectedOwner = false;
+                for (Player online : Bukkit.getOnlinePlayers()) {
+                    if (online.getAddress() != null
+                            && ip.equals(online.getAddress().getAddress().getHostAddress())
+                            && isProtectedTarget(online, sender)) {
+                        protectedOwner = true;
+                        break;
+                    }
+                }
+                if (protectedOwner) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("exempt", "<red>You cannot punish this player.")));
+                    return;
+                }
+                plugin.getLogger().warning("IP ban on " + ip + " by " + sender.getName()
+                        + " without full exempt/admin check (offline owners cannot be verified).");
             }
 
             plugin.getBanManager().tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, result -> {
                 if (result.isEmpty()) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
-                            message("ip-already-banned", "<red>%ip% is already banned.").replace("%ip%", ip)));
+                            message("ip-already-banned", "<red>%ip% is already banned.").replace("%ip%", esc(ip))));
                     return;
                 }
 
@@ -72,16 +106,17 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
                     if (ip.equals(online.getAddress() != null ? online.getAddress().getAddress().getHostAddress() : null)) {
                         kickSafely(online, plugin.getMiniMessage().deserialize(
                                 message("ipban-screen", "<red>Your IP address is banned.\n<gray>Reason: %reason%")
-                                        .replace("%reason%", reason).replace("%staff%", staffName)));
+                                        .replace("%reason%", esc(reason)).replace("%staff%", esc(staffName))
+                                        .replace("%remaining%", "permanent")));
                     }
                 }
 
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("banip-success", "<green>%ip% has been banned. <gray>(%reason%)")
-                                .replace("%ip%", ip).replace("%reason%", reason)));
+                                .replace("%ip%", esc(ip)).replace("%reason%", esc(reason))));
 
                 broadcast(message("banip-broadcast", "")
-                        .replace("%ip%", ip).replace("%staff%", staffName).replace("%reason%", reason));
+                        .replace("%ip%", esc(ip)).replace("%staff%", esc(staffName)).replace("%reason%", esc(reason)));
             });
         });
     }
@@ -93,8 +128,10 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
      * (async — the DB lookup can block, same pattern as offline name resolution).
      */
     private void resolveIp(String arg, java.util.function.Consumer<String> callback) {
-        if (IP_LIKE.matcher(arg).matches() && (arg.contains(".") || arg.contains(":"))) {
-            callback.accept(arg);
+        if (isIpLike(arg)) {
+            // Normalize ("::ffff:1.2.3.4", leading zeros, ...) to canonical
+            // form so stored, cached and checked values always compare equal.
+            callback.accept(normalizeIp(arg));
             return;
         }
 
@@ -106,8 +143,15 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             String lastIp = plugin.getBanManager().findLastIpByName(arg);
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(lastIp));
+            // Stored IPs were recorded via getHostAddress() already, but
+            // normalize defensively so legacy rows still match.
+            String normalized = lastIp == null ? null : normalizeIp(lastIp);
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(normalized != null ? normalized : lastIp));
         });
+    }
+
+    private static boolean isIpLike(String arg) {
+        return IP_LIKE.matcher(arg).matches() && (arg.contains(".") || arg.contains(":"));
     }
 
     @Override

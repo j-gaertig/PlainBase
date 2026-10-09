@@ -34,7 +34,7 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
             try {
                 page = Math.max(1, Integer.parseInt(args[0]));
             } catch (NumberFormatException e) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>'" + args[0] + "' is not a valid page number — showing page 1."));
+                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>'" + esc(args[0]) + "' is not a valid page number — showing page 1."));
             }
         }
 
@@ -54,8 +54,8 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                     String duration = record.isPermanent() ? "permanent" : DurationParser.format(record.remainingMillis(now)) + " left";
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("banlist-entry", "<yellow>%player% <gray>- %reason% (%duration%)")
-                                    .replace("%player%", record.name())
-                                    .replace("%reason%", record.reason())
+                                    .replace("%player%", esc(record.name()))
+                                    .replace("%reason%", esc(record.reason()))
                                     .replace("%duration%", duration)));
                 }
             }
@@ -73,8 +73,8 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                     String duration = record.isPermanent() ? "permanent" : DurationParser.format(record.remainingMillis(now)) + " left";
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("banlist-ip-entry", "<yellow>%ip% <gray>- %reason% (%duration%)")
-                                    .replace("%ip%", record.ip())
-                                    .replace("%reason%", record.reason())
+                                    .replace("%ip%", esc(record.ip()))
+                                    .replace("%reason%", esc(record.reason()))
                                     .replace("%duration%", duration)));
                 }
             }
