@@ -30,6 +30,11 @@ public class VanishCommand implements BasicCommand {
             return;
         }
 
+        if (plugin.getVanishConfig() == null || plugin.getVanishManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Vanish is currently unavailable."));
+            return;
+        }
+
         if (!plugin.getVanishConfig().getBoolean("vanish.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Vanish has been disabled."));
             return;
@@ -131,11 +136,29 @@ public class VanishCommand implements BasicCommand {
     }
 
     private void toggleAll(Player executor, List<Player> targets) {
+        // Determine a single target state instead of toggling each player
+        // individually: if anyone is still visible, vanish everyone —
+        // otherwise reveal everyone. Per-player toggling would leave a
+        // mixed group in the exact same mixed state (no-op with noise).
+        boolean anyVisible = targets.stream().anyMatch(p -> !plugin.getVanishManager().isVanished(p));
+
         int vanished = 0;
         int revealed = 0;
         for (Player target : targets) {
-            if (plugin.getVanishManager().toggleVanish(target)) vanished++;
-            else revealed++;
+            boolean isVanished = plugin.getVanishManager().isVanished(target);
+            if (anyVisible && !isVanished) {
+                plugin.getVanishManager().vanish(target);
+                vanished++;
+                if (!target.equals(executor)) {
+                    target.sendMessage(plugin.getMiniMessage().deserialize("<green>You are now vanished!"));
+                }
+            } else if (!anyVisible && isVanished) {
+                plugin.getVanishManager().unvanish(target);
+                revealed++;
+                if (!target.equals(executor)) {
+                    target.sendMessage(plugin.getMiniMessage().deserialize("<gray>You are no longer vanished."));
+                }
+            }
         }
         executor.sendMessage(plugin.getMiniMessage().deserialize(
                 "<gray>Vanished: <green>" + vanished + " <gray>| Made visible: <red>" + revealed

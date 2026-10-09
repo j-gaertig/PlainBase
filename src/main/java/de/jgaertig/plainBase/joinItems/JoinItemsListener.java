@@ -6,13 +6,17 @@ import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.inventory.CraftItemEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCreativeEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.inventory.InventoryMoveItemEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -69,6 +73,12 @@ public class JoinItemsListener implements Listener {
             }
 
             int slot = itemsSection.getInt(key + ".slot");
+            // Slot validation: player inventory slots are 0-35. An invalid
+            // slot must never throw or write elsewhere — skip with a warning.
+            if (slot < 0 || slot >= 36) {
+                plugin.getLogger().warning("Invalid slot '" + slot + "' for join item '" + key + "', skipping.");
+                continue;
+            }
             Material material = Material.matchMaterial(itemsSection.getString(key + ".material", "STONE"));
             String name = itemsSection.getString(key + ".name", "");
             List<String> loreStrings = itemsSection.getStringList(key + ".lore");
@@ -99,6 +109,16 @@ public class JoinItemsListener implements Listener {
 
                 meta.getPersistentDataContainer().set(joinItemKey, PersistentDataType.STRING, key);
                 item.setItemMeta(meta);
+            }
+            // Overwrite guard: never destroy a player's existing items (e.g.
+            // diamonds). Only place the join item on an empty slot unless the
+            // config explicitly opts in via items.<key>.overwrite: true.
+            boolean overwrite = itemsSection.getBoolean(key + ".overwrite", false);
+            if (!overwrite) {
+                ItemStack existing = player.getInventory().getItem(slot);
+                if (existing != null && !existing.getType().isAir()) {
+                    continue;
+                }
             }
             player.getInventory().setItem(slot, item);
         }
@@ -182,11 +202,71 @@ public class JoinItemsListener implements Listener {
         }
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
     public void onCommand(PlayerCommandPreprocessEvent event) {
+        // A cancelled /clear never actually cleared anything — re-giving
+        // items for it would duplicate them. Exact match only: "/clearly"
+        // or similar commands must not trigger a re-give.
+        if (event.isCancelled()) return;
         String message = event.getMessage().toLowerCase();
-        if (message.startsWith("/clear") || message.startsWith("/minecraft:clear")) {
+        if (message.equals("/clear") || message.startsWith("/clear ")
+                || message.equals("/minecraft:clear") || message.startsWith("/minecraft:clear ")) {
             handleReGive(event.getPlayer(), message, "re-give-after-/clear");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onDeath(PlayerDeathEvent event) {
+        // Death dupe guard: items that are re-given after death must not
+        // also drop on the ground, or every death would duplicate them.
+        // Only items whose own config key carries the re-give-after-death
+        // flag are removed — one-shot join items without the flag keep
+        // their normal drop behaviour.
+        if (event.getKeepInventory()) return;
+        try {
+            event.getDrops().removeIf(this::isRegiveAfterDeathJoinItem);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to filter join items from death drops: " + e.getMessage());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInventoryMove(InventoryMoveItemEvent event) {
+        // Hopper / hopper-minecart siphoning: a join item must never be
+        // moved by non-player automation. No player context exists here,
+        // so any join item involvement cancels the move (safe default).
+        if (isJoinItem(event.getItem())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onCraft(CraftItemEvent event) {
+        // A join item must never be consumed as a crafting ingredient, and
+        // crafting must never produce a join-item-looking result.
+        if (isJoinItem(event.getRecipe().getResult())
+                || isJoinItem(event.getCurrentItem())
+                || isJoinItem(event.getCursor())) {
+            event.setCancelled(true);
+            return;
+        }
+        for (ItemStack ingredient : event.getInventory().getMatrix()) {
+            if (isJoinItem(ingredient)) {
+                event.setCancelled(true);
+                return;
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onInteractEntity(PlayerInteractEntityEvent event) {
+        // Placing a join item into an item frame would smuggle it out of
+        // the protected inventory.
+        if (!(event.getRightClicked() instanceof ItemFrame)) return;
+        Player player = event.getPlayer();
+        if (isJoinItem(player.getInventory().getItemInMainHand())
+                || isJoinItem(player.getInventory().getItemInOffHand())) {
+            event.setCancelled(true);
         }
     }
 
@@ -194,7 +274,8 @@ public class JoinItemsListener implements Listener {
     public void onRespawn(PlayerRespawnEvent event) {
         Player player = event.getPlayer();
         player.getScheduler().runDelayed(plugin, task -> {
-            giveConfiguredItems(event.getPlayer(), "re-give-after-death");
+            if (!player.isOnline()) return;
+            giveConfiguredItems(player, "re-give-after-death");
         }, null, 5L);
     }
 
@@ -202,7 +283,32 @@ public class JoinItemsListener implements Listener {
         String[] args = message.split(" ");
         Player target = (args.length == 1) ? sender : Bukkit.getPlayer(args[1]);
         if (target != null && target.isOnline()) {
-            target.getScheduler().runDelayed(plugin, task -> giveConfiguredItems(target, flag), null, 3L);
+            // Only re-give to self, or to others with explicit admin rights.
+            // Without this check, "/clear <other>" from any player would hand
+            // free items to that player (/clear farm).
+            if (!target.equals(sender) && !sender.hasPermission("plainbase.admin") && !sender.isOp()) {
+                return;
+            }
+            target.getScheduler().runDelayed(plugin, task -> { if (!target.isOnline()) return; giveConfiguredItems(target, flag); }, null, 3L);
+        }
+    }
+
+    /**
+     * True for join items whose own config entry carries the
+     * re-give-after-death flag (i.e. items that will be re-given on respawn
+     * and therefore must not drop on death).
+     */
+    private boolean isRegiveAfterDeathJoinItem(ItemStack item) {
+        if (!isJoinItem(item)) return false;
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) return false;
+        String configKey = meta.getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
+        if (configKey == null) return false;
+        try {
+            return plugin.getJoinItemsConfig().getStringList("items." + configKey + ".flags")
+                    .contains("re-give-after-death");
+        } catch (Exception e) {
+            return false;
         }
     }
 

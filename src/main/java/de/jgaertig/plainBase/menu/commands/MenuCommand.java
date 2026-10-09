@@ -30,6 +30,11 @@ public class MenuCommand implements BasicCommand {
             return;
         }
 
+        if (plugin.getMenuConfig() == null || plugin.getMenuManager() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Menu is currently unavailable."));
+            return;
+        }
+
         if (!plugin.getMenuConfig().getBoolean("menu.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>The menu system has been disabled."));
             return;
@@ -148,6 +153,7 @@ public class MenuCommand implements BasicCommand {
         if (args.length == 2) {
             String sub = args[0].toLowerCase();
             if (sub.equals("delete") || sub.equals("open")) {
+                if (plugin.getMenuManager() == null) return List.of();
                 String input = args[1].toLowerCase();
                 return new ArrayList<>(plugin.getMenuManager().getMenuNames()).stream()
                         .filter(n -> n.toLowerCase().startsWith(input))

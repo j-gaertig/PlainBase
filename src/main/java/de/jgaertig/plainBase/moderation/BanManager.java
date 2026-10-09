@@ -90,25 +90,24 @@ public class BanManager {
      * periodic task runs on Bukkit.getAsyncScheduler()).
      */
     private void refreshCacheBlocking() {
-        try {
-            List<BanRecord> bans = db.loadAllBans();
-            List<KickRecord> kicks = db.loadAllKicks();
-            List<IpBanRecord> ipBans = db.loadAllIpBans();
+        // Serialized with all mutations via mutationLock: without this, a
+        // periodic refresh racing a concurrent ban/unban could wipe the
+        // freshly written entry (clear + addAll is not atomic).
+        synchronized (mutationLock) {
+            try {
+                List<BanRecord> bans = db.loadAllBans();
+                List<KickRecord> kicks = db.loadAllKicks();
+                List<IpBanRecord> ipBans = db.loadAllIpBans();
 
-            Map<UUID, List<BanRecord>> newBansByUuid = new ConcurrentHashMap<>();
-            for (BanRecord record : bans) {
-                newBansByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
-            }
-            Map<UUID, List<KickRecord>> newKicksByUuid = new ConcurrentHashMap<>();
-            for (KickRecord record : kicks) {
-                newKicksByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
-            }
+                Map<UUID, List<BanRecord>> newBansByUuid = new ConcurrentHashMap<>();
+                for (BanRecord record : bans) {
+                    newBansByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
+                }
+                Map<UUID, List<KickRecord>> newKicksByUuid = new ConcurrentHashMap<>();
+                for (KickRecord record : kicks) {
+                    newKicksByUuid.computeIfAbsent(record.uuid(), k -> new CopyOnWriteArrayList<>()).add(record);
+                }
 
-            // Swap the cache under the same lock the mutation methods use, so a
-            // ban/unban that commits to the DB between this method's reads and
-            // its cache swap can't have its cache update clobbered by a stale
-            // snapshot read just before it.
-            synchronized (mutationLock) {
                 bansCache.clear();
                 bansCache.addAll(bans);
                 kicksCache.clear();
@@ -119,9 +118,11 @@ public class BanManager {
                 bansByUuid.putAll(newBansByUuid);
                 kicksByUuid.clear();
                 kicksByUuid.putAll(newKicksByUuid);
+            } catch (SQLException | RuntimeException e) {
+                // RuntimeException included: a single corrupt row (bad UUID,
+                // unexpected null) must never kill the periodic refresh task.
+                plugin.getLogger().severe("Could not refresh moderation cache: " + e.getMessage());
             }
-        } catch (SQLException e) {
-            plugin.getLogger().severe("Could not refresh moderation cache: " + e.getMessage());
         }
     }
 
@@ -224,7 +225,22 @@ public class BanManager {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             Optional<BanRecord> result;
             synchronized (mutationLock) {
-                if (getActiveBan(uuid).isPresent()) {
+                // Authoritative live check instead of cache-only: two racing
+                // /ban calls (or a ban from another server on shared MySQL)
+                // must not both pass the "not already banned" test.
+                // On DB failure fall back to the cache so a hiccup can't
+                // produce duplicate rows.
+                BanRecord live = null;
+                boolean liveOk = false;
+                try {
+                    live = db.findActiveBan(uuid, System.currentTimeMillis());
+                    liveOk = true;
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not live-check ban for " + name + ", falling back to cache: " + e.getMessage());
+                }
+                BanRecord effective = live != null ? live : (liveOk ? null : getActiveBan(uuid).orElse(null));
+                if (effective != null) {
+                    if (live != null) cacheLiveBan(live);
                     result = Optional.empty();
                 } else {
                     try {
@@ -247,11 +263,19 @@ public class BanManager {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             boolean success;
             synchronized (mutationLock) {
-                Optional<BanRecord> active = getActiveBan(uuid);
-                if (active.isEmpty()) {
+                // Prefer the live row (another server may have banned/unbanned
+                // since our last refresh); fall back to cache on DB failure.
+                BanRecord active = null;
+                try {
+                    active = db.findActiveBan(uuid, System.currentTimeMillis());
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not live-check ban for " + uuid + ", falling back to cache: " + e.getMessage());
+                }
+                if (active == null) active = getActiveBan(uuid).orElse(null);
+                if (active == null) {
                     success = false;
                 } else {
-                    BanRecord old = active.get();
+                    BanRecord old = active;
                     long now = System.currentTimeMillis();
                     try {
                         db.revokeBan(old.id(), staffUuid, staffName, now);
@@ -276,7 +300,7 @@ public class BanManager {
                 KickRecord record = db.insertKick(uuid, name, reason, staffUuid, staffName);
                 kicksCache.add(record);
                 kicksByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
-            } catch (SQLException e) {
+            } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().severe("Could not record kick for " + name + ": " + e.getMessage());
             }
             if (onDone != null) Bukkit.getGlobalRegionScheduler().run(plugin, t -> onDone.run());
@@ -287,9 +311,21 @@ public class BanManager {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             Optional<IpBanRecord> result;
             synchronized (mutationLock) {
+                // Live check first (same reasoning as tryBanAsync); cache is
+                // only the fallback when the DB itself is unreachable.
                 long now = System.currentTimeMillis();
-                boolean alreadyBanned = ipBansCache.stream().anyMatch(r -> r.ip().equals(ip) && r.isActive(now));
+                IpBanRecord live = null;
+                boolean liveOk = false;
+                try {
+                    live = db.findActiveIpBan(ip, now);
+                    liveOk = true;
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
+                }
+                boolean alreadyBanned = live != null
+                        || (!liveOk && ipBansCache.stream().anyMatch(r -> r.ip().equals(ip) && r.isActive(now)));
                 if (alreadyBanned) {
+                    if (live != null) cacheLiveIpBan(live);
                     result = Optional.empty();
                 } else {
                     try {
@@ -312,7 +348,15 @@ public class BanManager {
             boolean success;
             synchronized (mutationLock) {
                 long now = System.currentTimeMillis();
-                IpBanRecord old = ipBansCache.stream().filter(r -> r.ip().equals(ip) && r.isActive(now)).findFirst().orElse(null);
+                IpBanRecord old = null;
+                try {
+                    old = db.findActiveIpBan(ip, now);
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
+                }
+                if (old == null) {
+                    old = ipBansCache.stream().filter(r -> r.ip().equals(ip) && r.isActive(now)).findFirst().orElse(null);
+                }
                 if (old == null) {
                     success = false;
                 } else {
@@ -349,5 +393,23 @@ public class BanManager {
                 return;
             }
         }
+    }
+
+    /**
+     * Keeps the in-memory snapshot consistent when a live DB check found a row
+     * the cache doesn't have yet (e.g. banned from another server on shared
+     * MySQL). Must be called while holding {@code mutationLock}.
+     */
+    private void cacheLiveBan(BanRecord live) {
+        boolean known = bansCache.stream().anyMatch(r -> r.id() == live.id());
+        if (!known) {
+            bansCache.add(live);
+            bansByUuid.computeIfAbsent(live.uuid(), k -> new CopyOnWriteArrayList<>()).add(live);
+        }
+    }
+
+    private void cacheLiveIpBan(IpBanRecord live) {
+        boolean known = ipBansCache.stream().anyMatch(r -> r.id() == live.id());
+        if (!known) ipBansCache.add(live);
     }
 }

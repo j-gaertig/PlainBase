@@ -28,6 +28,11 @@ public class Spawn implements BasicCommand {
             return;
         }
 
+        if (plugin.getSpawnConfig() == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+            return;
+        }
+
         if (!sender.hasPermission("plainbase.admin") && !sender.hasPermission("plainbase.spawn.admin") && !sender.hasPermission("plainbase.spawn.spawn")) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>No permission!"));
             return;
@@ -52,10 +57,18 @@ public class Spawn implements BasicCommand {
 
         FileConfiguration config = plugin.getSpawnConfig();
         String worldName = config.getString(path + ".world");
-        if (worldName == null) return;
+        if (worldName == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is not set correctly. Contact an admin."));
+            plugin.getLogger().warning("Spawn location world is missing in spawn.yml!");
+            return;
+        }
 
         World world = Bukkit.getWorld(worldName);
-        if (world == null) return;
+        if (world == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn world '" + worldName + "' not found!"));
+            plugin.getLogger().warning("Spawn world '" + worldName + "' not found!");
+            return;
+        }
 
         Location loc = new Location(
                 world,

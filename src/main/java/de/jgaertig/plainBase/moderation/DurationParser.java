@@ -35,7 +35,11 @@ public final class DurationParser {
             matchedChars += matcher.group().length();
             long amount = Long.parseLong(matcher.group(1));
             String unit = matcher.group(2).toLowerCase();
-            totalMillis += amount * unitMillis(unit);
+            try {
+                totalMillis = Math.addExact(totalMillis, Math.multiplyExact(amount, unitMillis(unit)));
+            } catch (ArithmeticException e) {
+                throw new IllegalArgumentException("Duration too large: " + input);
+            }
         }
 
         // Reject input that isn't fully made of recognized "<number><unit>" tokens
@@ -80,8 +84,13 @@ public final class DurationParser {
         if (days > 0) sb.append(days).append("d ");
         if (hours > 0) sb.append(hours).append("h ");
         if (minutes > 0) sb.append(minutes).append("m ");
-        if (days == 0 && hours == 0) sb.append(seconds).append("s ");
+        if (days == 0 && hours == 0) {
+            // Sub-second durations would otherwise render as "0s" — floor at 1s.
+            // Skip a trailing "0s" when minutes are already shown ("1m", not "1m 0s").
+            if (seconds > 0 || sb.isEmpty()) sb.append(Math.max(1, seconds)).append("s ");
+        }
 
-        return sb.toString().trim();
+        String result = sb.toString().trim();
+        return result.isEmpty() ? "0s" : result;
     }
 }

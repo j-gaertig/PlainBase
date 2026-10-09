@@ -3,13 +3,19 @@ package de.jgaertig.plainBase.teleport.tpa;
 import de.jgaertig.plainBase.PlainBase;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 public class TPAManager {
@@ -17,9 +23,9 @@ public class TPAManager {
     private final PlainBase plugin;
 
 
-    private final Map<UUID, TpaSession> activeSessions = new HashMap<>();
-    private final Set<UUID> tpAutoPlayers = new HashSet<>();
-    private final Map<UUID, ScheduledTask> activeWarmups = new HashMap<>();
+    private final Map<UUID, TpaSession> activeSessions = new ConcurrentHashMap<>();
+    private final Set<UUID> tpAutoPlayers = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, ScheduledTask> activeWarmups = new ConcurrentHashMap<>();
 
     public enum RequestType { TPA, TPAHERE }
 
@@ -36,6 +42,13 @@ public class TPAManager {
             return;
         }
 
+        for (TpaSession session : activeSessions.values()) {
+            if (session.requesterId().equals(requester.getUniqueId())) {
+                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You already have an outgoing teleport request! Use /tpacancel to cancel it."));
+                return;
+            }
+        }
+
         requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleport request sent to <yellow>" + target.getName() + "<gray>."));
         target.sendMessage(plugin.getMiniMessage().deserialize("<yellow>" + requester.getName() + " <gray>has sent you a teleport request."));
 
@@ -44,19 +57,23 @@ public class TPAManager {
             return;
         }
 
+        long seconds = plugin.getTeleportConfig().getLong("tpa.request_timeout", 300);
+        if (seconds <= 0) seconds = 30;
+        seconds = Math.max(5, Math.min(300, seconds));
+        final long timeoutSeconds = seconds;
+
         String typeAction = (type == RequestType.TPA) ? "teleport to you" : "you teleport to them";
         target.sendMessage(plugin.getMiniMessage().deserialize(
                 "<gray>They want to " + typeAction + ". You have <yellow>" +
-                        plugin.getTeleportConfig().getLong("tpa.request_timeout", 300) + " <gray>seconds to respond.\n" +
+                        timeoutSeconds + " <gray>seconds to respond.\n" +
                         "<gray>Use <green>/tpaccept <gray>or <red>/tpdeny<gray>."
         ));
 
-        long seconds = plugin.getTeleportConfig().getLong("tpa.request_timeout", 300);
         ScheduledTask timeoutTask = Bukkit.getAsyncScheduler().runDelayed(plugin, (t) -> {
             if (activeSessions.containsKey(target.getUniqueId())) {
                 expireRequest(target.getUniqueId());
             }
-        }, seconds, TimeUnit.SECONDS);
+        }, timeoutSeconds, TimeUnit.SECONDS);
 
         activeSessions.put(target.getUniqueId(), new TpaSession(requester.getUniqueId(), type, timeoutTask));
     }
@@ -151,24 +168,36 @@ public class TPAManager {
             return;
         }
 
+        ScheduledTask old = activeWarmups.remove(toTeleport.getUniqueId());
+        if (old != null) old.cancel();
+
         toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleporting in <yellow>" + seconds + " <gray>seconds. Do not move!"));
 
-        ScheduledTask warmupTask = Bukkit.getRegionScheduler().runDelayed(plugin, toTeleport.getLocation(), (task) -> {
+        ScheduledTask warmupTask = toTeleport.getScheduler().runDelayed(plugin, (task) -> {
             activeWarmups.remove(toTeleport.getUniqueId());
             performTeleport(toTeleport, destination);
-        }, seconds * 20L);
+        }, null, seconds * 20L);
 
         activeWarmups.put(toTeleport.getUniqueId(), warmupTask);
     }
 
-    private void performTeleport(Player p, Player target) {
-        if (p == null || !p.isOnline() || target == null || !target.isOnline()) return;
+    private void performTeleport(Player toTeleport, Player destination) {
+        if (toTeleport == null || destination == null) return;
+        if (!toTeleport.isOnline() || !destination.isOnline()) return;
 
-        p.teleportAsync(target.getLocation()).thenAccept(success -> {
-            if (success) {
-                p.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleport successful!"));
-            }
-        });
+        destination.getScheduler().run(plugin, t -> {
+            if (!destination.isOnline() || !toTeleport.isOnline()) return;
+            Location destLoc = destination.getLocation().clone();
+            if (destLoc.getWorld() == null) return;
+            toTeleport.getScheduler().run(plugin, t2 -> {
+                if (!toTeleport.isOnline() || !destination.isOnline()) return;
+                toTeleport.teleportAsync(destLoc).thenAccept(success -> {
+                    if (success) {
+                        toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleport successful!"));
+                    }
+                });
+            }, null);
+        }, null);
     }
 
     public void cancelWarmup(Player p, String reason) {
@@ -179,10 +208,55 @@ public class TPAManager {
         }
     }
 
+    public void cancelAll() {
+        for (ScheduledTask task : new ArrayList<>(activeWarmups.values())) {
+            if (task != null) task.cancel();
+        }
+        activeWarmups.clear();
+        for (TpaSession session : new ArrayList<>(activeSessions.values())) {
+            if (session != null && session.timeoutTask() != null) session.timeoutTask().cancel();
+        }
+        activeSessions.clear();
+    }
+
+    public void handleQuit(Player quitter) {
+        if (quitter == null) return;
+        UUID quitterId = quitter.getUniqueId();
+
+        ScheduledTask warmup = activeWarmups.remove(quitterId);
+        if (warmup != null) warmup.cancel();
+
+        TpaSession asTarget = activeSessions.remove(quitterId);
+        if (asTarget != null) {
+            if (asTarget.timeoutTask() != null) asTarget.timeoutTask().cancel();
+            Player requester = Bukkit.getPlayer(asTarget.requesterId());
+            if (requester != null && requester.isOnline()) {
+                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+            }
+        }
+
+        List<UUID> outgoingTargets = new ArrayList<>();
+        for (Map.Entry<UUID, TpaSession> entry : new ArrayList<>(activeSessions.entrySet())) {
+            if (entry.getValue().requesterId().equals(quitterId)) {
+                outgoingTargets.add(entry.getKey());
+            }
+        }
+        for (UUID targetId : outgoingTargets) {
+            TpaSession session = activeSessions.remove(targetId);
+            if (session != null) {
+                if (session.timeoutTask() != null) session.timeoutTask().cancel();
+                Player target = Bukkit.getPlayer(targetId);
+                if (target != null && target.isOnline()) {
+                    target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                }
+            }
+        }
+    }
+
     public void cancelOutgoingRequest(Player requester) {
 
         UUID targetUUID = null;
-        for (Map.Entry<UUID, TpaSession> entry : activeSessions.entrySet()) {
+        for (Map.Entry<UUID, TpaSession> entry : new ArrayList<>(activeSessions.entrySet())) {
             if (entry.getValue().requesterId().equals(requester.getUniqueId())) {
                 targetUUID = entry.getKey();
                 break;

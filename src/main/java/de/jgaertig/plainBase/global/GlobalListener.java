@@ -15,7 +15,7 @@ public class GlobalListener implements Listener {
 
     @EventHandler
     public void onAdminJoin(PlayerJoinEvent event) {
-        if (!event.getPlayer().isOp()) return;
+        if (!event.getPlayer().hasPermission("plainbase.admin")) return;
 
         double currentMain = plugin.getConfig().getDouble("version", 0.0);
         double latestMain = plugin.getLatestVersions().getOrDefault("config.yml", 0.0);

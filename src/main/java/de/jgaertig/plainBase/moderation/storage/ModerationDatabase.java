@@ -64,6 +64,10 @@ public class ModerationDatabase {
             File dataDir = new File(plugin.getDataFolder(), "data");
             dataDir.mkdirs();
             String fileName = plugin.getModerationConfig().getString("storage.sqlite.file", "moderation.db");
+            if (fileName == null || !fileName.matches("[A-Za-z0-9_.-]+\\.db")) {
+                plugin.getLogger().warning("Invalid storage.sqlite.file '" + fileName + "', falling back to moderation.db");
+                fileName = "moderation.db";
+            }
             File dbFile = new File(dataDir, fileName);
             config.setJdbcUrl("jdbc:sqlite:" + dbFile.getAbsolutePath());
             // SQLite has no real concurrent-writer story — a single pooled
@@ -76,6 +80,15 @@ public class ModerationDatabase {
         dataSource = new HikariDataSource(config);
 
         try (Connection conn = dataSource.getConnection()) {
+            if (!mysql) {
+                // WAL + busy timeout reduce "database is locked" errors under
+                // concurrent load. Best-effort: failures must not break setup.
+                try (Statement st = conn.createStatement()) {
+                    st.execute("PRAGMA journal_mode=WAL");
+                    st.execute("PRAGMA busy_timeout=5000");
+                } catch (SQLException ignored) {
+                }
+            }
             createTables(conn);
         }
     }
@@ -85,7 +98,14 @@ public class ModerationDatabase {
     }
 
     private String prefix() {
-        return mysql ? plugin.getModerationConfig().getString("storage.mysql.table-prefix", "pb_") : "pb_";
+        String p = mysql ? plugin.getModerationConfig().getString("storage.mysql.table-prefix", "pb_") : "pb_";
+        if (p == null) p = "pb_";
+        // Table prefix is concatenated into SQL — never allow anything that
+        // could break out of the identifier (SQL injection via config).
+        if (!p.matches("[A-Za-z0-9_]*")) {
+            throw new IllegalArgumentException("Invalid moderation table prefix: " + p);
+        }
+        return p;
     }
 
     private void createTables(Connection conn) throws SQLException {
@@ -271,7 +291,7 @@ public class ModerationDatabase {
      * @return the last known IP for a player name, or null if unknown/never seen
      */
     public String findLastIpByName(String name) throws SQLException {
-        String sql = "SELECT last_ip FROM " + prefix() + "player_ips WHERE name = ? ORDER BY last_seen DESC LIMIT 1";
+        String sql = "SELECT last_ip FROM " + prefix() + "player_ips WHERE LOWER(name) = LOWER(?) ORDER BY last_seen DESC LIMIT 1";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, name);
             try (ResultSet rs = ps.executeQuery()) {
@@ -298,7 +318,7 @@ public class ModerationDatabase {
         try (Connection conn = dataSource.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
                 result.add(new KickRecord(rs.getInt(1), UUID.fromString(rs.getString(2)), rs.getString(3), rs.getString(4),
-                        emptyToNull(rs.getString(5)) == null ? null : UUID.fromString(rs.getString(5)), rs.getString(6), rs.getLong(7)));
+                        nullableUuid(rs.getString(5)), rs.getString(6), rs.getLong(7)));
             }
         }
         return result;
@@ -365,9 +385,5 @@ public class ModerationDatabase {
         } catch (IllegalArgumentException e) {
             return null;
         }
-    }
-
-    private String emptyToNull(String s) {
-        return (s == null || s.isEmpty()) ? null : s;
     }
 }

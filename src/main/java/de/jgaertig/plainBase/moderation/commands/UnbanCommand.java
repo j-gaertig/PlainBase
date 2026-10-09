@@ -40,7 +40,7 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
         resolveTarget(targetName, offlinePlayer -> {
             if (offlinePlayer == null) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", targetName)));
+                        message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
                 return;
             }
 
@@ -50,14 +50,14 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
             manager.unbanPlayerAsync(offlinePlayer.getUniqueId(), staffUuid, staffName, unbanned -> {
                 if (!unbanned) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
-                            message("not-banned", "<red>%player% is not currently banned.").replace("%player%", name)));
+                            message("not-banned", "<red>%player% is not currently banned. <gray>(Name change? Bans are UUID-based.)").replace("%player%", esc(name))));
                     return;
                 }
 
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("unban-success", "<green>%player% has been unbanned.").replace("%player%", name)));
+                        message("unban-success", "<green>%player% has been unbanned.").replace("%player%", esc(name))));
 
-                broadcast(message("unban-broadcast", "").replace("%player%", name).replace("%staff%", staffName));
+                broadcast(message("unban-broadcast", "").replace("%player%", esc(name)).replace("%staff%", esc(staffName)));
             });
         });
     }

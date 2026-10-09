@@ -42,11 +42,11 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
         Player target = Bukkit.getPlayer(args[0]);
         if (target == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("player-not-online", "<red>%player% is not online.").replace("%player%", args[0])));
+                    message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(args[0]))));
             return;
         }
 
-        if (isExempt(target, sender)) {
+        if (isExempt(target, sender) || isProtectedTarget(target, sender)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
             return;
         }
@@ -65,16 +65,16 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
             if (stillOnline != null) {
                 kickSafely(stillOnline, plugin.getMiniMessage().deserialize(
                         message("kick-screen", "<red>You have been kicked.\n<gray>Reason: %reason%")
-                                .replace("%reason%", reason)
-                                .replace("%staff%", staffName)));
+                                .replace("%reason%", esc(reason))
+                                .replace("%staff%", esc(staffName))));
             }
 
             sender.sendMessage(plugin.getMiniMessage().deserialize(
                     message("kick-success", "<green>%player% has been kicked. <gray>(%reason%)")
-                            .replace("%player%", targetName).replace("%reason%", reason)));
+                            .replace("%player%", esc(targetName)).replace("%reason%", esc(reason))));
 
             broadcast(message("kick-broadcast", "")
-                    .replace("%player%", targetName).replace("%staff%", staffName).replace("%reason%", reason));
+                    .replace("%player%", esc(targetName)).replace("%staff%", esc(staffName)).replace("%reason%", esc(reason)));
         });
     }
 

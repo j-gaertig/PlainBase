@@ -7,6 +7,9 @@ import org.bukkit.OfflinePlayer;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
@@ -55,6 +58,56 @@ abstract class ModerationCommandBase {
 
     protected String message(String key, String fallback) {
         return plugin.getModerationConfig().getString("messages." + key, fallback);
+    }
+
+    /**
+     * Escapes a user-controlled value (player name, reason, staff name, IP)
+     * so it can be safely substituted into a MiniMessage template via
+     * String#replace BEFORE deserialization — without this, a reason like
+     * {@code <click:run_command:...>} would inject clickable/hoverable tags
+     * into every ban message shown to staff and players.
+     */
+    protected String esc(String s) {
+        return plugin.getMiniMessage().escapeTags(Objects.toString(s, ""));
+    }
+
+    protected boolean isAdmin(CommandSender sender) {
+        return sender.hasPermission("plainbase.admin") || sender.hasPermission("plainbase.moderation.admin");
+    }
+
+    /**
+     * True when the online target is protected from punishment by a non-admin
+     * sender: covers exempt players AND admins (an admin target must never be
+     * bannable by a plain moderator). Admin senders bypass this entirely.
+     */
+    protected boolean isProtectedTarget(Player target, CommandSender sender) {
+        if (isAdmin(sender)) return false;
+        return target.hasPermission("plainbase.moderation.exempt")
+                || target.hasPermission("plainbase.moderation.admin")
+                || target.hasPermission("plainbase.admin");
+    }
+
+    /**
+     * Offline players expose no permission API, so exempt/admin status cannot
+     * be verified for them — documented limitation. Log for audit purposes so
+     * admins can review offline punishments afterwards.
+     */
+    protected void warnOfflineExemptUnchecked(String targetName) {
+        plugin.getLogger().warning("Punishing offline player '" + targetName
+                + "' without exempt/admin check (cannot be verified while offline).");
+    }
+
+    /**
+     * Normalizes an IP string (v4/v6, with/without brackets or leading zeros)
+     * to its canonical host-address form so stored, cached and checked values
+     * always compare equal. Returns null when the input is not a valid IP.
+     */
+    protected static String normalizeIp(String ip) {
+        try {
+            return InetAddress.getByName(ip).getHostAddress();
+        } catch (UnknownHostException | RuntimeException e) {
+            return null;
+        }
     }
 
     /**
