@@ -1,0 +1,296 @@
+name: Release sync (Modrinth + Hangar)
+
+# Manually publish an existing GitHub release to Modrinth and Hangar.
+# Files + release notes are taken from the GitHub release automatically;
+# each platform is only touched when the version is missing there.
+# Afterwards the README "Latest release" block is updated on main.
+# Run it from the main branch (Actions -> Release sync -> Run workflow).
+#
+# Required repository secrets (only needed when an upload is due):
+#   MODRINTH_TOKEN  - Modrinth personal access token with VERSION_CREATE scope
+#                     (https://modrinth.com/settings/account, then give it
+#                     access to the PlainBase project)
+#   HANGAR_API_TOKEN - Hangar API key with the create_version permission
+#                      (hangar.papermc.io -> profile -> Api keys)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'GitHub release tag to sync (e.g. 0.3.0-Beta)'
+        required: true
+        type: string
+      channel:
+        description: 'Hangar channel (auto: *Beta* -> Beta, *Experimental* -> Release, else Release)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - Release
+          - Beta
+          - Alpha
+      game_versions:
+        description: 'Comma-separated Minecraft versions for both platforms'
+        required: false
+        default: '1.21.6,1.21.7,1.21.8,1.21.9,1.21.10,1.21.11,26.1,26.1.1,26.1.2,26.2'
+        type: string
+      dry_run:
+        description: 'Only check existence, upload nothing, touch no files'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  MODRINTH_PROJECT_ID: 'yfx0z1Sw'
+  MODRINTH_SLUG: 'plainbase'
+  HANGAR_AUTHOR: 'j-gaertig'
+  HANGAR_SLUG: 'PlainBase'
+  LOADERS: 'paper,purpur,folia'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --json name,body,createdAt,assets > release.json; then
+            echo "::error::No GitHub release found for tag '$TAG'. Create it first, then re-run."
+            exit 1
+          fi
+          # Pick the distributable jar (skip sources/javadoc/shade-originals).
+          JAR="$(jq -r '[.assets[] | select(.name | endswith(".jar")) | select(.name | test("sources|javadoc|original") | not)] | sort_by(.size) | last | .name' release.json)"
+          if [ -z "$JAR" ] || [ "$JAR" = "null" ]; then
+            echo "::error::Release '$TAG' has no distributable jar asset."
+            exit 1
+          fi
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+          gh release download "$TAG" --pattern "$JAR" --dir dist
+          test -s "dist/$JAR"
+          {
+            echo "created_at=$(jq -r .createdAt release.json)"
+            echo "name=$(jq -r .name release.json)"
+          } >> "$GITHUB_OUTPUT"
+          jq -r .body release.json > release-body.md
+          echo "Release '$TAG': jar=$JAR"
+
+      - name: Derive channels and types
+        id: meta
+        env:
+          TAG: ${{ inputs.tag }}
+          CHANNEL_IN: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" == *Beta* ]]; then
+            VTYPE=beta; AUTO_CHANNEL=Beta
+          elif [[ "$TAG" == *Experimental* ]]; then
+            VTYPE=alpha; AUTO_CHANNEL=Release
+          else
+            VTYPE=release; AUTO_CHANNEL=Release
+          fi
+          if [ "$CHANNEL_IN" = "auto" ]; then CHANNEL="$AUTO_CHANNEL"; else CHANNEL="$CHANNEL_IN"; fi
+          echo "version_type=$VTYPE" >> "$GITHUB_OUTPUT"
+          echo "hangar_channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG version_type=$VTYPE hangar_channel=$CHANNEL"
+
+      - name: Check Modrinth
+        id: modrinth_check
+        run: |
+          set -euo pipefail
+          EXISTING="$(curl -s --fail "https://api.modrinth.com/v2/project/${MODRINTH_PROJECT_ID}/version" \
+            | jq -r --arg t '${{ inputs.tag }}' '.[] | select(.version_number == $t) | .id')"
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "version_id=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Modrinth already has ${{ inputs.tag }} (id=$EXISTING), skipping upload."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Modrinth is missing ${{ inputs.tag }}, will upload."
+          fi
+
+      - name: Upload to Modrinth
+        id: modrinth_up
+        if: steps.modrinth_check.outputs.exists != 'true' && inputs.dry_run != true
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          JAR: ${{ steps.release.outputs.jar }}
+          VTYPE: ${{ steps.meta.outputs.version_type }}
+          NAME: ${{ steps.release.outputs.name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MODRINTH_TOKEN:-}" ]; then
+            echo "::error::Modrinth upload needed but secret MODRINTH_TOKEN is not set."
+            exit 1
+          fi
+          jq -n \
+            --arg name "$NAME" \
+            --arg version_number "$TAG" \
+            --arg changelog "$(cat release-body.md)" \
+            --argjson game_versions "$(echo '${{ inputs.game_versions }}' | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')" \
+            --arg version_type "$VTYPE" \
+            --argjson loaders "$(echo "$LOADERS" | jq -R 'split(",")')" \
+            --arg project_id "$MODRINTH_PROJECT_ID" \
+            '{
+              name: $name, version_number: $version_number, changelog: $changelog,
+              dependencies: [], game_versions: $game_versions, version_type: $version_type,
+              loaders: $loaders, featured: false, status: "listed",
+              project_id: $project_id, file_parts: ["file"], primary_file: "file"
+            }' > modrinth-payload.json
+          RESP="$(curl -s --fail -X POST "https://api.modrinth.com/v2/version" \
+            -H "Authorization: $MODRINTH_TOKEN" \
+            -F "data=@modrinth-payload.json;type=application/json" \
+            -F "file=@dist/$JAR;type=application/java-archive")"
+          echo "$RESP" | jq -r '"uploaded Modrinth version id=\(.id)"'
+          echo "version_id=$(echo "$RESP" | jq -r .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Check Hangar
+        id: hangar_check
+        run: |
+          set -euo pipefail
+          OFFSET=0
+          FOUND=""
+          while :; do
+            PAGE="$(curl -s --fail "https://hangar.papermc.io/api/v1/projects/${HANGAR_AUTHOR}/${HANGAR_SLUG}/versions?limit=25&offset=$OFFSET")"
+            HIT="$(echo "$PAGE" | jq -r --arg t '${{ inputs.tag }}' '.result[] | select(.name == $t) | .name')"
+            [ -n "$HIT" ] && { FOUND="$HIT"; break; }
+            TOTAL="$(echo "$PAGE" | jq -r '.pagination.count')"
+            COUNT="$(echo "$PAGE" | jq -r '.result | length')"
+            OFFSET=$((OFFSET + COUNT))
+            [ "$COUNT" -eq 0 ] || [ "$OFFSET" -ge "$TOTAL" ] && break
+          done
+          if [ -n "$FOUND" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Hangar already has ${{ inputs.tag }}, skipping upload."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Hangar is missing ${{ inputs.tag }}, will upload."
+          fi
+
+      - name: Upload to Hangar
+        if: steps.hangar_check.outputs.exists != 'true' && inputs.dry_run != true
+        env:
+          HANGAR_API_TOKEN: ${{ secrets.HANGAR_API_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          JAR: ${{ steps.release.outputs.jar }}
+          CHANNEL: ${{ steps.meta.outputs.hangar_channel }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HANGAR_API_TOKEN:-}" ]; then
+            echo "::error::Hangar upload needed but secret HANGAR_API_TOKEN is not set."
+            exit 1
+          fi
+          JWT="$(curl -s --fail -X POST \
+            "https://hangar.papermc.io/api/v1/authenticate?apiKey=$HANGAR_API_TOKEN" \
+            -H "User-Agent: plainbase-release-sync" | jq -r .token)"
+          if [ -z "$JWT" ] || [ "$JWT" = "null" ]; then
+            echo "::error::Hangar authentication failed (bad API key?)."
+            exit 1
+          fi
+          # Written to a file and referenced via @file: curl's -F treats ";"
+          # as a field-metadata separator, so release notes must never be inlined.
+          jq -n \
+            --arg version "$TAG" \
+            --arg channel "$CHANNEL" \
+            --arg changelog "$(cat release-body.md)" \
+            --argjson platforms "$(echo '${{ inputs.game_versions }}' | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')" \
+            '{
+              version: $version,
+              channel: $channel,
+              description: $changelog,
+              pluginDependencies: {PAPER: [{name: "PlaceholderAPI", required: false}]},
+              platformDependencies: {PAPER: $platforms},
+              files: [{fileInfo: null, externalUrl: null, platforms: ["PAPER"]}]
+            }' > hangar-payload.json
+          CODE="$(curl -s -o hangar-resp.json -w "%{http_code}" -X POST \
+            "https://hangar.papermc.io/api/v1/projects/${HANGAR_AUTHOR}/${HANGAR_SLUG}/upload" \
+            -H "Authorization: HangarAuth $JWT" \
+            -H "User-Agent: plainbase-release-sync" \
+            -F "versionUpload=@hangar-payload.json;type=application/json" \
+            -F "files=@dist/$JAR;type=application/java-archive")"
+          if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then
+            echo "::error::Hangar upload failed (HTTP $CODE): $(cat hangar-resp.json)"
+            exit 1
+          fi
+          echo "Hangar upload accepted (HTTP $CODE)."
+
+      - name: Update README latest-release block
+        if: inputs.dry_run != true
+        env:
+          TAG: ${{ inputs.tag }}
+          CREATED: ${{ steps.release.outputs.created_at }}
+          MID: ${{ steps.modrinth_up.outputs.version_id || steps.modrinth_check.outputs.version_id }}
+        run: |
+          set -euo pipefail
+          DATE="$(date -d "$CREATED" +%Y-%m-%d)"
+          # Exact per-version links when we know the Modrinth id, else project pages.
+          if [ -n "${MID:-}" ]; then
+            MLINK="https://modrinth.com/project/${MODRINTH_SLUG}/version/${MID}"
+          else
+            MLINK="https://modrinth.com/plugin/${MODRINTH_SLUG}"
+          fi
+          python3 - "$TAG" "$DATE" "$MLINK" <<'EOF'
+          import re, sys
+          tag, date, mlink = sys.argv[1], sys.argv[2], sys.argv[3]
+          block = (
+            "<!-- RELEASE-SYNC:START -->\n"
+            f"> **Latest release:** [{tag}](https://github.com/j-gaertig/PlainBase/releases/tag/{tag}) — {date}"
+            f" · [Modrinth]({mlink})"
+            f" · [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase/versions/{tag})\n"
+            "<!-- RELEASE-SYNC:END -->"
+          )
+          p = "README.md"
+          t = open(p, encoding="utf-8").read()
+          if "<!-- RELEASE-SYNC:START -->" in t:
+              t = re.sub(r"<!-- RELEASE-SYNC:START -->.*?<!-- RELEASE-SYNC:END -->",
+                         block, t, flags=re.DOTALL)
+          else:
+              anchor = "Essential features, zero bloat.\n</p>"
+              assert anchor in t, "README anchor for release block not found"
+              t = t.replace(anchor, anchor + "\n\n" + block, 1)
+          open(p, "w", encoding="utf-8").write(t)
+          print("README updated")
+          EOF
+          if git diff --quiet README.md; then
+            echo "README already current."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "docs: latest release $TAG (Modrinth + Hangar sync)"
+            git push origin HEAD:main
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Release sync: ${{ inputs.tag }}"
+            echo ""
+            echo "- GitHub release: https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag }} (jar: \`${{ steps.release.outputs.jar }}\`, notes taken from the release body)"
+            if [ "${{ steps.modrinth_check.outputs.exists }}" = "true" ]; then
+              echo "- Modrinth: already present, skipped — https://modrinth.com/project/${MODRINTH_SLUG}/version/${{ steps.modrinth_check.outputs.version_id }}"
+            elif [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "- Modrinth: missing, dry-run — nothing uploaded"
+            else
+              echo "- Modrinth: uploaded — https://modrinth.com/project/${MODRINTH_SLUG}/version/${{ steps.modrinth_up.outputs.version_id }}"
+            fi
+            if [ "${{ steps.hangar_check.outputs.exists }}" = "true" ]; then
+              echo "- Hangar: already present, skipped — https://hangar.papermc.io/${HANGAR_AUTHOR}/${HANGAR_SLUG}/versions/${{ inputs.tag }}"
+            elif [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "- Hangar: missing, dry-run — nothing uploaded"
+            else
+              echo "- Hangar: uploaded (channel \`${{ steps.meta.outputs.hangar_channel }}\`) — https://hangar.papermc.io/${HANGAR_AUTHOR}/${HANGAR_SLUG}/versions/${{ inputs.tag }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
