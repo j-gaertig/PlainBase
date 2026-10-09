@@ -72,7 +72,7 @@ public final class PlainBase extends JavaPlugin {
         latestVersions.put("vanish.yml", 1.1);
         latestVersions.put("menu.yml", 1.1);
         latestVersions.put("moderation.yml", 2.0);
-        latestVersions.put("team.yml", 1.1);
+        latestVersions.put("team.yml", 1.2);
 
         registerPlaceholderExpansion();
 
@@ -280,43 +280,43 @@ public final class PlainBase extends JavaPlugin {
                 new Permission("plainbase.team.admin", "PlainBase: Bypass — acts as team-admin on any team regardless of membership", PermissionDefault.OP)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.invite", "PlainBase: Allows access to /team <team> invite", PermissionDefault.OP)
+                new Permission("plainbase.team.invite", "PlainBase: Allows access to /team <team> invite (team admins only)", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.add", "PlainBase: Allows access to /team <team> add", PermissionDefault.OP)
+                new Permission("plainbase.team.add", "PlainBase: Allows access to /team <team> add (team admins only)", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.kick", "PlainBase: Allows access to /team <team> kick", PermissionDefault.OP)
+                new Permission("plainbase.team.kick", "PlainBase: Allows access to /team <team> kick (team admins only)", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.setrole", "PlainBase: Allows access to /team <team> setrole", PermissionDefault.OP)
+                new Permission("plainbase.team.setrole", "PlainBase: Allows access to /team <team> setrole (team admins only)", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.request", "PlainBase: Allows access to /team <team> request", PermissionDefault.OP)
+                new Permission("plainbase.team.request", "PlainBase: Allows access to /team <team> request", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.accept", "PlainBase: Allows access to /team accept", PermissionDefault.OP)
+                new Permission("plainbase.team.accept", "PlainBase: Allows access to /team accept", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.deny", "PlainBase: Allows access to /team deny", PermissionDefault.OP)
+                new Permission("plainbase.team.deny", "PlainBase: Allows access to /team deny", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.reject", "PlainBase: Allows access to /team reject (reject a pending join request)", PermissionDefault.OP)
+                new Permission("plainbase.team.reject", "PlainBase: Allows access to /team reject (team admins only)", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.leave", "PlainBase: Allows access to /team leave", PermissionDefault.OP)
+                new Permission("plainbase.team.leave", "PlainBase: Allows access to /team leave", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.list", "PlainBase: Allows access to /team list", PermissionDefault.OP)
+                new Permission("plainbase.team.list", "PlainBase: Allows access to /team list", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.info", "PlainBase: Allows access to /team info", PermissionDefault.OP)
+                new Permission("plainbase.team.info", "PlainBase: Allows access to /team info", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.invites", "PlainBase: Allows access to /team invites (list your own pending invites)", PermissionDefault.OP)
+                new Permission("plainbase.team.invites", "PlainBase: Allows access to /team invites (list your own pending invites)", PermissionDefault.TRUE)
         );
         getServer().getPluginManager().addPermission(
-                new Permission("plainbase.team.requests", "PlainBase: Allows access to /team requests (list a team's pending join requests)", PermissionDefault.OP)
+                new Permission("plainbase.team.requests", "PlainBase: Allows access to /team requests (team admins only)", PermissionDefault.TRUE)
         );
     }
 
@@ -585,7 +585,11 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupTeam() {
-        loadModuleConfig("team.yml");
+        FileConfiguration teamCfg = loadModuleConfig("team.yml");
+        if (teamCfg == null) {
+            getLogger().severe("Could not load team.yml! The team module stays disabled until this is fixed.");
+            return;
+        }
 
         teamManager = new TeamManager(this);
 

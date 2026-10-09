@@ -6,6 +6,7 @@ import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -116,7 +117,7 @@ public class TeamCommand implements BasicCommand {
         String actionName = args[0].toLowerCase(Locale.ROOT);
         ActionSpec spec = ACTIONS.get(actionName);
         if (spec == null) {
-            sender.sendMessage(mm("<red>Unknown /team subcommand: " + args[0] + ". Run <gray>/team<red> for a list."));
+            sender.sendMessage(mm("<red>Unknown /team subcommand: " + plugin.getMiniMessage().escapeTags(args[0]) + ". Run <gray>/team<red> for a list."));
             return;
         }
         if (!checkPermission(sender, spec.permission())) return;
@@ -135,7 +136,7 @@ public class TeamCommand implements BasicCommand {
             if (args.length > idx) {
                 String candidate = args[idx].toLowerCase(Locale.ROOT);
                 if (!teams.teamExists(candidate)) {
-                    sender.sendMessage(mm("<red>Unknown team: " + args[idx]));
+                    sender.sendMessage(teamMsg("unknown-team", "<red>Unknown team: %team%", "team", args[idx]));
                     return;
                 }
                 teamId = candidate;
@@ -146,7 +147,7 @@ public class TeamCommand implements BasicCommand {
             }
         }
         if (spec.adminGated() && !teams.isTeamAdmin(sender, teamId)) {
-            sender.sendMessage(mm("<red>You must be a team admin of " + teamId + " to do this."));
+            sender.sendMessage(teamMsg("not-admin", "<red>You must be a team admin of %team% to do this.", "team", String.valueOf(teamId)));
             return;
         }
 
@@ -208,19 +209,41 @@ public class TeamCommand implements BasicCommand {
     }
 
     private net.kyori.adventure.text.Component mm(String s) {
-        return plugin.getMiniMessage().deserialize(s);
+        try {
+            return plugin.getMiniMessage().deserialize(s);
+        } catch (Exception e) {
+            return net.kyori.adventure.text.Component.text(s);
+        }
+    }
+
+    /**
+     * Team-config message with escaped user inputs (team ids, player names)
+     * so they can never inject MiniMessage formatting or click events.
+     */
+    private net.kyori.adventure.text.Component teamMsg(String key, String defaultText, String... placeholders) {
+        String raw = plugin.getTeamConfig().getString("messages." + key, defaultText);
+        for (int i = 0; i + 1 < placeholders.length; i += 2) {
+            String value = placeholders[i + 1] == null ? "" : placeholders[i + 1];
+            raw = raw.replace("%" + placeholders[i] + "%", plugin.getMiniMessage().escapeTags(value));
+        }
+        return mm(raw);
     }
 
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         TeamManager teams = plugin.getTeamManager();
         if (teams == null) return List.of();
+        if (!plugin.getConfig().getBoolean("modules.team", true)) return List.of();
+        FileConfiguration teamCfg = plugin.getTeamConfig();
+        if (teamCfg == null || !teamCfg.getBoolean("team.enabled", true)) return List.of();
+        if (!teamCfg.getBoolean("team.commands.team.enabled", true)) return List.of();
         CommandSender sender = stack.getSender();
 
         if (args.length <= 1) {
             String input = args.length == 1 ? args[0].toLowerCase(Locale.ROOT) : "";
             return ACTIONS.values().stream()
                     .filter(spec -> hasPermission(sender, spec.permission()))
+                    .filter(spec -> teamCfg.getBoolean("team.commands." + spec.name() + ".enabled", true))
                     .map(ActionSpec::name)
                     .filter(name -> name.startsWith(input))
                     .toList();
@@ -228,6 +251,7 @@ public class TeamCommand implements BasicCommand {
 
         ActionSpec spec = ACTIONS.get(args[0].toLowerCase(Locale.ROOT));
         if (spec == null || !spec.teamScoped()) return List.of();
+        if (!teamCfg.getBoolean("team.commands." + spec.name() + ".enabled", true)) return List.of();
 
         if (args.length == 2) {
             String input = args[1].toLowerCase(Locale.ROOT);

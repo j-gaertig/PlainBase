@@ -41,6 +41,10 @@ team:
 # join requests are all managed at runtime via /team and are stored per
 # player (by UUID) in plugins/PlainBase/data/teams/, not here.
 #
+# Invites and join requests are persisted there as well (invites.yml,
+# requests.yml) and have NO expiry by design — they survive restarts and wait
+# until they are accepted/denied (adding a player directly clears both).
+#
 # "color" is a MiniMessage string used for the team's display name wherever
 # PlainBase shows it (chat, /team list|info, PAPI placeholders) — full
 # gradients and <rainbow> are supported there.
@@ -55,6 +59,9 @@ team:
 # to your "color" automatically. This does NOT affect the selector working,
 # only the small vanilla color accent. Not available on Folia (its scoreboard
 # API is currently unsupported there) — everything else still works.
+# Team ids are also used for the vanilla mirror ("pb_<id>", 16-char limit),
+# so keep them at 12 chars max and lowercase. Longer ids are skipped with
+# an error in the console.
 teams:
   red:
     display-name: "<red>Red Team"
@@ -62,7 +69,7 @@ teams:
   blue:
     display-name: "<blue>Blue Team"
     color: "<blue>"
-  rainbow-example:
+  rainbow:
     display-name: "<rainbow>Rainbow Team"
     color: "<rainbow>"
 
@@ -89,11 +96,14 @@ messages:
   kick-success: "<green>Removed %player% from %team%."
   leave-success: "<gray>You left %team%."
   leave-usage-multiple: "<red>You're in multiple teams — specify one: /team leave <team>"
+  last-admin: "<red>Cannot remove the last admin of %team%. Promote someone else to admin first."
 
   request-sent: "<green>Join request for %team% sent to its admins."
   request-received: "<yellow>%player% wants to join <gray>%team%<yellow>! Use <green>/team add %team% %player% <yellow>to accept or <red>/team reject %team% %player% <yellow>to reject."
   request-not-found: "<red>No pending join request from %player% for %team%."
   request-already-pending: "<yellow>You already have a pending join request for %team%."
+  request-rejected: "<red>Your join request for %team% was rejected."
+  request-reject-success: "<green>Rejected %player%'s join request for %team%."
 
   setrole-success: "<green>%player% is now %role% in %team%."
   invalid-role: "<red>Invalid role. Use <yellow>member <red>or <yellow>admin<red>."
@@ -117,4 +127,4 @@ messages:
   your-teams-entry: "<gray>- %team% <yellow>(%role%)"
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.1
+version: 1.2

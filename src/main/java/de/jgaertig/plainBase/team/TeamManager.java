@@ -16,6 +16,9 @@ import org.bukkit.scoreboard.Team;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
@@ -56,6 +59,28 @@ public class TeamManager {
     private final Map<String, Set<UUID>> requests = new ConcurrentHashMap<>();
     // uuid -> the team currently mirrored on the vanilla scoreboard (see class javadoc)
     private final Map<UUID, String> scoreboardTeamOf = new ConcurrentHashMap<>();
+
+    // Scoreboard teams created by THIS manager instance (vanilla names "pb_<id>").
+    // Cleanup (sync/shutdown) only ever unregisters names in this set, so stale
+    // "pb_*" teams from other plugins or previous instances are never touched.
+    private final Set<String> ownedScoreboardTeams = ConcurrentHashMap.newKeySet();
+
+    // Per-player lock for invite/accept/deny/add/request check-then-act
+    // sequences, so two concurrent actions for the same player cannot both
+    // pass a check (e.g. max-teams) and then both mutate.
+    private final ConcurrentHashMap<UUID, Object> uuidLocks = new ConcurrentHashMap<>();
+
+    private Object lockFor(UUID uuid) {
+        return uuidLocks.computeIfAbsent(uuid, k -> new Object());
+    }
+
+    // Built-in defaults for message keys added after team.yml v1.1, so servers
+    // still running an older team.yml get sensible text instead of the raw key.
+    private static final Map<String, String> BUILTIN_DEFAULTS = Map.of(
+            "last-admin", "<red>Cannot remove the last admin of %team%. Promote someone else to admin first.",
+            "request-rejected", "<red>Your join request for %team% was rejected.",
+            "request-reject-success", "<green>Rejected %player%'s join request for %team%."
+    );
 
     private Scoreboard scoreboard;
 
@@ -102,7 +127,17 @@ public class TeamManager {
         if (section == null) return;
 
         for (String rawId : section.getKeys(false)) {
-            String id = rawId.toLowerCase();
+            String id = rawId.toLowerCase(Locale.ROOT);
+            // Vanilla scoreboard names are capped at 16 chars ("pb_" + id), so
+            // ids longer than 12 chars could never be mirrored. Skip with a loud
+            // warning instead of silently truncating (truncation could map two
+            // different teams onto one scoreboard team).
+            if (id.length() > 12) {
+                plugin.getLogger().severe("Team '" + rawId + "' skipped: id is " + id.length()
+                        + " chars, max is 12 (vanilla scoreboard limit is 16 chars for \"pb_<id>\"). "
+                        + "Shorten the id in modules/team.yml.");
+                continue;
+            }
             String displayName = section.getString(rawId + ".display-name", id);
             String color = section.getString(rawId + ".color", "<white>");
             NamedTextColor vanillaColor = resolveVanillaColor(color);
@@ -168,6 +203,7 @@ public class TeamManager {
         if (!(sender instanceof Player player)) return true; // console always allowed
         if (player.isOp()) return true;
         if (player.hasPermission("plainbase.admin") || player.hasPermission("plainbase.team.admin")) return true;
+        if (teamId == null) return false;
         return getRole(player.getUniqueId(), teamId.toLowerCase()) == Role.ADMIN;
     }
 
@@ -179,8 +215,12 @@ public class TeamManager {
         return result;
     }
 
+    /**
+     * Unmodifiable snapshot copy — callers can never mutate live state.
+     */
     public Map<UUID, Role> getMembers(String teamId) {
-        return memberships.getOrDefault(teamId.toLowerCase(), Map.of());
+        Map<UUID, Role> live = teamId == null ? null : memberships.get(teamId.toLowerCase(Locale.ROOT));
+        return live == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(live));
     }
 
     public boolean isInvited(UUID uuid, String teamId) {
@@ -202,96 +242,112 @@ public class TeamManager {
     // ---------------------------------------------------------------
 
     public void invite(CommandSender staff, String teamId, String targetName) {
-        String id = teamId.toLowerCase();
+        String id = teamId.toLowerCase(Locale.ROOT);
         resolveTarget(staff, targetName, target -> {
             UUID uuid = target.getUniqueId();
+            synchronized (lockFor(uuid)) {
+                if (isMember(uuid, id)) {
+                    staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
+                    return;
+                }
+                if (invites.getOrDefault(uuid, Set.of()).contains(id)) {
+                    staff.sendMessage(msg("invite-already-pending", "player", targetName, "team", id));
+                    return;
+                }
+                if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
+                    staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
+                    return;
+                }
 
-            if (isMember(uuid, id)) {
-                staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
-                return;
-            }
-            if (invites.getOrDefault(uuid, Set.of()).contains(id)) {
-                staff.sendMessage(msg("invite-already-pending", "player", targetName, "team", id));
-                return;
-            }
-            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-                staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
-                return;
-            }
+                invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
+                saveInvites();
+                staff.sendMessage(msg("invite-sent", "player", targetName, "team", id));
 
-            invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
-            saveInvites();
-            staff.sendMessage(msg("invite-sent", "player", targetName, "team", id));
-
-            Player online = Bukkit.getPlayer(uuid);
-            if (online != null) {
-                online.sendMessage(msg("invite-received", "team", id));
+                Player online = Bukkit.getPlayer(uuid);
+                if (online != null) {
+                    online.sendMessage(msg("invite-received", "team", id));
+                }
             }
         });
     }
 
     public void accept(Player player, String teamIdOrNull) {
         UUID uuid = player.getUniqueId();
-        Set<String> pending = invites.getOrDefault(uuid, Set.of());
-        String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
-        if (id == null) return;
+        synchronized (lockFor(uuid)) {
+            Set<String> pending = invites.getOrDefault(uuid, Set.of());
+            String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
+            if (id == null) return;
 
-        if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-            player.sendMessage(msg("max-teams-reached", "player", player.getName(), "max", String.valueOf(getMaxTeamsPerPlayer())));
-            return;
+            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
+                player.sendMessage(msg("max-teams-reached", "player", player.getName(), "max", String.valueOf(getMaxTeamsPerPlayer())));
+                return;
+            }
+
+            invites.computeIfPresent(uuid, (k, set) -> {
+                set.remove(id);
+                return set.isEmpty() ? null : set;
+            });
+            saveInvites();
+            setMember(uuid, id, Role.MEMBER);
+            player.sendMessage(msg("invite-accepted", "team", id));
         }
-
-        invites.get(uuid).remove(id);
-        saveInvites();
-        setMember(uuid, id, Role.MEMBER);
-        player.sendMessage(msg("invite-accepted", "team", id));
     }
 
     public void deny(Player player, String teamIdOrNull) {
         UUID uuid = player.getUniqueId();
-        Set<String> pending = invites.getOrDefault(uuid, Set.of());
-        String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
-        if (id == null) return;
+        synchronized (lockFor(uuid)) {
+            Set<String> pending = invites.getOrDefault(uuid, Set.of());
+            String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
+            if (id == null) return;
 
-        invites.get(uuid).remove(id);
-        saveInvites();
-        player.sendMessage(msg("invite-denied", "team", id));
+            invites.computeIfPresent(uuid, (k, set) -> {
+                set.remove(id);
+                return set.isEmpty() ? null : set;
+            });
+            saveInvites();
+            player.sendMessage(msg("invite-denied", "team", id));
+        }
     }
 
     public void add(CommandSender staff, String teamId, String targetName) {
-        String id = teamId.toLowerCase();
+        String id = teamId.toLowerCase(Locale.ROOT);
         resolveTarget(staff, targetName, target -> {
             UUID uuid = target.getUniqueId();
+            synchronized (lockFor(uuid)) {
+                if (isMember(uuid, id)) {
+                    staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
+                    return;
+                }
+                if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
+                    staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
+                    return;
+                }
 
-            if (isMember(uuid, id)) {
-                staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
-                return;
+                // Adding directly also clears any pending invite/request for this team.
+                Set<String> pendingInvites = invites.get(uuid);
+                if (pendingInvites != null) pendingInvites.remove(id);
+                Set<UUID> pendingRequests = requests.get(id);
+                if (pendingRequests != null) pendingRequests.remove(uuid);
+                saveInvites();
+                saveRequests();
+
+                // Founder rule: a team with no admins yet gains one — the first
+                // member added becomes ADMIN so the team stays manageable.
+                Role assigned = countAdmins(id) == 0 ? Role.ADMIN : Role.MEMBER;
+                setMember(uuid, id, assigned);
+                if (assigned == Role.ADMIN) {
+                    plugin.getLogger().info("Team '" + id + "': " + targetName + " added as ADMIN (team had no admins).");
+                }
+                staff.sendMessage(msg("add-success", "player", targetName, "team", id));
+
+                Player online = Bukkit.getPlayer(uuid);
+                if (online != null) online.sendMessage(msg("add-success", "player", online.getName(), "team", id));
             }
-            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-                staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
-                return;
-            }
-
-            // Adding directly also clears any pending invite/request for this team.
-            // (getOrDefault falls back to the immutable Set.of() when there's no
-            // entry yet — remove() on that throws, so only touch a real set.)
-            Set<String> pendingInvites = invites.get(uuid);
-            if (pendingInvites != null) pendingInvites.remove(id);
-            Set<UUID> pendingRequests = requests.get(id);
-            if (pendingRequests != null) pendingRequests.remove(uuid);
-            saveInvites();
-            saveRequests();
-
-            setMember(uuid, id, Role.MEMBER);
-            staff.sendMessage(msg("add-success", "player", targetName, "team", id));
-
-            Player online = Bukkit.getPlayer(uuid);
-            if (online != null) online.sendMessage(msg("add-success", "player", online.getName(), "team", id));
         });
     }
 
     public void kick(CommandSender staff, String teamId, String targetName) {
-        String id = teamId.toLowerCase();
+        String id = teamId.toLowerCase(Locale.ROOT);
         resolveTarget(staff, targetName, target -> {
             UUID uuid = target.getUniqueId();
 
@@ -299,6 +355,7 @@ public class TeamManager {
                 staff.sendMessage(msg("not-in-team", "team", id));
                 return;
             }
+            if (denyIfLastAdmin(staff, id, uuid)) return;
 
             removeMember(uuid, id);
             staff.sendMessage(msg("kick-success", "player", targetName, "team", id));
@@ -313,7 +370,7 @@ public class TeamManager {
         Set<String> memberOf = getPlayerTeams(uuid);
         String id;
         if (teamIdOrNull != null) {
-            id = teamIdOrNull.toLowerCase();
+            id = teamIdOrNull.toLowerCase(Locale.ROOT);
             if (!memberOf.contains(id)) {
                 player.sendMessage(msg("not-in-team", "team", id));
                 return;
@@ -328,57 +385,66 @@ public class TeamManager {
             return;
         }
 
+        if (denyIfLastAdmin(player, id, uuid)) return;
         removeMember(uuid, id);
         player.sendMessage(msg("leave-success", "team", id));
     }
 
     public void request(Player player, String teamId) {
-        String id = teamId.toLowerCase();
+        String id = teamId.toLowerCase(Locale.ROOT);
         UUID uuid = player.getUniqueId();
+        synchronized (lockFor(uuid)) {
+            if (isMember(uuid, id)) {
+                player.sendMessage(msg("already-member", "team", id));
+                return;
+            }
+            if (requests.getOrDefault(id, Set.of()).contains(uuid)) {
+                player.sendMessage(msg("request-already-pending", "team", id));
+                return;
+            }
+            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
+                player.sendMessage(msg("max-teams-reached", "player", player.getName(), "max", String.valueOf(getMaxTeamsPerPlayer())));
+                return;
+            }
 
-        if (isMember(uuid, id)) {
-            player.sendMessage(msg("already-member", "team", id));
-            return;
-        }
-        if (requests.getOrDefault(id, Set.of()).contains(uuid)) {
-            player.sendMessage(msg("request-already-pending", "team", id));
-            return;
-        }
-        if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-            player.sendMessage(msg("max-teams-reached", "player", player.getName(), "max", String.valueOf(getMaxTeamsPerPlayer())));
-            return;
-        }
+            requests.computeIfAbsent(id, k -> ConcurrentHashMap.newKeySet()).add(uuid);
+            saveRequests();
+            player.sendMessage(msg("request-sent", "team", id));
 
-        requests.computeIfAbsent(id, k -> ConcurrentHashMap.newKeySet()).add(uuid);
-        saveRequests();
-        player.sendMessage(msg("request-sent", "team", id));
-
-        Component notice = msg("request-received", "player", player.getName(), "team", id);
-        for (Map.Entry<UUID, Role> entry : getMembers(id).entrySet()) {
-            if (entry.getValue() != Role.ADMIN) continue;
-            Player admin = Bukkit.getPlayer(entry.getKey());
-            if (admin != null) admin.sendMessage(notice);
+            Component notice = msg("request-received", "player", player.getName(), "team", id);
+            for (Map.Entry<UUID, Role> entry : getMembers(id).entrySet()) {
+                if (entry.getValue() != Role.ADMIN) continue;
+                Player admin = Bukkit.getPlayer(entry.getKey());
+                if (admin != null) admin.sendMessage(notice);
+            }
         }
     }
 
     public void denyRequest(CommandSender staff, String teamId, String targetName) {
-        String id = teamId.toLowerCase();
+        String id = teamId.toLowerCase(Locale.ROOT);
         resolveTarget(staff, targetName, target -> {
             UUID uuid = target.getUniqueId();
+            synchronized (lockFor(uuid)) {
+                Set<UUID> pending = requests.get(id);
+                if (pending == null || !pending.contains(uuid)) {
+                    staff.sendMessage(msg("request-not-found", "player", targetName, "team", id));
+                    return;
+                }
+                requests.computeIfPresent(id, (k, set) -> {
+                    set.remove(uuid);
+                    return set.isEmpty() ? null : set;
+                });
+                saveRequests();
+                staff.sendMessage(msg("request-reject-success", "player", targetName, "team", id));
 
-            Set<UUID> pending = requests.getOrDefault(id, Set.of());
-            if (!pending.contains(uuid)) {
-                staff.sendMessage(msg("request-not-found", "player", targetName, "team", id));
-                return;
+                Player online = Bukkit.getPlayer(uuid);
+                if (online != null) online.sendMessage(msg("request-rejected", "team", id));
             }
-            pending.remove(uuid);
-            saveRequests();
-            staff.sendMessage(msg("kick-success", "player", targetName, "team", id)); // reuse: "removed/rejected"
         });
     }
 
     public void setRole(CommandSender staff, String teamId, String targetName, String roleStr) {
-        String id = teamId.toLowerCase();
+        String id = teamId.toLowerCase(Locale.ROOT);
         Role role;
         try {
             role = Role.valueOf(roleStr.toUpperCase());
@@ -394,6 +460,8 @@ public class TeamManager {
                 staff.sendMessage(msg("not-in-team", "team", id));
                 return;
             }
+            // Demoting the last remaining admin would orphan the team.
+            if (role == Role.MEMBER && denyIfLastAdmin(staff, id, uuid)) return;
 
             setMember(uuid, id, role);
             staff.sendMessage(msg("setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase()));
@@ -413,17 +481,25 @@ public class TeamManager {
             String rendered = displayLegacy
                     .replace("%team-display%", def.color() + def.displayName())
                     .replace("%count%", String.valueOf(count));
-            sender.sendMessage(plugin.getMiniMessage().deserialize(rendered));
+            sender.sendMessage(safeDeserialize(rendered));
         }
     }
 
     public void info(CommandSender sender, String teamId) {
+        if (teamId == null) {
+            sender.sendMessage(msg("unknown-team", "team", "?"));
+            return;
+        }
         TeamDefinition def = getTeam(teamId);
-        Map<UUID, Role> members = getMembers(teamId.toLowerCase());
+        if (def == null) {
+            sender.sendMessage(msg("unknown-team", "team", teamId));
+            return;
+        }
+        Map<UUID, Role> members = getMembers(teamId.toLowerCase(Locale.ROOT));
 
         String header = plugin.getTeamConfig().getString("messages.info-header", "--- %team-display% ---")
                 .replace("%team-display%", def.color() + def.displayName());
-        sender.sendMessage(plugin.getMiniMessage().deserialize(header));
+        sender.sendMessage(safeDeserialize(header));
 
         if (members.isEmpty()) {
             sender.sendMessage(msg("info-empty"));
@@ -570,6 +646,28 @@ public class TeamManager {
         assignScoreboardTeam(uuid, teamId);
     }
 
+    private long countAdmins(String teamId) {
+        Map<UUID, Role> members = memberships.get(teamId);
+        if (members == null) return 0;
+        return members.values().stream().filter(r -> r == Role.ADMIN).count();
+    }
+
+    /**
+     * Last-admin guard: refuses to remove/demote the final ADMIN of a team.
+     * Must be called BEFORE the mutation. Returns true when the action was
+     * denied (caller must return immediately).
+     */
+    private boolean denyIfLastAdmin(CommandSender sender, String teamId, UUID targetUuid) {
+        Map<UUID, Role> members = memberships.get(teamId);
+        if (members == null || members.get(targetUuid) != Role.ADMIN) return false;
+        long admins = members.values().stream().filter(r -> r == Role.ADMIN).count();
+        if (admins <= 1) {
+            sender.sendMessage(msg("last-admin", "team", teamId));
+            return true;
+        }
+        return false;
+    }
+
     private void removeMember(UUID uuid, String teamId) {
         Map<UUID, Role> members = memberships.get(teamId);
         if (members != null) members.remove(uuid);
@@ -584,11 +682,28 @@ public class TeamManager {
     }
 
     private Component msg(String key, String... placeholders) {
-        String raw = plugin.getTeamConfig().getString("messages." + key, key);
+        String raw = plugin.getTeamConfig().getString("messages." + key, BUILTIN_DEFAULTS.getOrDefault(key, key));
         for (int i = 0; i + 1 < placeholders.length; i += 2) {
-            raw = raw.replace("%" + placeholders[i] + "%", placeholders[i + 1]);
+            // Player/team inputs are untrusted — escape them so a name like
+            // "<red>" can never inject MiniMessage formatting or click events.
+            // (Team display-names from team.yml stay raw on purpose: those are
+            // admin-authored MiniMessage by design.)
+            String value = placeholders[i + 1] == null ? "" : placeholders[i + 1];
+            raw = raw.replace("%" + placeholders[i] + "%", plugin.getMiniMessage().escapeTags(value));
         }
-        return plugin.getMiniMessage().deserialize(raw);
+        return safeDeserialize(raw);
+    }
+
+    /**
+     * MiniMessage with a plain-text fallback: a single broken admin message
+     * must never break the command that renders it.
+     */
+    private Component safeDeserialize(String raw) {
+        try {
+            return plugin.getMiniMessage().deserialize(raw);
+        } catch (Exception e) {
+            return Component.text(raw);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -604,19 +719,23 @@ public class TeamManager {
             validNames.add(name);
             Team team = scoreboard.getTeam(name);
             if (team == null) team = scoreboard.registerNewTeam(name);
+            ownedScoreboardTeams.add(name);
             team.color(def.vanillaColor());
             team.prefix(plugin.getMiniMessage().deserialize(def.color() + "[" + def.id() + "] <reset>"));
         }
 
         for (Team team : new ArrayList<>(scoreboard.getTeams())) {
-            if (team.getName().startsWith("pb_") && !validNames.contains(team.getName())) {
+            if (team.getName().startsWith("pb_") && !validNames.contains(team.getName())
+                    && ownedScoreboardTeams.contains(team.getName())) {
                 team.unregister();
+                ownedScoreboardTeams.remove(team.getName());
             }
         }
     }
 
     private void refreshScoreboardEntries(String teamId) {
         if (scoreboard == null) return;
+        if (!ownedScoreboardTeams.contains(scoreboardName(teamId))) return;
         Team team = scoreboard.getTeam(scoreboardName(teamId));
         if (team == null) return;
 
@@ -642,15 +761,27 @@ public class TeamManager {
     }
 
     public void shutdown() {
+        // Synchronous final flush — the server may be stopping, so async
+        // tasks might never run. Write directly instead of via runNow().
+        saveMembershipsSync();
+        saveInvitesSync();
+        saveRequestsSync();
         if (scoreboard == null) return;
         for (Team team : new ArrayList<>(scoreboard.getTeams())) {
-            if (team.getName().startsWith("pb_")) team.unregister();
+            if (team.getName().startsWith("pb_") && ownedScoreboardTeams.contains(team.getName())) {
+                team.unregister();
+            }
         }
+        ownedScoreboardTeams.clear();
     }
 
+    /**
+     * Vanilla scoreboard names are limited to 16 chars; team ids longer than
+     * 12 chars are rejected at load (see loadTeamDefinitions), so "pb_<id>"
+     * always fits and must never be truncated.
+     */
     private String scoreboardName(String teamId) {
-        String name = "pb_" + teamId;
-        return name.length() > 40 ? name.substring(0, 40) : name; // generous modern limit, just a sanity cap
+        return "pb_" + teamId;
     }
 
     // ---------------------------------------------------------------
@@ -676,7 +807,7 @@ public class TeamManager {
                 } catch (IllegalArgumentException ignored) {
                 }
             }
-            memberships.put(teamId, map);
+            memberships.put(teamId.toLowerCase(Locale.ROOT), map);
         }
 
         invites.clear();
@@ -684,8 +815,11 @@ public class TeamManager {
         for (String uuidStr : invitesConfig.getKeys(false)) {
             try {
                 UUID uuid = UUID.fromString(uuidStr);
-                invites.put(uuid, ConcurrentHashMap.newKeySet());
-                invites.get(uuid).addAll(invitesConfig.getStringList(uuidStr));
+                Set<String> set = ConcurrentHashMap.newKeySet();
+                for (String team : invitesConfig.getStringList(uuidStr)) {
+                    set.add(team.toLowerCase(Locale.ROOT));
+                }
+                if (!set.isEmpty()) invites.put(uuid, set);
             } catch (IllegalArgumentException ignored) {
             }
         }
@@ -700,7 +834,7 @@ public class TeamManager {
                 } catch (IllegalArgumentException ignored) {
                 }
             }
-            requests.put(teamId, set);
+            requests.put(teamId.toLowerCase(Locale.ROOT), set);
         }
     }
 
@@ -710,54 +844,76 @@ public class TeamManager {
     // interleaved/corrupted write. Serializing per file (not one lock for
     // all three) keeps members/invites/requests writes from blocking each
     // other while still ruling out that race for each file individually.
-    private final Object membersFileLock = new Object();
-    private final Object invitesFileLock = new Object();
-    private final Object requestsFileLock = new Object();
+    // Static on purpose: the lock must also hold across manager instances
+    // (e.g. a /plainbase reload creating a second TeamManager while the old
+    // one's async saves are still in flight).
+    private static final Object MEMBERS_LOCK = new Object();
+    private static final Object INVITES_LOCK = new Object();
+    private static final Object REQUESTS_LOCK = new Object();
 
     private void saveMemberships() {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            synchronized (membersFileLock) {
-                YamlConfiguration config = new YamlConfiguration();
-                for (Map.Entry<String, Map<UUID, Role>> teamEntry : memberships.entrySet()) {
-                    for (Map.Entry<UUID, Role> memberEntry : teamEntry.getValue().entrySet()) {
-                        config.set(teamEntry.getKey() + "." + memberEntry.getKey(), memberEntry.getValue().name());
-                    }
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveMembershipsSync());
+    }
+
+    private void saveMembershipsSync() {
+        synchronized (MEMBERS_LOCK) {
+            YamlConfiguration config = new YamlConfiguration();
+            for (Map.Entry<String, Map<UUID, Role>> teamEntry : memberships.entrySet()) {
+                for (Map.Entry<UUID, Role> memberEntry : teamEntry.getValue().entrySet()) {
+                    config.set(teamEntry.getKey() + "." + memberEntry.getKey(), memberEntry.getValue().name());
                 }
-                saveQuietly(config, "members.yml");
             }
-        });
+            saveQuietly(config, "members.yml");
+        }
     }
 
     private void saveInvites() {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            synchronized (invitesFileLock) {
-                YamlConfiguration config = new YamlConfiguration();
-                for (Map.Entry<UUID, Set<String>> entry : invites.entrySet()) {
-                    if (!entry.getValue().isEmpty()) config.set(entry.getKey().toString(), new ArrayList<>(entry.getValue()));
-                }
-                saveQuietly(config, "invites.yml");
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveInvitesSync());
+    }
+
+    private void saveInvitesSync() {
+        synchronized (INVITES_LOCK) {
+            YamlConfiguration config = new YamlConfiguration();
+            for (Map.Entry<UUID, Set<String>> entry : invites.entrySet()) {
+                if (!entry.getValue().isEmpty()) config.set(entry.getKey().toString(), new ArrayList<>(entry.getValue()));
             }
-        });
+            saveQuietly(config, "invites.yml");
+        }
     }
 
     private void saveRequests() {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            synchronized (requestsFileLock) {
-                YamlConfiguration config = new YamlConfiguration();
-                for (Map.Entry<String, Set<UUID>> entry : requests.entrySet()) {
-                    if (!entry.getValue().isEmpty()) {
-                        List<String> uuids = entry.getValue().stream().map(UUID::toString).toList();
-                        config.set(entry.getKey(), uuids);
-                    }
-                }
-                saveQuietly(config, "requests.yml");
-            }
-        });
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveRequestsSync());
     }
 
+    private void saveRequestsSync() {
+        synchronized (REQUESTS_LOCK) {
+            YamlConfiguration config = new YamlConfiguration();
+            for (Map.Entry<String, Set<UUID>> entry : requests.entrySet()) {
+                if (!entry.getValue().isEmpty()) {
+                    List<String> uuids = entry.getValue().stream().map(UUID::toString).toList();
+                    config.set(entry.getKey(), uuids);
+                }
+            }
+            saveQuietly(config, "requests.yml");
+        }
+    }
+
+    /**
+     * Crash-safe write: dump to "{@code <file>.tmp}" in the same directory, then move over
+     * the target atomically (with a non-atomic fallback for file systems
+     * without atomic-move support), so a crash can never leave a
+     * half-written YAML behind.
+     */
     private void saveQuietly(YamlConfiguration config, String fileName) {
+        File target = dataFile(fileName);
+        File tmp = new File(target.getParentFile(), fileName + ".tmp");
         try {
-            config.save(dataFile(fileName));
+            config.save(tmp);
+            try {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException e) {
             plugin.getLogger().severe("Could not save " + fileName + ": " + e.getMessage());
         }
