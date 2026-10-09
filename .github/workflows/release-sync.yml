@@ -183,7 +183,6 @@ jobs:
         env:
           HANGAR_API_TOKEN: ${{ secrets.HANGAR_API_TOKEN }}
           TAG: ${{ inputs.tag }}
-          JAR: ${{ steps.release.outputs.jar }}
           CHANNEL: ${{ steps.meta.outputs.hangar_channel }}
         run: |
           set -euo pipefail
@@ -198,12 +197,25 @@ jobs:
             echo "::error::Hangar authentication failed (bad API key?)."
             exit 1
           fi
+          # Hangar caps direct uploads at 15 MB total, but our shaded jar is
+          # ~19 MB — same as before, the Hangar version links the Modrinth
+          # file as an external download (this is how 0.2.0-Beta got there).
+          # The Modrinth version is guaranteed to exist: the Modrinth step
+          # above uploads it first when missing.
+          FILE_URL="$(curl -s --fail "https://api.modrinth.com/v2/project/${MODRINTH_PROJECT_ID}/version/${TAG}" \
+            | jq -r '.files | map(select(.primary == true)) + map(select(.primary != true)) | .[0].url')"
+          if [ -z "$FILE_URL" ] || [ "$FILE_URL" = "null" ]; then
+            echo "::error::Could not resolve a Modrinth file URL for '$TAG'."
+            exit 1
+          fi
+          echo "Linking Hangar version to external file: $FILE_URL"
           # Written to a file and referenced via @file: curl's -F treats ";"
           # as a field-metadata separator, so release notes must never be inlined.
           jq -n \
             --arg version "$TAG" \
             --arg channel "$CHANNEL" \
             --arg changelog "$(cat release-body.md)" \
+            --arg externalUrl "$FILE_URL" \
             --argjson platforms "$(echo '${{ inputs.game_versions }}' | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')" \
             '{
               version: $version,
@@ -211,14 +223,13 @@ jobs:
               description: $changelog,
               pluginDependencies: {PAPER: [{name: "PlaceholderAPI", required: false}]},
               platformDependencies: {PAPER: $platforms},
-              files: [{fileInfo: null, externalUrl: null, platforms: ["PAPER"]}]
+              files: [{fileInfo: null, externalUrl: $externalUrl, platforms: ["PAPER"]}]
             }' > hangar-payload.json
           CODE="$(curl -s -o hangar-resp.json -w "%{http_code}" -X POST \
             "https://hangar.papermc.io/api/v1/projects/${HANGAR_AUTHOR}/${HANGAR_SLUG}/upload" \
             -H "Authorization: HangarAuth $JWT" \
             -H "User-Agent: plainbase-release-sync" \
-            -F "versionUpload=@hangar-payload.json;type=application/json" \
-            -F "files=@dist/$JAR;type=application/java-archive")"
+            -F "versionUpload=@hangar-payload.json;type=application/json")"
           if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then
             echo "::error::Hangar upload failed (HTTP $CODE): $(cat hangar-resp.json)"
             exit 1
