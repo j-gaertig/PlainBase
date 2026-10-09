@@ -11,10 +11,6 @@
   Essential features, zero bloat.
 </p>
 
-<!-- RELEASE-SYNC:START -->
-> **Latest release:** [0.3.0-Beta](https://github.com/j-gaertig/PlainBase/releases/tag/0.3.0-Beta) — 2026-10-09 · [Modrinth](https://modrinth.com/project/plainbase/version/b1B7eoWJ) · [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase/versions/0.3.0-Beta)
-<!-- RELEASE-SYNC:END -->
-
 ---
 
 ## Current Features
