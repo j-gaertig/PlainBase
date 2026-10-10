@@ -96,6 +96,12 @@ public final class PlainBase extends JavaPlugin {
      * re-hides from this copy (take-and-clear). Never holds a live manager.
      */
     private volatile Set<java.util.UUID> carriedVanishedIds = Set.of();
+    /**
+     * BUG-1 carry-over: pre-vanish self states snapshotted alongside the IDs
+     * so the fresh manager restores the ORIGINAL values instead of
+     * snapshotting still-vanished flags on re-vanish. Take-and-clear with the IDs.
+     */
+    private volatile Map<java.util.UUID, VanishManager.PrevSelfState> carriedPrevSelfStates = Map.of();
     private volatile MenuManager menuManager;
     private volatile BanManager banManager;
     private volatile TeamManager teamManager;
@@ -224,6 +230,7 @@ public final class PlainBase extends JavaPlugin {
         }
 
         removePermissions();
+        commandsRegistered = false;
 
         getLogger().info("Successfully Disabled! (Version " + getPluginMeta().getVersion() + ")");
     }
@@ -340,6 +347,19 @@ public final class PlainBase extends JavaPlugin {
             } catch (Exception e) {
                 getLogger().fine("Could not remove permission " + name + ": " + e.getMessage());
             }
+        }
+        // Bukkit Permissibles cache effective permissions: refresh online
+        // players so removed nodes no longer resolve until re-registered.
+        try {
+            for (Player player : getServer().getOnlinePlayers()) {
+                try {
+                    player.recalculatePermissions();
+                } catch (Exception e) {
+                    getLogger().fine("Could not recalculate permissions for " + player.getName() + ": " + e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            getLogger().fine("Could not recalculate permissions after removal: " + e.getMessage());
         }
     }
 
@@ -707,7 +727,7 @@ public final class PlainBase extends JavaPlugin {
             snapshot = pendingSaves.toArray(new CompletableFuture[0]);
         }
         if (!block) {
-            CompletableFuture.allOf(snapshot).whenComplete((v, t) -> {
+            CompletableFuture.allOf(snapshot).orTimeout(5, TimeUnit.SECONDS).whenComplete((v, t) -> {
                 if (t != null) {
                     getLogger().warning("Async config writes failed during reload: " + t.getMessage());
                 }
@@ -892,9 +912,17 @@ public final class PlainBase extends JavaPlugin {
                 getLogger().warning("Failed to snapshot vanish state, vanished players may be revealed: " + e.getMessage());
                 carriedVanishedIds = Set.of();
             }
+            // BUG-1: carry pre-vanish self states by value alongside the IDs.
+            try {
+                carriedPrevSelfStates = Map.copyOf(vanishManager.copyPrevSelfStates());
+            } catch (Exception e) {
+                getLogger().fine("Failed to snapshot vanish self states: " + e.getMessage());
+                carriedPrevSelfStates = Map.of();
+            }
             vanishManager = null;
         } else {
             carriedVanishedIds = Set.of();
+            carriedPrevSelfStates = Map.of();
         }
 
         // Close any open menu inventories before the listeners are
@@ -906,14 +934,26 @@ public final class PlainBase extends JavaPlugin {
         // Each step is isolated: a throwing manager must never abort the rest.
         if (menuManager != null) {
             try {
-                menuManager.closeAllMenusSyncAwait(3000);
+                if (block) {
+                    // Disable path only: bounded synchronous wait (1000ms —
+                    // the entity-thread closes usually land within a few ms,
+                    // the rest is abandoned + logged, never stalling shutdown
+                    // indefinitely). Kept sequential with awaitPendingSaves()
+                    // above by design: total bounded shutdown budget ~= 5s
+                    // saves + 1s menus, both abandoned with a warning instead
+                    // of blocking forever.
+                    menuManager.closeAllMenusSyncAwait(1000);
+                } else {
+                    // Reload path: never stall the global region thread with
+                    // a .get() wait. Best-effort sync close first, then the
+                    // deferred fire-and-forget entity-thread closes (Folia:
+                    // inventory access is entity-thread-only, the sync pass
+                    // throws there and the deferred pass covers it).
+                    menuManager.closeAllMenusSyncBestEffort();
+                    menuManager.closeAllMenus();
+                }
             } catch (Exception e) {
                 getLogger().warning("Failed to close menus: " + e.getMessage());
-            }
-            try {
-                menuManager.closeAllMenusSyncBestEffort();
-            } catch (Exception e) {
-                getLogger().warning("Failed to close menus (sync): " + e.getMessage());
             }
         }
         menuManager = null;
@@ -1032,7 +1072,7 @@ public final class PlainBase extends JavaPlugin {
                     if (live == null) return;
                     live.setDefaults(defaults);
                     for (String key : defaults.getKeys(true)) {
-                        if (!live.contains(key)) {
+                        if (!live.isSet(key)) {
                             live.set(key, defaults.get(key));
                         }
                     }
@@ -1088,7 +1128,7 @@ public final class PlainBase extends JavaPlugin {
                 FileConfiguration defaults = YamlConfiguration.loadConfiguration(reader);
                 config.setDefaults(defaults);
                 for (String key : defaults.getKeys(true)) {
-                    if (!config.contains(key)) {
+                    if (!config.isSet(key)) {
                         config.set(key, defaults.get(key));
                     }
                 }
@@ -1127,50 +1167,114 @@ public final class PlainBase extends JavaPlugin {
         // while this reads). Module configs are guarded per-instance via
         // synchronized(config): their snapshots/mutations use the same monitor
         // (see saveModuleConfigAsync), YamlConfiguration is not thread-safe.
+        // Snapshot everything under the lock(s), log outside so slow I/O
+        // (logger handlers) never holds configLock.
+        final String currentMain;
+        final String configLatest;
+        final java.util.Map<String, String> currentByFile = new java.util.HashMap<>();
+        final java.util.Map<String, String> latestByFile = new java.util.HashMap<>();
         synchronized (configLock) {
-            String configLatest = versionToString(latestVersions.get("config.yml"));
-            if (configLatest != null) {
-                checkVersion("config.yml", readVersionString(getConfig()), configLatest);
-            }
+            currentMain = readVersionString(getConfig());
+            configLatest = versionToString(latestVersions.get("config.yml"));
 
             // Snapshot copy: a concurrent stopModules() -> clear() on another
             // thread must never break this traversal.
             new HashMap<>(configs).forEach((name, config) -> {
-                String latest = versionToString(latestVersions.get(name));
-                if (latest != null && config != null) {
-                    String current;
-                    synchronized (config) {
-                        current = readVersionString(config);
-                    }
-                    checkVersion("modules/" + name, current, latest);
+                if (config == null) {
+                    currentByFile.put(name, "0");
+                    return;
                 }
+                String current;
+                synchronized (config) {
+                    current = readVersionString(config);
+                }
+                currentByFile.put(name, current);
             });
+            latestByFile.putAll(latestVersions);
         }
+
+        if (configLatest != null) {
+            checkVersion("config.yml", currentMain, configLatest);
+        }
+        currentByFile.forEach((name, current) -> {
+            String latest = latestByFile.get(name);
+            if (latest != null) {
+                checkVersion("modules/" + name, current, latest);
+            }
+        });
     }
 
     /**
      * Compares dotted version strings segment by segment ("1.10" &gt; "1.9"):
      * a double comparison would wrongly treat 1.10 as equal to 1.1.
-     * Non-numeric segments count as 0, missing segments count as 0.
-     * Returns negative if a &lt; b, zero if equal, positive if a &gt; b.
+     * A dash-separated pre-release suffix ("0.3.0-Beta", "1.0-Alpha") is
+     * stripped from the numeric core and compared afterwards: same core
+     * means pre-release &lt; release, two pre-releases compare their tags
+     * case-insensitively ("alpha" &lt; "beta"). Non-numeric segments count
+     * as 0 (numeric prefix when trailing junk remains), missing segments
+     * count as 0. Returns negative if a &lt; b, zero if equal, positive if
+     * a &gt; b. Kept identical in PlainBaseCommand/GlobalListener.
      */
     private static int compareVersions(String a, String b) {
-        String[] pa = a.split("\\.", -1);
-        String[] pb = b.split("\\.", -1);
+        String left = a == null ? "0" : a.trim();
+        String right = b == null ? "0" : b.trim();
+        String preL = preReleaseOf(left);
+        String preR = preReleaseOf(right);
+        String[] pa = coreOf(left).split("\\.", -1);
+        String[] pb = coreOf(right).split("\\.", -1);
         int len = Math.max(pa.length, pb.length);
         for (int i = 0; i < len; i++) {
             int na = parseVersionSegment(i < pa.length ? pa[i] : "0");
             int nb = parseVersionSegment(i < pb.length ? pb[i] : "0");
             if (na != nb) return Integer.compare(na, nb);
         }
+        boolean hasPreL = preL != null;
+        boolean hasPreR = preR != null;
+        if (hasPreL != hasPreR) return hasPreL ? -1 : 1;
+        if (hasPreL) {
+            int cmp = preL.compareToIgnoreCase(preR);
+            if (cmp != 0) return Integer.compare(cmp, 0);
+        }
         return 0;
     }
 
+    /** Numeric core of a version: everything before the first '-' or '+'. */
+    private static String coreOf(String version) {
+        String core = version;
+        int dash = core.indexOf('-');
+        if (dash >= 0) core = core.substring(0, dash);
+        int plus = core.indexOf('+');
+        if (plus >= 0) core = core.substring(0, plus);
+        core = core.trim();
+        return core.isEmpty() ? "0" : core;
+    }
+
+    /** Pre-release tag of a version ("0.3.0-Beta" -&gt; "Beta"), or null. */
+    private static String preReleaseOf(String version) {
+        int dash = version.indexOf('-');
+        if (dash < 0) return null;
+        String pre = version.substring(dash + 1);
+        int plus = pre.indexOf('+');
+        if (plus >= 0) pre = pre.substring(0, plus);
+        pre = pre.trim();
+        return pre.isEmpty() ? null : pre;
+    }
+
     private static int parseVersionSegment(String segment) {
+        String s = segment == null ? "" : segment.trim();
         try {
-            return Integer.parseInt(segment.trim());
+            return Integer.parseInt(s);
         } catch (NumberFormatException e) {
-            return 0;
+            // Tolerate trailing junk ("3rc1" -> 3): compare the leading
+            // numeric prefix instead of collapsing the whole segment to 0.
+            int end = 0;
+            while (end < s.length() && Character.isDigit(s.charAt(end))) end++;
+            if (end == 0) return 0;
+            try {
+                return Integer.parseInt(s.substring(0, end));
+            } catch (NumberFormatException e2) {
+                return 0;
+            }
         }
     }
 
@@ -1190,6 +1294,7 @@ public final class PlainBase extends JavaPlugin {
      * from 1.1, which YAML would otherwise parse to the same double).
      */
     private static String readVersionString(FileConfiguration config) {
+        if (config == null) return "0";
         Object value = config.get("version");
         if (value == null) return "0";
         String text = value.toString().trim();
@@ -1205,6 +1310,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupSpawn() {
+        if (!ensureGlobalThread("setupSpawn", this::setupSpawn)) return;
         FileConfiguration spawnConfig = loadModuleConfig("spawn.yml");
         if (spawnConfig == null) {
             getLogger().severe("Could not load spawn.yml! The spawn module stays disabled until this is fixed.");
@@ -1248,6 +1354,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupJoinItems() {
+        if (!ensureGlobalThread("setupJoinItems", this::setupJoinItems)) return;
         FileConfiguration joinItemsConfig = loadModuleConfig("joinitems.yml");
         if (joinItemsConfig == null) {
             getLogger().severe("Could not load joinitems.yml! The joinitems module stays disabled until this is fixed.");
@@ -1257,6 +1364,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupMessages() {
+        if (!ensureGlobalThread("setupMessages", this::setupMessages)) return;
         FileConfiguration messagesConfig = loadModuleConfig("messages.yml");
         if (messagesConfig == null) {
             getLogger().severe("Could not load messages.yml! The messages module stays disabled until this is fixed.");
@@ -1269,6 +1377,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupTeleport() {
+        if (!ensureGlobalThread("setupTeleport", this::setupTeleport)) return;
         FileConfiguration teleportConfig = loadModuleConfig("teleport.yml");
         if (teleportConfig == null) {
             getLogger().severe("Could not load teleport.yml! The teleport module stays disabled until this is fixed.");
@@ -1295,6 +1404,9 @@ public final class PlainBase extends JavaPlugin {
         // stopModules() must never re-hide a stale set.
         Set<java.util.UUID> previousVanished = carriedVanishedIds;
         carriedVanishedIds = Set.of();
+        // BUG-1: take the carried pre-vanish self states alongside the IDs.
+        Map<java.util.UUID, VanishManager.PrevSelfState> previousSelfStates = carriedPrevSelfStates;
+        carriedPrevSelfStates = Map.of();
 
         FileConfiguration vanishCfg = loadModuleConfig("vanish.yml");
         if (vanishCfg == null) {
@@ -1356,7 +1468,7 @@ public final class PlainBase extends JavaPlugin {
         }
 
         vanishManager = new VanishManager(this);
-        restoreVanishState(previousVanished);
+        restoreVanishState(previousVanished, previousSelfStates);
 
         getServer().getPluginManager().registerEvents(new VanishListener(this), this);
 
@@ -1371,9 +1483,20 @@ public final class PlainBase extends JavaPlugin {
      * only the existing VanishManager API (getVanishedPlayers/vanish). Online
      * players are re-vanished directly; offline ones re-vanish on join via
      * their persisted files. Never throws.
+     * <p>
+     * BUG-1: restores the carried pre-vanish self states BEFORE re-vanishing
+     * so applySelfState's putIfAbsent keeps the original values instead of
+     * snapshotting the still-vanished flags.
      */
-    private void restoreVanishState(Set<java.util.UUID> previousVanished) {
-        if (previousVanished == null || previousVanished.isEmpty() || vanishManager == null) return;
+    private void restoreVanishState(Set<java.util.UUID> previousVanished,
+                                    Map<java.util.UUID, VanishManager.PrevSelfState> previousSelfStates) {
+        if (vanishManager == null) return;
+        try {
+            vanishManager.restorePrevSelfStates(previousSelfStates);
+        } catch (Exception e) {
+            getLogger().fine("Failed to restore vanish self states: " + e.getMessage());
+        }
+        if (previousVanished == null || previousVanished.isEmpty()) return;
         for (java.util.UUID uuid : previousVanished) {
             try {
                 if (vanishManager.isVanished(uuid)) continue;
@@ -1388,6 +1511,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupMenu() {
+        if (!ensureGlobalThread("setupMenu", this::setupMenu)) return;
         FileConfiguration menuCfg = loadModuleConfig("menu.yml");
         if (menuCfg == null) {
             getLogger().severe("Could not load menu.yml! The menu module stays disabled until this is fixed.");
@@ -1402,6 +1526,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupModeration() {
+        if (!ensureGlobalThread("setupModeration", this::setupModeration)) return;
         FileConfiguration moderationCfg = loadModuleConfig("moderation.yml");
         if (moderationCfg == null) {
             getLogger().severe("Could not load moderation.yml! The moderation module stays disabled until this is fixed.");
@@ -1451,7 +1576,24 @@ public final class PlainBase extends JavaPlugin {
         if (placeholdersRegistered) return;
         if (getServer().getPluginManager().getPlugin("PlaceholderAPI") == null) return;
 
-        placeholdersRegistered = new PlainBaseExpansion(this).register();
+        // BUG-7: cache the instance only after register()==true — a merely
+        // constructed instance must never become lastInstance.
+        PlainBaseExpansion expansion = new PlainBaseExpansion(this);
+        boolean ok = false;
+        try {
+            ok = expansion.register();
+        } catch (Exception e) {
+            getLogger().fine("Failed to register PlaceholderAPI expansion: " + e.getMessage());
+            ok = false;
+        }
+        if (ok) {
+            try {
+                PlainBaseExpansion.setLastInstance(expansion);
+            } catch (Exception e) {
+                getLogger().fine("Failed to cache PlaceholderAPI expansion: " + e.getMessage());
+            }
+        }
+        placeholdersRegistered = ok;
         if (placeholdersRegistered) {
             getLogger().info("PlaceholderAPI detected — registered %plainbase_*% placeholders!");
         }

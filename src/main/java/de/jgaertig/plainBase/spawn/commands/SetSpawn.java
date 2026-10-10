@@ -21,12 +21,24 @@ public class SetSpawn implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.spawn", false)) {
+        // Root-config read under the central configLock (same monitor as
+        // PlainBaseCommand toggle/suggest): the instance is fetched INSIDE the
+        // lock since reloadConfig() may swap it at any time.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.spawn", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
 
-        if (plugin.getSpawnConfig() == null) {
+        // Single snapshot, reused for the checks and the write below (never
+        // re-fetched: a reload between the checks could otherwise hand back a
+        // different/null instance).
+        FileConfiguration setspawnConfig = plugin.getSpawnConfig();
+        if (setspawnConfig == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
             return;
         }
@@ -37,11 +49,7 @@ public class SetSpawn implements BasicCommand {
         }
 
         // Snapshot + locked read: writers mutate under synchronized(config).
-        FileConfiguration setspawnConfig = plugin.getSpawnConfig();
-        if (setspawnConfig == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
-            return;
-        }
+        // Reuses the setspawnConfig snapshot above (never re-fetched).
         boolean commandEnabled;
         synchronized (setspawnConfig) {
             commandEnabled = setspawnConfig.getBoolean("commands.setspawn.enabled", true);
@@ -109,7 +117,7 @@ public class SetSpawn implements BasicCommand {
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to check world border for /setspawn: " + e.getMessage());
             }
-            saveToSpawnConfig(loc);
+            saveToSpawnConfig(setspawnConfig, loc);
         } else {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Failed to set spawn location!"));
             return;
@@ -124,8 +132,7 @@ public class SetSpawn implements BasicCommand {
         return Double.parseDouble(arg);
     }
 
-    private void saveToSpawnConfig(Location loc) {
-        var config = plugin.getSpawnConfig();
+    private void saveToSpawnConfig(FileConfiguration config, Location loc) {
         if (config == null) return;
         synchronized (config) {
             config.set("spawn.location.world", loc.getWorld().getName());

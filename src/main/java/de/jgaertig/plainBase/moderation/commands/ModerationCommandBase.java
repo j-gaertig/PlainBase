@@ -339,9 +339,11 @@ public abstract class ModerationCommandBase {
      * Online-player lookup that prefers an exact name match: Bukkit#getPlayer
      * does prefix matching ("Alex" also matches "Alexander"), which could ban
      * or kick the wrong player on a typo. Exact first, fuzzy only as
-     * fallback — and the fuzzy fallback never resolves to a vanished player
-     * invisible to the viewer (falls through to offline lookup instead, same
-     * oracle protection as TeamManager#onlinePlayerExactFirst).
+     * fallback — and BOTH never resolve to a vanished player invisible to the
+     * viewer (falls through to offline lookup instead, same oracle protection
+     * as TeamManager#onlinePlayerExactFirst). Without this, probing a name
+     * via ban/kick ("not online" vs success) would leak a vanished player's
+     * existence — suggest() already filters, execute() must too.
      */
     protected Player onlinePlayerExactFirst(String name, CommandSender viewer) {
         if (name == null) return null;
@@ -351,7 +353,19 @@ public abstract class ModerationCommandBase {
         } catch (Exception e) {
             return null;
         }
-        if (exact != null) return exact;
+        if (exact != null) {
+            if (viewer instanceof Player p) {
+                try {
+                    var vanishManager = plugin.getVanishManager();
+                    if (vanishManager != null && vanishManager.isVanished(exact) && !vanishManager.canSee(p, exact)) {
+                        return null;
+                    }
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+            return exact;
+        }
         Player fuzzy;
         try {
             fuzzy = Bukkit.getPlayer(name);
@@ -396,6 +410,25 @@ public abstract class ModerationCommandBase {
         } catch (Exception ignored) {
         }
         if (exactOnline != null) {
+            // Vanish-oracle guard (same as Team/TPA execute): an exact online
+            // match invisible to a player sender must pretend the player does
+            // not exist — return null (callers report player-not-found) instead
+            // of the online player, and skip the offline-cache fallback below
+            // (which would otherwise resolve the same UUID anyway and leak
+            // existence via a successful ban). Console/non-player senders
+            // bypass (they see everyone, like suggest()).
+            if (sender instanceof Player viewer) {
+                try {
+                    var vanishManager = plugin.getVanishManager();
+                    if (vanishManager != null && vanishManager.isVanished(exactOnline) && !vanishManager.canSee(viewer, exactOnline)) {
+                        callback.accept(null);
+                        return;
+                    }
+                } catch (Exception e) {
+                    callback.accept(null);
+                    return;
+                }
+            }
             callback.accept(exactOnline);
             return;
         }
@@ -409,6 +442,30 @@ public abstract class ModerationCommandBase {
         } catch (Exception ignored) {
         }
         if (cached != null) {
+            // Vanish-oracle guard for the cached path too: the cached profile
+            // may belong to a currently online-vanished player (exact-online
+            // missed on case/race) — same null-pretence as above.
+            if (sender instanceof Player viewer) {
+                try {
+                    var vanishManager = plugin.getVanishManager();
+                    Player onlineForCached = null;
+                    try {
+                        onlineForCached = cached.getPlayer();
+                        if (onlineForCached == null && cached.getUniqueId() != null) {
+                            onlineForCached = Bukkit.getPlayer(cached.getUniqueId());
+                        }
+                    } catch (Exception ignored) {
+                    }
+                    if (onlineForCached != null && vanishManager != null
+                            && vanishManager.isVanished(onlineForCached) && !vanishManager.canSee(viewer, onlineForCached)) {
+                        callback.accept(null);
+                        return;
+                    }
+                } catch (Exception e) {
+                    callback.accept(null);
+                    return;
+                }
+            }
             callback.accept(cached);
             return;
         }
@@ -427,7 +484,33 @@ public abstract class ModerationCommandBase {
                 resolved = null;
             }
             OfflinePlayer finalResolved = resolved;
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalResolved));
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                // Post-resolve oracle guard (covers the race where the target
+                // vanished between the pre-checks and now, same pattern as
+                // TeamManager#denyVanishedOracleResolved).
+                if (finalResolved != null && sender instanceof Player viewer) {
+                    try {
+                        var vanishManager = plugin.getVanishManager();
+                        Player onlineNow = null;
+                        try {
+                            onlineNow = finalResolved.getPlayer();
+                            if (onlineNow == null && finalResolved.getUniqueId() != null) {
+                                onlineNow = Bukkit.getPlayer(finalResolved.getUniqueId());
+                            }
+                        } catch (Exception ignored) {
+                        }
+                        if (onlineNow != null && vanishManager != null
+                                && vanishManager.isVanished(onlineNow) && !vanishManager.canSee(viewer, onlineNow)) {
+                            callback.accept(null);
+                            return;
+                        }
+                    } catch (Exception e) {
+                        callback.accept(null);
+                        return;
+                    }
+                }
+                callback.accept(finalResolved);
+            });
         });
     }
 

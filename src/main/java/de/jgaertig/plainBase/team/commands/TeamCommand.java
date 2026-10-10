@@ -164,6 +164,12 @@ public class TeamCommand implements BasicCommand {
             usage(sender, spec);
             return;
         }
+        // Surplus args are never silently ignored: /team invite a b extra
+        // must show usage instead of acting on a prefix.
+        if (idx < args.length) {
+            usage(sender, spec);
+            return;
+        }
 
         Player player = sender instanceof Player p ? p : null;
         switch (actionName) {

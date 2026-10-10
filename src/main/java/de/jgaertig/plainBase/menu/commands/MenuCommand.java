@@ -28,7 +28,15 @@ public class MenuCommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.menu", false)) {
+        // Root-config read under the central configLock (same monitor as
+        // PlainBaseCommand toggle/suggest): the instance is fetched INSIDE the
+        // lock since reloadConfig() may swap it at any time.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.menu", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
@@ -46,12 +54,21 @@ public class MenuCommand implements BasicCommand {
             return;
         }
 
-        if (!menuConfig.getBoolean("menu.enabled", true)) {
+        // Locked reads: writers mutate under synchronized(config), so reads
+        // must hold the same instance monitor (YamlConfiguration is not
+        // thread-safe). Snapshot the flags, message outside the lock.
+        boolean menuEnabled;
+        boolean menuCommandEnabled;
+        synchronized (menuConfig) {
+            menuEnabled = menuConfig.getBoolean("menu.enabled", true);
+            menuCommandEnabled = menuConfig.getBoolean("menu.commands.menu.enabled", true);
+        }
+        if (!menuEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>The menu system has been disabled."));
             return;
         }
 
-        if (!menuConfig.getBoolean("menu.commands.menu.enabled", true)) {
+        if (!menuCommandEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }
@@ -69,7 +86,7 @@ public class MenuCommand implements BasicCommand {
         switch (args[0].toLowerCase(Locale.ROOT)) {
             case "new" -> {
                 if (!checkPermission(player, "plainbase.menu.new")) return;
-                if (args.length < 2) {
+                if (args.length != 2) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/menu new <name>"));
                     return;
                 }
@@ -91,7 +108,7 @@ public class MenuCommand implements BasicCommand {
             }
             case "delete" -> {
                 if (!checkPermission(player, "plainbase.menu.delete")) return;
-                if (args.length < 2) {
+                if (args.length != 2) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/menu delete <name>"));
                     return;
                 }
@@ -107,7 +124,7 @@ public class MenuCommand implements BasicCommand {
             }
             case "open" -> {
                 if (!checkPermission(player, "plainbase.menu.open")) return;
-                if (args.length < 2) {
+                if (args.length != 2) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/menu open <name>"));
                     return;
                 }
@@ -184,8 +201,15 @@ public class MenuCommand implements BasicCommand {
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
         // Mirror execute() guards: no suggestions when the module is off or unavailable.
+        // Root-config read under the central configLock (instance inside the
+        // lock, see execute() above); module flags under the instance monitor.
         try {
-            if (!plugin.getConfig().getBoolean("modules.menu", false)) return List.of();
+            boolean moduleEnabled;
+            synchronized (plugin.getConfigLock()) {
+                FileConfiguration rootCfg = plugin.getConfig();
+                moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.menu", false);
+            }
+            if (!moduleEnabled) return List.of();
         } catch (Exception e) {
             return List.of();
         }
@@ -194,8 +218,10 @@ public class MenuCommand implements BasicCommand {
         MenuManager suggestManager = plugin.getMenuManager();
         if (suggestConfig == null || suggestManager == null) return List.of();
         try {
-            if (!suggestConfig.getBoolean("menu.enabled", true)) return List.of();
-            if (!suggestConfig.getBoolean("menu.commands.menu.enabled", true)) return List.of();
+            synchronized (suggestConfig) {
+                if (!suggestConfig.getBoolean("menu.enabled", true)) return List.of();
+                if (!suggestConfig.getBoolean("menu.commands.menu.enabled", true)) return List.of();
+            }
         } catch (Exception e) {
             return List.of();
         }

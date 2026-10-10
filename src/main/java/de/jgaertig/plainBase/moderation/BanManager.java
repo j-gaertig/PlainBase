@@ -121,7 +121,7 @@ public class BanManager {
                 plugin.getLogger().warning("Invalid storage.refresh-interval-seconds, using 30s: " + e.getMessage());
             }
         }
-        seconds = Math.max(5, seconds);
+        seconds = Math.min(3600, Math.max(5, seconds));
         try {
             refreshTask = Bukkit.getAsyncScheduler().runAtFixedRate(plugin, task -> refreshCacheBlocking(), seconds, seconds, TimeUnit.SECONDS);
         } catch (Exception e) {
@@ -288,6 +288,15 @@ public class BanManager {
         return db.findLastIpByName(name);
     }
 
+    /**
+     * UUID-based last-IP lookup (stable across name changes, exact PK match).
+     * Preferred whenever the target UUID is known — see
+     * ModerationDatabase#findLastIpByUuid.
+     */
+    public String findLastIpByUuidStrict(UUID uuid) throws SQLException {
+        return db.findLastIpByUuid(uuid);
+    }
+
     // ---- Async mutations — always call back via the global region scheduler ----
 
     /**
@@ -428,7 +437,10 @@ public class BanManager {
     }
 
     public void recordKickAsync(UUID uuid, String name, String reason, UUID staffUuid, String staffName, Runnable onDone) {
-        if (!plugin.isEnabled()) return;
+        if (!plugin.isEnabled()) {
+            if (onDone != null) complete(onDone);
+            return;
+        }
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             // Blocking insert outside the lock; only the cache add below is
             // guarded (same pattern as tryBanAsync — see there).
@@ -619,8 +631,14 @@ public class BanManager {
      * Keeps the in-memory snapshot consistent when a live DB check found a row
      * the cache doesn't have yet (e.g. banned from another server on shared
      * MySQL). Must be called while holding {@code mutationLock}.
+     * <p>
+     * Synthetic fail-closed records (id == -1, produced by
+     * ModerationDatabase#findActiveBan/findActiveIpBan for corrupt rows) are
+     * never cached: they carry no real row id and must not leak into banlist,
+     * baninfo or the unban guards.
      */
     private void cacheLiveBan(BanRecord live) {
+        if (live == null || live.id() == -1) return;
         boolean known = bansCache.stream().anyMatch(r -> r.id() == live.id());
         if (!known) {
             bansCache.add(live);
@@ -629,6 +647,7 @@ public class BanManager {
     }
 
     private void cacheLiveIpBan(IpBanRecord live) {
+        if (live == null || live.id() == -1) return;
         boolean known = ipBansCache.stream().anyMatch(r -> r.id() == live.id());
         if (!known) ipBansCache.add(live);
     }

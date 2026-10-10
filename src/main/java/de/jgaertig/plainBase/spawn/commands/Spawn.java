@@ -24,12 +24,23 @@ public class Spawn implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.spawn", false)) {
+        // Root-config read under the central configLock (same monitor as
+        // PlainBaseCommand toggle/suggest): the instance is fetched INSIDE the
+        // lock since reloadConfig() may swap it at any time.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.spawn", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
 
-        if (plugin.getSpawnConfig() == null) {
+        // Single snapshot, reused below (never re-fetched: a reload between
+        // the checks could otherwise hand back a different/null instance).
+        FileConfiguration spawnConfig = plugin.getSpawnConfig();
+        if (spawnConfig == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
             return;
         }
@@ -40,11 +51,9 @@ public class Spawn implements BasicCommand {
         }
 
         // Snapshot + locked read: writers mutate under synchronized(config).
-        FileConfiguration spawnConfig = plugin.getSpawnConfig();
-        if (spawnConfig == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
-            return;
-        }
+        // Reuses the spawnConfig snapshot above (never re-fetched: a reload
+        // between the checks could otherwise hand back null).
+        FileConfiguration config = spawnConfig;
         boolean commandEnabled;
         synchronized (spawnConfig) {
             commandEnabled = spawnConfig.getBoolean("commands.spawn.enabled", true);
@@ -56,6 +65,11 @@ public class Spawn implements BasicCommand {
 
         if (!(sender instanceof Player player)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command can only be executed by players."));
+            return;
+        }
+
+        if (!(args.length == 0)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/spawn"));
             return;
         }
 
@@ -78,7 +92,6 @@ public class Spawn implements BasicCommand {
         // under the lock — world lookup and teleport happen outside it.
         // Reuses the spawnConfig snapshot above (never re-fetched: a reload
         // between the checks could otherwise hand back null).
-        FileConfiguration config = spawnConfig;
         final String worldName;
         final double rawX;
         final double rawY;

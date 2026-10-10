@@ -76,7 +76,9 @@ public class TeleportListener implements Listener {
             checkAndCancel(event.getPlayer(), "move");
             return;
         }
-        if (from.distanceSquared(to) < 0.01) return;
+        if (from.distanceSquared(to) < 1e-6
+                && Float.compare(from.getYaw(), to.getYaw()) == 0
+                && Float.compare(from.getPitch(), to.getPitch()) == 0) return;
 
         checkAndCancel(event.getPlayer(), "move");
     }

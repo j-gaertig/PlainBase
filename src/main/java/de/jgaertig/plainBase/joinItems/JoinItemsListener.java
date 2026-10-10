@@ -102,9 +102,10 @@ public class JoinItemsListener implements Listener {
             }
 
             // Re-give dupe guard: if an exemplar of this key is already
-            // anywhere in the inventory, skip the re-give (covers moved
-            // originals after /clear or death).
-            if (requiredFlag != null && inventoryHasJoinItemKey(player, key)) {
+            // anywhere in the inventory, skip the give (covers moved
+            // originals after /clear or death, and the plain join path so a
+            // reload/rejoin never hands out a duplicate).
+            if (inventoryHasJoinItemKey(player, key)) {
                 continue;
             }
 
@@ -174,8 +175,16 @@ public class JoinItemsListener implements Listener {
             // diamonds). Only place the join item on an empty slot unless the
             // config explicitly opts in via items.<key>.overwrite: true.
             boolean overwrite = itemsSection.getBoolean(key + ".overwrite", false);
+            ItemStack existing = player.getInventory().getItem(slot);
+            // M2: overwrite:true must not re-place the identical item — if the
+            // slot already carries the same PDC key, skip instead of setItem.
+            // Depth 2 covers bundle/shulker nesting so a bundle in the slot
+            // is not destroyed.
+            if (existing != null && !existing.getType().isAir()
+                    && stackHasJoinItemKey(existing, key, 2)) {
+                continue;
+            }
             if (!overwrite) {
-                ItemStack existing = player.getInventory().getItem(slot);
                 if (existing != null && !existing.getType().isAir()) {
                     continue;
                 }
@@ -387,6 +396,19 @@ public class JoinItemsListener implements Listener {
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)
+    public void onBlockPlace(org.bukkit.event.block.BlockPlaceEvent event) {
+        // L3: a join item must never be consumed by placing it as a block
+        // (same smuggling path as hopper/crafting guards above).
+        try {
+            if (isJoinItem(event.getItemInHand())) {
+                event.setCancelled(true);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check join item block-place guard: " + e.getMessage());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onInteractEntity(PlayerInteractEntityEvent event) {
         // Placing a join item into an item frame would smuggle it out of
         // the protected inventory.
@@ -432,7 +454,7 @@ public class JoinItemsListener implements Listener {
         if (rawMessage == null) return;
         String[] args = rawMessage.trim().split("\\s+");
         if (args.length == 0) return;
-        Player target = (args.length == 1) ? sender : resolveReGiveTarget(args[1]);
+        Player target = (args.length == 1) ? sender : resolveReGiveTarget(args[1], sender);
         if (target != null && target.isOnline()) {
             // Only re-give to self, or to others with explicit admin rights.
             // Without this check, "/clear <other>" from any player would hand
@@ -455,16 +477,19 @@ public class JoinItemsListener implements Listener {
      * Resolves the /clear re-give target by name. Selectors (@a/@p/@r/@s/@e,
      * incl. "@p[...]" args) resolve to null — they must never trigger a
      * re-give (resolving them would either hit the wrong player or silently
-     * skip, and mass-clear re-gives would duplicate items). Exact first:
+     * skip, and mass-clear re-gives would duplicate items). Exact match only:
      * Bukkit#getPlayer does prefix matching and could hand items to the
-     * wrong player on a typo.
+     * wrong player on a typo, so only getPlayerExact is used. L1: "@s"
+     * always maps to the sender, plain "@p" maps to the sender as well
+     * (nearest player to self); any other "@" selector stays null.
      */
-    private static Player resolveReGiveTarget(String name) {
-        if (name == null || name.startsWith("@")) return null;
-        Player exact = Bukkit.getPlayerExact(name);
-        if (exact != null) return exact;
+    private static Player resolveReGiveTarget(String name, Player sender) {
+        if (name == null) return null;
+        if (name.equals("@s")) return sender;
+        if (name.equals("@p")) return sender;
+        if (name.startsWith("@")) return null;
         try {
-            return Bukkit.getPlayer(name);
+            return Bukkit.getPlayerExact(name);
         } catch (Exception e) {
             return null;
         }
@@ -527,8 +552,8 @@ public class JoinItemsListener implements Listener {
     }
 
     /**
-     * PDC-key check for one stack incl. shulker nesting (max depth 2).
-     * Never throws: meta casts are guarded, failures return false.
+     * PDC-key check for one stack incl. shulker nesting and bundle contents
+     * (max depth 2). Never throws: meta casts are guarded, failures return false.
      */
     private boolean stackHasJoinItemKey(ItemStack stack, String key, int depth) {
         try {
@@ -542,6 +567,18 @@ public class JoinItemsListener implements Listener {
             }
             if (depth <= 0 || !stack.hasItemMeta()) return false;
             ItemMeta meta = stack.getItemMeta();
+            // L2: bundles can smuggle join items like shulkers — recurse into
+            // BundleMeta contents with the same depth budget.
+            if (meta instanceof org.bukkit.inventory.meta.BundleMeta bundleMeta) {
+                try {
+                    for (ItemStack nested : bundleMeta.getItems()) {
+                        if (stackHasJoinItemKey(nested, key, depth - 1)) return true;
+                    }
+                } catch (Exception e) {
+                    return false;
+                }
+                return false;
+            }
             if (!(meta instanceof org.bukkit.inventory.meta.BlockStateMeta blockMeta)) return false;
             org.bukkit.block.BlockState state;
             try {

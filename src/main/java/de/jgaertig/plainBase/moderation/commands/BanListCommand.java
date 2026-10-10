@@ -40,6 +40,10 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
         }
 
         int page = 1;
+        if (args.length > 1) {
+            sender.sendMessage(render("<yellow>Usage: <gray>/banlist [page]"));
+            return;
+        }
         if (args.length >= 1) {
             try {
                 long parsed = Long.parseLong(args[0]);

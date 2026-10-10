@@ -11,6 +11,7 @@ import org.bukkit.entity.Player;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -144,11 +145,20 @@ public class TPAManager {
         // The full session reserves its own identity for the conditional
         // expiry remove below: the timeout must never delete a NEWER session
         // installed after accept/deny/cancel re-armed the slot.
+        // L4: capture display names synchronously — the async expiry below
+        // must never call Bukkit/Player getters off-thread.
+        String capturedTargetName;
+        try {
+            capturedTargetName = target.getName();
+        } catch (Exception e) {
+            capturedTargetName = "player";
+        }
         AtomicReference<TpaSession> expectedRef = new AtomicReference<>();
         ScheduledTask timeoutTask;
         try {
+            final String expiryTargetName = capturedTargetName;
             timeoutTask = Bukkit.getAsyncScheduler().runDelayed(plugin, (t) -> {
-                expireRequest(targetId, expectedRef.get());
+                expireRequest(targetId, expectedRef.get(), expiryTargetName);
             }, timeoutSeconds, TimeUnit.SECONDS);
         } catch (Exception e) {
             activeSessions.remove(targetId, stub);
@@ -301,17 +311,19 @@ public class TPAManager {
      * is foreign and must survive — hence remove(key, expected), never an
      * unconditional remove.
      */
-    private void expireRequest(UUID targetId, TpaSession expected) {
+    private void expireRequest(UUID targetId, TpaSession expected, String targetName) {
         if (targetId == null || expected == null) return;
         if (!activeSessions.remove(targetId, expected)) return;
         TpaSession session = expected;
 
         // Runs on the async scheduler: only the map removal above may happen
         // here. Bukkit API calls (sendMessage) must run on entity threads.
+        // L4: names were captured synchronously at schedule time — never call
+        // target.getName()/requester.getName() here off-thread.
         UUID requesterId = session.requesterId();
         Player target = Bukkit.getPlayer(targetId);
         Player requester = Bukkit.getPlayer(requesterId);
-        String targetName = target != null ? target.getName() : null;
+        final String safeTargetName = targetName != null ? targetName : "player";
 
         if (target != null) {
             try {
@@ -328,19 +340,12 @@ public class TPAManager {
             try {
                 requester.getScheduler().run(plugin, (t) -> {
                     if (requester.isOnline()) {
-                        requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request to " + esc(targetName != null ? targetName : "player") + " expired."));
+                        requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request to " + esc(safeTargetName) + " expired."));
                     }
                 }, null);
             } catch (Exception e) {
                 plugin.getLogger().fine("Failed to notify TPA expiry for " + requesterId + ": " + e.getMessage());
             }
-        }
-    }
-
-    private void clearSession(UUID targetId) {
-        TpaSession session = activeSessions.remove(targetId);
-        if (session != null && session.timeoutTask() != null) {
-            session.timeoutTask().cancel();
         }
     }
 
@@ -434,9 +439,10 @@ public class TPAManager {
         // owns anything to clean up.
         if (activeWarmups.putIfAbsent(toTeleportId, warmupTask) != null) {
             warmupTask.cancel();
-            // Conditional removes only: never delete the winner's mapping.
-            warmupPartners.remove(toTeleportId, destinationId);
-            warmupPartners.remove(destinationId, toTeleportId);
+            // Loser owns nothing: the winner's warmupPartners mapping (same
+            // key when the destination matches) must never be touched here.
+            // A conditional remove(toTeleportId, destinationId) would delete
+            // the winner's mapping on equal destinations — so no cleanup.
             toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: a teleport is already in progress."));
             return;
         }
@@ -490,6 +496,67 @@ public class TPAManager {
             }
             Location destLoc = destination.getLocation().clone();
             if (destLoc.getWorld() == null) return;
+            // L5: center on the destination block (+0.5 XZ, RTP pattern) so the
+            // arrival never clips into a block edge. Up-scan for headroom:
+            // feet + head must be passable with solid ground below, up to 5
+            // blocks up; otherwise abort instead of arriving suffocated.
+            // Runs on the destination region thread — getBlock() is legal here.
+            final Location arrivalLoc;
+            try {
+                destLoc.setX(destLoc.getBlockX() + 0.5);
+                destLoc.setZ(destLoc.getBlockZ() + 0.5);
+                Location found = null;
+                for (int i = 0; i <= 5; i++) {
+                    Location cand = destLoc.clone().add(0, i, 0);
+                    if (cand.getWorld() == null) break;
+                    // Max-height guard: head block must stay below the limit.
+                    int maxH;
+                    int minH;
+                    try {
+                        maxH = cand.getWorld().getMaxHeight();
+                        minH = cand.getWorld().getMinHeight();
+                    } catch (Exception e) {
+                        break;
+                    }
+                    if (cand.getY() + 1 >= maxH) break;
+                    if (cand.getY() < minH) continue;
+                    org.bukkit.block.Block feet;
+                    org.bukkit.block.Block head;
+                    org.bukkit.block.Block ground;
+                    try {
+                        feet = cand.getBlock();
+                        head = cand.clone().add(0, 1, 0).getBlock();
+                        ground = cand.clone().add(0, -1, 0).getBlock();
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    if (!feet.isPassable() || !head.isPassable()) continue;
+                    // Ground stability: never arrive floating — the block
+                    // below must be solid to stand on.
+                    try {
+                        if (!ground.getType().isSolid()) continue;
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    found = cand;
+                    break;
+                }
+                if (found == null) {
+                    try {
+                        toTeleport.getScheduler().run(plugin, tAbort -> {
+                            if (toTeleport.isOnline()) {
+                                toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed: destination is obstructed."));
+                            }
+                        }, null);
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to notify obstructed TPA destination: " + e.getMessage());
+                    }
+                    return;
+                }
+                arrivalLoc = found;
+            } catch (Exception ignored) {
+                return;
+            }
             toTeleport.getScheduler().run(plugin, t2 -> {
                 if (!toTeleport.isOnline() || !destination.isOnline()) return;
                 try {
@@ -502,7 +569,7 @@ public class TPAManager {
                     }
                     return;
                 }
-                toTeleport.teleportAsync(destLoc).thenAccept(success -> {
+                toTeleport.teleportAsync(arrivalLoc).thenAccept(success -> {
                     // thenAccept runs off the entity thread: hop back onto the
                     // teleporting player's EntityScheduler for sendMessage
                     // (Folia Region/EntityScheduler is retained everywhere).
@@ -792,6 +859,29 @@ public class TPAManager {
         }
     }
 
+    /**
+     * Crash-safe write: dump to "{@code <uuid>.yml.tmp}" in the same directory,
+     * then move over the target atomically (non-atomic fallback where the file
+     * system lacks atomic-move support), so a crash can never leave a
+     * half-written playerdata file behind. Same pattern as
+     * VanishManager#saveAtomically (shared per-UUID lock above already
+     * serializes against concurrent vanish saves of the same file).
+     * Never throws.
+     */
+    private void saveAtomically(YamlConfiguration config, File target, UUID uuid) {
+        File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
+        try {
+            config.save(tmp);
+            try {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
+        }
+    }
+
     private void savePlayerData(UUID uuid, boolean tpAutoStatus) {
         CompletableFuture<Void> pending = new CompletableFuture<>();
         plugin.trackPendingSave(pending);
@@ -817,11 +907,7 @@ public class TPAManager {
                     config.set("tpauto", tpAutoStatus);
                     // Hier können später weitere Werte mit config.set(...) hinzugefügt werden
 
-                    try {
-                        config.save(file);
-                    } catch (IOException e) {
-                        plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
-                    }
+                    saveAtomically(config, file, uuid);
                 }
             } finally {
                 pending.complete(null);

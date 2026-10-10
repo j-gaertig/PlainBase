@@ -282,6 +282,12 @@ public class RTPManager {
 
         int y;
         try {
+            // L6: this runs on the destination region thread (via
+            // RegionScheduler.execute with chunkX/chunkZ above), so the chunk's
+            // region is owned here and getHighestBlockYAt needs no extra hop.
+            // A getChunkAtAsync preload before measuring would be the async
+            // alternative, but would restructure the attempt chain — kept as a
+            // documented option, no risky refactor.
             y = world.getHighestBlockYAt(finalX, finalZ);
         } catch (Exception e) {
             scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);

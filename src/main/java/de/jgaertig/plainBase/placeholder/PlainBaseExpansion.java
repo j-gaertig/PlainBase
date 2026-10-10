@@ -16,18 +16,26 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
     private final PlainBase plugin;
 
     /**
-     * P3: cache of the last constructed expansion instance. PlainBase#onDisable
-     * currently unregisters via {@code new PlainBaseExpansion(this).unregister()}
-     * (works because PlaceholderAPI unregisters by identifier, but same-instance
-     * unregister is more robust). This field keeps the live instance so future
-     * code can unregister exactly the registered object; the static helper below
-     * is null-guarded and never throws.
+     * P3: cache of the last successfully registered expansion instance.
+     * Set only after register()==true via {@link #setLastInstance} (called from
+     * PlainBase#registerPlaceholderExpansion) — a merely constructed but never
+     * registered instance must never become the cached one. This field keeps
+     * the live instance so future code can unregister exactly the registered
+     * object; the static helper below is null-guarded and never throws.
      */
     private static volatile PlainBaseExpansion lastInstance;
 
     public PlainBaseExpansion(PlainBase plugin) {
         this.plugin = plugin;
-        lastInstance = this;
+    }
+
+    /**
+     * BUG-7: records the live instance after a successful register(). Called
+     * only when register()==true so unregisterCached() always targets the
+     * actually registered object.
+     */
+    public static void setLastInstance(PlainBaseExpansion instance) {
+        lastInstance = instance;
     }
 
     /**

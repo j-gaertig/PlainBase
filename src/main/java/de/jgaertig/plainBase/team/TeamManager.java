@@ -35,10 +35,12 @@ import java.util.function.Consumer;
  * Vanilla limitation: a scoreboard entry (player name) can only belong to
  * ONE scoreboard team at a time. With {@code max-teams-per-player: 1}
  * (the default) this never matters. If an admin raises that limit, only the
- * player's most-recently-joined team is mirrored to the scoreboard for
- * selector purposes — all other memberships are still fully tracked by
- * PlainBase (roles, /team info, placeholders), just not selector-visible
- * at the same time. This is a Minecraft engine constraint, not a bug.
+ * player's alphabetically-first (sorted-first) team is mirrored to the
+ * scoreboard for selector purposes — all other memberships are still fully
+ * tracked by PlainBase (roles, /team info, placeholders), just not
+ * selector-visible at the same time. This is a Minecraft engine constraint,
+ * not a bug. Sorted-first is used everywhere (add/accept, remove/leave,
+ * reload, join-resync) so the mirrored team is always deterministic.
  */
 public class TeamManager {
 
@@ -84,6 +86,11 @@ public class TeamManager {
     // Cleanup (sync/shutdown) only ever unregisters names in this set, so stale
     // "pb_*" teams from other plugins or previous instances are never touched.
     private final Set<String> ownedScoreboardTeams = ConcurrentHashMap.newKeySet();
+
+    // Foreign-entry warnings are emitted only once per entry name: without
+    // this every mutation (add/kick/reload) would re-warn for every foreign
+    // entry, spamming the log. Repeats are logged at fine level instead.
+    private final Set<String> warnedForeignEntries = ConcurrentHashMap.newKeySet();
 
     // Per-player lock for invite/accept/deny/add/request check-then-act
     // sequences, so two concurrent actions for the same player cannot both
@@ -199,6 +206,30 @@ public class TeamManager {
             try {
                 this.scoreboard = Bukkit.getScoreboardManager() != null ? Bukkit.getScoreboardManager().getMainScoreboard() : null;
                 syncScoreboardTeamDefinitions();
+                // Deterministic mirror for multi-team players: exactly one
+                // team per player (sorted-first) is entered into the mirror
+                // map BEFORE any entry is added, so refreshScoreboardEntries()
+                // adds each online player to exactly that team. Looping per
+                // team without this would add a multi-team player to every
+                // team they are in (last-write-wins on nondeterministic map
+                // order, plus foreign-team warn-spam on every reload).
+                try {
+                    Set<UUID> allPlayers = new HashSet<>();
+                    for (Map<UUID, Role> members : memberships.values()) {
+                        if (members != null) allPlayers.addAll(members.keySet());
+                    }
+                    for (UUID uuid : allPlayers) {
+                        if (uuid == null) continue;
+                        String first = getPlayerTeams(uuid).stream().sorted().findFirst().orElse(null);
+                        if (first == null) continue;
+                        String sbName = scoreboardName(first);
+                        if (sbName.startsWith("pb_") && ownedScoreboardTeams.contains(sbName)) {
+                            scoreboardTeamOf.put(uuid, first);
+                        }
+                    }
+                } catch (Exception e) {
+                    plugin.getLogger().fine("Could not pre-assign scoreboard mirror teams: " + e.getMessage());
+                }
                 for (String teamId : memberships.keySet()) refreshScoreboardEntries(teamId);
             } catch (Exception e) {
                 plugin.getLogger().severe("Team module: scoreboard mirror disabled (" + e.getMessage()
@@ -976,7 +1007,10 @@ public class TeamManager {
             player.sendMessage(msg(cfgSnapshot, "your-teams-empty"));
             return;
         }
-        for (String teamId : memberOf) {
+        // Sorted for deterministic output (set iteration order is unspecified).
+        List<String> sorted = new ArrayList<>(memberOf);
+        sorted.sort(String.CASE_INSENSITIVE_ORDER);
+        for (String teamId : sorted) {
             Role role = getRole(player.getUniqueId(), teamId);
             if (role == null) continue;
             player.sendMessage(msg(cfgSnapshot, "your-teams-entry", "team", teamId, "role", role.name().toLowerCase(Locale.ROOT)));
@@ -994,7 +1028,11 @@ public class TeamManager {
         // invites for deleted definitions are skipped here (purged on accept).
         Set<String> live = invites.get(player.getUniqueId());
         if (live != null) {
-            for (String teamId : new HashSet<>(live)) {
+            // Sorted for deterministic reminder order (set iteration order is
+            // unspecified); snapshot copy since invites may mutate concurrently.
+            List<String> sorted = new ArrayList<>(new HashSet<>(live));
+            sorted.sort(String.CASE_INSENSITIVE_ORDER);
+            for (String teamId : sorted) {
                 if (teamId == null || !teamExists(teamId)) continue;
                 try {
                     player.sendMessage(msg(cfgSnapshot, "invite-reminder-on-join", "team", teamId));
@@ -1013,9 +1051,17 @@ public class TeamManager {
      * they've already seen).
      */
     public void resyncScoreboard(Player player) {
-        for (String teamId : getPlayerTeams(player.getUniqueId())) {
-            assignScoreboardTeam(player.getUniqueId(), teamId);
+        if (player == null) return;
+        // BUG-3: single deterministic mirror entry — a scoreboard entry can only
+        // be on ONE team, so looping over all memberships is last-write-wins on
+        // nondeterministic set order. Sorted findFirst matches removeMember().
+        UUID uuid;
+        try {
+            uuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
         }
+        getPlayerTeams(uuid).stream().sorted().findFirst().ifPresent(teamId -> assignScoreboardTeam(uuid, teamId));
     }
 
     /**
@@ -1255,7 +1301,17 @@ public class TeamManager {
         }
         saveMemberships();
         refreshScoreboardEntries(teamId);
-        assignScoreboardTeam(uuid, teamId);
+        // Deterministic mirror: a scoreboard entry can only be on ONE team,
+        // so mirror the alphabetically-first (sorted-first) team — not
+        // bluntly the just-added id. Matches removeMember()/resyncScoreboard()
+        // and the constructor pre-assignment, so the mirrored team never
+        // flips depending on call order.
+        String mirror = teamId;
+        try {
+            mirror = getPlayerTeams(uuid).stream().sorted().findFirst().orElse(teamId);
+        } catch (Exception ignored) {
+        }
+        assignScoreboardTeam(uuid, mirror);
     }
 
     private long countAdmins(String teamId) {
@@ -1403,8 +1459,47 @@ public class TeamManager {
             // Only the team currently assigned for selector purposes gets the entry
             // (a scoreboard entry can only be on one team at a time).
             if (!teamId.equals(scoreboardTeamOf.getOrDefault(uuid, teamId))) continue;
-            String name = lookupName(uuid);
-            if (name != null) team.addEntry(name);
+            // BUG-2: offline members have no scoreboard entry — lookupName falls
+            // back to the UUID string, which must never be added as an entry.
+            Player online;
+            try {
+                online = Bukkit.getPlayer(uuid);
+            } catch (Exception e) {
+                continue;
+            }
+            if (online == null) continue;
+            String name;
+            try {
+                name = online.getName();
+            } catch (Exception e) {
+                continue;
+            }
+            if (name == null || name.equals(uuid.toString())) continue;
+            // Never hijack a foreign team — an entry already on another
+            // scoreboard team belongs to someone else (other plugin / manual).
+            // Warned only once per entry (see warnedForeignEntries) so every
+            // mutation does not re-spam the log for the same entry.
+            try {
+                Team existing = scoreboard.getEntryTeam(name);
+                if (existing != null && !existing.equals(team)) {
+                    String warnMsg = "Scoreboard entry '" + name + "' is already on foreign team '"
+                            + existing.getName() + "' — skipping mirror for team '" + teamId + "'.";
+                    if (warnedForeignEntries.add(name)) {
+                        plugin.getLogger().warning(warnMsg);
+                    } else {
+                        plugin.getLogger().fine(warnMsg);
+                    }
+                    continue;
+                }
+            } catch (Exception e) {
+                plugin.getLogger().fine("Could not check entry team for '" + name + "': " + e.getMessage());
+                continue;
+            }
+            try {
+                team.addEntry(name);
+            } catch (Exception e) {
+                plugin.getLogger().warning("Could not add scoreboard entry '" + name + "' to '" + team.getName() + "': " + e.getMessage());
+            }
         }
     }
 
@@ -1452,7 +1547,9 @@ public class TeamManager {
 
     private File dataFile(String name) {
         File folder = new File(plugin.getDataFolder(), "data/teams");
-        if (!folder.exists()) folder.mkdirs();
+        if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
+            plugin.getLogger().warning("Could not create directory: " + folder);
+        }
         return new File(folder, name);
     }
 
@@ -1542,11 +1639,19 @@ public class TeamManager {
             // new complete map, never a half-cleared one.
             Map<String, Map<UUID, Role>> fresh = new ConcurrentHashMap<>();
             FileConfiguration members = membersConfig;
+            // Orphan warnings are summarized (one line per load, not one per
+            // team) so a team.yml cleanup with many stale teams does not spam.
+            int orphanMemberTeams = 0;
+            int orphanMembers = 0;
             for (String teamId : members.getKeys(false)) {
                 String norm = teamId.toLowerCase(Locale.ROOT);
                 if (!teams.containsKey(norm)) {
-                    plugin.getLogger().warning("Team state for unknown team '" + teamId
-                            + "' ignored (no such definition in modules/team.yml); orphan membership dropped.");
+                    orphanMemberTeams++;
+                    try {
+                        ConfigurationSection orphanSection = members.getConfigurationSection(teamId);
+                        if (orphanSection != null) orphanMembers += orphanSection.getKeys(false).size();
+                    } catch (Exception ignored) {
+                    }
                     continue;
                 }
                 ConfigurationSection section = members.getConfigurationSection(teamId);
@@ -1560,12 +1665,17 @@ public class TeamManager {
                 }
                 if (!map.isEmpty()) fresh.put(norm, map);
             }
+            if (orphanMemberTeams > 0) {
+                plugin.getLogger().warning("Dropped orphan memberships for " + orphanMemberTeams
+                        + " unknown team(s) (" + orphanMembers + " entries, no such definition in modules/team.yml).");
+            }
             memberships = fresh;
         }
 
         synchronized (INVITES_LOCK) {
             Map<UUID, Set<String>> fresh = new ConcurrentHashMap<>();
             FileConfiguration invitesConfig = invitesConfigStrict;
+            int orphanInvites = 0;
             for (String uuidStr : invitesConfig.getKeys(false)) {
                 try {
                     UUID uuid = UUID.fromString(uuidStr);
@@ -1573,8 +1683,7 @@ public class TeamManager {
                     for (String team : invitesConfig.getStringList(uuidStr)) {
                         String norm = team.toLowerCase(Locale.ROOT);
                         if (!teams.containsKey(norm)) {
-                            plugin.getLogger().warning("Pending invite for unknown team '" + team
-                                    + "' ignored (player " + uuidStr + "); orphan dropped.");
+                            orphanInvites++;
                             continue;
                         }
                         set.add(norm);
@@ -1583,17 +1692,26 @@ public class TeamManager {
                 } catch (IllegalArgumentException ignored) {
                 }
             }
+            if (orphanInvites > 0) {
+                plugin.getLogger().warning("Dropped " + orphanInvites
+                        + " orphan invite(s) for unknown teams (no such definition in modules/team.yml).");
+            }
             invites = fresh;
         }
 
         synchronized (REQUESTS_LOCK) {
             Map<String, Set<UUID>> fresh = new ConcurrentHashMap<>();
             FileConfiguration requestsConfig = requestsConfigStrict;
+            int orphanRequestTeams = 0;
+            int orphanRequests = 0;
             for (String teamId : requestsConfig.getKeys(false)) {
                 String norm = teamId.toLowerCase(Locale.ROOT);
                 if (!teams.containsKey(norm)) {
-                    plugin.getLogger().warning("Pending join requests for unknown team '" + teamId
-                            + "' ignored; orphans dropped.");
+                    orphanRequestTeams++;
+                    try {
+                        orphanRequests += requestsConfig.getStringList(teamId).size();
+                    } catch (Exception ignored) {
+                    }
                     continue;
                 }
                 Set<UUID> set = ConcurrentHashMap.newKeySet();
@@ -1604,6 +1722,10 @@ public class TeamManager {
                     }
                 }
                 if (!set.isEmpty()) fresh.put(norm, set);
+            }
+            if (orphanRequestTeams > 0) {
+                plugin.getLogger().warning("Dropped " + orphanRequests + " orphan join request(s) for "
+                        + orphanRequestTeams + " unknown team(s) (no such definition in modules/team.yml).");
             }
             requests = fresh;
         }

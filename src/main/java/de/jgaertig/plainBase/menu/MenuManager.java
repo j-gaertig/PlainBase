@@ -271,57 +271,100 @@ public class MenuManager {
         }
     }
 
+    /**
+     * Opens a menu for a player. Only the definition lookup runs on the
+     * calling thread (the map is a ConcurrentHashMap); inventory creation and
+     * {@code player.openInventory} hop onto the player's entity scheduler via
+     * {@link #openMenuInternal(Player, MenuDefinition)} — on Folia inventory
+     * access is entity-thread-only and would throw otherwise. Returns false
+     * synchronously when the menu does not exist (or scheduling fails); a
+     * menu that exists always returns true, failures inside the scheduled
+     * task are logged and messaged to the player there.
+     */
     public boolean openMenu(Player player, String name) {
         if (player == null || name == null) return false;
         MenuDefinition menu = menus.get(name);
         if (menu == null) return false;
 
-        int size = normalizeSize(menu.size());
-        MenuHolder holder = new MenuHolder(name);
-        Component title;
         try {
-            title = menu.buildTitle(plugin, player);
+            player.getScheduler().run(plugin, t -> openMenuInternal(player, menu), null);
         } catch (Exception e) {
-            plugin.getLogger().warning("Failed to build title for menu '" + name + "', using plain text.");
-            title = Component.text(name);
-        }
-        Inventory inv;
-        try {
-            inv = Bukkit.createInventory(holder, size, title);
-        } catch (Exception e) {
-            plugin.getLogger().warning("Failed to open menu '" + name + "' for " + player.getName() + ": " + e.getMessage());
+            plugin.getLogger().warning("Failed to schedule menu '" + name + "' for " + player.getName() + ": " + e.getMessage());
             return false;
         }
-        holder.setInventory(inv);
+        return true;
+    }
 
-        // fill empty slots with fill material
-        if (menu.fillMaterial() != null) {
-            ItemStack fill = new ItemStack(menu.fillMaterial());
-            ItemMeta meta = fill.getItemMeta();
-            if (meta != null) {
-                meta.displayName(Component.empty());
-                fill.setItemMeta(meta);
+    /**
+     * Entity-thread body of {@link #openMenu(Player, String)}: runs on the
+     * player's entity scheduler, so Bukkit#createInventory and
+     * Player#openInventory are always thread-correct (Folia scheduler
+     * retained). Never throws.
+     */
+    private void openMenuInternal(Player player, MenuDefinition menu) {
+        String name = menu.name();
+        try {
+            if (!player.isOnline()) return;
+            int size = normalizeSize(menu.size());
+            MenuHolder holder = new MenuHolder(name);
+            Component title;
+            try {
+                title = menu.buildTitle(plugin, player);
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to build title for menu '" + name + "', using plain text.");
+                title = Component.text(name);
             }
-            for (int i = 0; i < size; i++) {
-                inv.setItem(i, fill.clone());
-            }
-        }
-
-        Map<Integer, ItemDefinition> defs = menu.items();
-        if (defs != null) {
-            for (Map.Entry<Integer, ItemDefinition> entry : defs.entrySet()) {
-                if (entry == null || entry.getKey() == null) continue;
-                if (entry.getKey() < 0 || entry.getKey() >= size) continue;
+            Inventory inv;
+            try {
+                inv = Bukkit.createInventory(holder, size, title);
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to open menu '" + name + "' for " + player.getName() + ": " + e.getMessage());
                 try {
-                    inv.setItem(entry.getKey(), buildItem(plugin, player, entry.getValue()));
-                } catch (Exception e) {
-                    plugin.getLogger().warning("Failed to build item for menu '" + name + "', skipping slot " + entry.getKey() + ".");
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not open menu!"));
+                } catch (Exception ignored) {
+                }
+                return;
+            }
+            holder.setInventory(inv);
+
+            // fill empty slots with fill material
+            if (menu.fillMaterial() != null) {
+                ItemStack fill = new ItemStack(menu.fillMaterial());
+                ItemMeta meta = fill.getItemMeta();
+                if (meta != null) {
+                    meta.displayName(Component.empty());
+                    fill.setItemMeta(meta);
+                }
+                for (int i = 0; i < size; i++) {
+                    inv.setItem(i, fill.clone());
                 }
             }
-        }
 
-        player.openInventory(inv);
-        return true;
+            Map<Integer, ItemDefinition> defs = menu.items();
+            if (defs != null) {
+                for (Map.Entry<Integer, ItemDefinition> entry : defs.entrySet()) {
+                    if (entry == null || entry.getKey() == null) continue;
+                    if (entry.getKey() < 0 || entry.getKey() >= size) continue;
+                    try {
+                        inv.setItem(entry.getKey(), buildItem(plugin, player, entry.getValue()));
+                    } catch (Exception e) {
+                        plugin.getLogger().warning("Failed to build item for menu '" + name + "', skipping slot " + entry.getKey() + ".");
+                    }
+                }
+            }
+
+            try {
+                player.openInventory(inv);
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to open menu '" + name + "' for " + player.getName() + ": " + e.getMessage());
+                try {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not open menu!"));
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to open menu '" + name + "' for " + player.getName() + ": " + e.getMessage());
+        }
     }
 
     private ItemStack buildItem(PlainBase plugin, Player viewer, ItemDefinition def) {
@@ -409,7 +452,11 @@ public class MenuManager {
         // ORDERING (must stay close-before-reload): close open GUIs FIRST,
         // then reload. After reloadMenus() the MenuListener no longer knows
         // this menu, and clicks in a stale open inventory would no longer be
-        // cancelled (item-takeout exploit). Never swap these two calls.
+        // cancelled (item-takeout exploit). Command path uses best-effort +
+        // fire-and-forget (no .get() wait): this runs on a region thread and
+        // a blocking SyncAwait stalls the tick (the delete stall). Never swap.
+        // The blocking SyncAwait lives only in stopModules(block=true).
+        closeAllMenusSyncBestEffort();
         closeAllMenus();
         reloadMenus();
     }

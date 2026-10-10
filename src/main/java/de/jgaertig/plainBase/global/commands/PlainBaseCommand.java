@@ -86,6 +86,7 @@ public class PlainBaseCommand implements BasicCommand {
                             // so a reference taken before the lock can be stale.
                             org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
                             if (rootCfg == null) {
+                                if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
                                 sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
                                 return;
                             }
@@ -109,19 +110,26 @@ public class PlainBaseCommand implements BasicCommand {
                             }
                         }
                         if (!found) {
+                            if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
                             return;
                         }
+                        // NOTE: saveConfig() rewrites config.yml WITHOUT comments
+                        // (Bukkit YamlConfiguration strips them) — the toggle
+                        // itself is unaffected, but hand-written comments are
+                        // lost. The success message below says so.
                         plugin.saveConfig();
                         plugin.reloadModules();
                         if (sender instanceof Player player && !player.isOnline()) return;
                         String statusColor = newStatus ? "<green>enabled" : "<red>disabled";
                         sender.sendMessage(plugin.getMiniMessage().deserialize(
                                 "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
+                                        + " <dark_gray>(Note: saving removed comments from config.yml.)"
                         ));
                     } catch (Exception e) {
                         plugin.getLogger().log(Level.WARNING, "Failed to toggle module " + moduleName, e);
                         try {
+                            if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
                         } catch (Exception ignored) {
                         }
@@ -301,16 +309,32 @@ public class PlainBaseCommand implements BasicCommand {
                         return "NOT_FOUND";
                     }
 
-                    JsonElement latest = versions.get(0);
-                    if (latest.isJsonObject() && latest.getAsJsonObject().has("version_number")) {
-                        return latest.getAsJsonObject().get("version_number").getAsString();
+                    // Update channel follows the running version: pre-release
+                    // builds ("-Beta"/"-Alpha") also accept "beta" entries so
+                    // beta users are offered updates; stable builds only ever
+                    // see "release" entries.
+                    boolean acceptBeta = isPreRelease(plugin.getPluginMeta().getVersion());
+                    for (JsonElement element : versions) {
+                        if (!element.isJsonObject()) continue;
+                        var obj = element.getAsJsonObject();
+                        if (!obj.has("version_number")) continue;
+                        String type = obj.has("version_type") && !obj.get("version_type").isJsonNull()
+                                ? obj.get("version_type").getAsString() : "";
+                        if ("release".equalsIgnoreCase(type)) {
+                            return obj.get("version_number").getAsString();
+                        }
+                        if (acceptBeta && "beta".equalsIgnoreCase(type)) {
+                            return obj.get("version_number").getAsString();
+                        }
                     }
+                    return "NOT_FOUND";
                 }
             } else {
                 plugin.getLogger().warning("Modrinth API responded with HTTP " + responseCode);
                 // Drain + close the error stream so the connection can be reused.
+                // Bounded read (OOM guard): never buffer an unbounded error body.
                 try (InputStream err = conn.getErrorStream()) {
-                    if (err != null) err.readAllBytes();
+                    if (err != null) err.readNBytes(8 * 1024);
                 } catch (Exception ignored) {
                 }
             }
@@ -327,28 +351,84 @@ public class PlainBaseCommand implements BasicCommand {
     /**
      * Segment-wise version compare ("1.10" &gt; "1.9"): a plain
      * equalsIgnoreCase would miss equivalent-but-differently-cased versions
-     * and a double compare would collapse 1.10 to 1.1. Non-numeric segments
-     * count as 0, missing segments count as 0.
+     * and a double compare would collapse 1.10 to 1.1. A dash-separated
+     * pre-release suffix ("0.3.0-Beta") is stripped from the numeric core
+     * and compared afterwards: same core means pre-release &lt; release, two
+     * pre-releases compare their tags case-insensitively. Non-numeric
+     * segments count as 0, missing segments count as 0. Kept identical in
+     * PlainBase/GlobalListener.
      */
     private static int compareVersions(String a, String b) {
-        String left = a == null ? "0" : a;
-        String right = b == null ? "0" : b;
-        String[] pa = left.split("\\.", -1);
-        String[] pb = right.split("\\.", -1);
+        String left = a == null ? "0" : a.trim();
+        String right = b == null ? "0" : b.trim();
+        String preL = preReleaseOf(left);
+        String preR = preReleaseOf(right);
+        String[] pa = coreOf(left).split("\\.", -1);
+        String[] pb = coreOf(right).split("\\.", -1);
         int len = Math.max(pa.length, pb.length);
         for (int i = 0; i < len; i++) {
             int na = parseSegment(i < pa.length ? pa[i] : "0");
             int nb = parseSegment(i < pb.length ? pb[i] : "0");
             if (na != nb) return Integer.compare(na, nb);
         }
+        boolean hasPreL = preL != null;
+        boolean hasPreR = preR != null;
+        if (hasPreL != hasPreR) return hasPreL ? -1 : 1;
+        if (hasPreL) {
+            int cmp = preL.compareToIgnoreCase(preR);
+            if (cmp != 0) return Integer.compare(cmp, 0);
+        }
         return 0;
     }
 
+    /** Numeric core of a version: everything before the first '-' or '+'. */
+    private static String coreOf(String version) {
+        String core = version;
+        int dash = core.indexOf('-');
+        if (dash >= 0) core = core.substring(0, dash);
+        int plus = core.indexOf('+');
+        if (plus >= 0) core = core.substring(0, plus);
+        core = core.trim();
+        return core.isEmpty() ? "0" : core;
+    }
+
+    /** Pre-release tag of a version ("0.3.0-Beta" -&gt; "Beta"), or null. */
+    private static String preReleaseOf(String version) {
+        int dash = version.indexOf('-');
+        if (dash < 0) return null;
+        String pre = version.substring(dash + 1);
+        int plus = pre.indexOf('+');
+        if (plus >= 0) pre = pre.substring(0, plus);
+        pre = pre.trim();
+        return pre.isEmpty() ? null : pre;
+    }
+
+    /**
+     * True when the running version is a pre-release ("-Beta"/"-Alpha"):
+     * the update check then also accepts "beta" Modrinth entries, otherwise
+     * only "release" entries are offered.
+     */
+    private static boolean isPreRelease(String version) {
+        if (version == null) return false;
+        String lower = version.toLowerCase(Locale.ROOT);
+        return lower.contains("-alpha") || lower.contains("-beta");
+    }
+
     private static int parseSegment(String segment) {
+        String s = segment == null ? "" : segment.trim();
         try {
-            return Integer.parseInt(segment.trim());
+            return Integer.parseInt(s);
         } catch (NumberFormatException e) {
-            return 0;
+            // Tolerate trailing junk ("3rc1" -> 3): compare the leading
+            // numeric prefix instead of collapsing the whole segment to 0.
+            int end = 0;
+            while (end < s.length() && Character.isDigit(s.charAt(end))) end++;
+            if (end == 0) return 0;
+            try {
+                return Integer.parseInt(s.substring(0, end));
+            } catch (NumberFormatException e2) {
+                return 0;
+            }
         }
     }
 }

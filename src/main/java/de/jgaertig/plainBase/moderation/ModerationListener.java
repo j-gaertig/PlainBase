@@ -7,6 +7,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -34,7 +35,7 @@ public class ModerationListener implements Listener {
         this.plugin = plugin;
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onPreLogin(AsyncPlayerPreLoginEvent event) {
         if (!plugin.getConfig().getBoolean("modules.moderation", false)) return;
 
@@ -125,6 +126,10 @@ public class ModerationListener implements Listener {
             // (NPEs can no longer bypass bans: all nullable ban/template fields
             // are handled via Objects.toString below, so this path only triggers
             // on genuine DB/runtime failures.)
+            // Corrupt-row mapping errors do NOT reach this fail-open path: they
+            // are handled fail-closed inside ModerationDatabase#findActiveBan /
+            // #findActiveIpBan, which log loudly and return a synthetic active
+            // record (deny) instead of throwing.
         }
     }
 
@@ -137,7 +142,7 @@ public class ModerationListener implements Listener {
      * window and kicks. The next login is additionally covered by the pre-login
      * live DB check.
      */
-    @EventHandler
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onJoin(PlayerJoinEvent event) {
         if (!plugin.getConfig().getBoolean("modules.moderation", false)) return;
 
@@ -163,9 +168,16 @@ public class ModerationListener implements Listener {
         String ipbanTemplate = Objects.toString(
                 modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
                 "<red>Your IP address is banned.");
+        final String banTemplateAsync = banTemplate;
+        final String tempbanTemplateAsync = tempbanTemplate;
+        final String ipbanTemplateAsync = ipbanTemplate;
 
         Player player = event.getPlayer();
-        UUID uuid = player.getUniqueId();
+        // Only the UUID plus immutable snapshots (Strings/booleans) cross into
+        // the async closure below — never the Player entity itself (Folia:
+        // entity access off-thread is unsafe). The target is re-resolved via
+        // Bukkit.getPlayer(uuid) back on a region thread before kicking.
+        final UUID uuid = player.getUniqueId();
         String rawIp = player.getAddress() == null ? null : player.getAddress().getAddress() == null
                 ? null : player.getAddress().getAddress().getHostAddress();
         String ip = ModerationCommandBase.normalizeIp(rawIp);
@@ -176,8 +188,12 @@ public class ModerationListener implements Listener {
 
         // Live re-check off the join thread (blocking JDBC must never run on
         // it, and no full cache scan per join). Pre-login already covered the
-        // normal case, so a DB failure here fails open with a warning — except
-        // the UUID check, which cheaply falls back to the cache.
+        // normal case, so a DB failure here fails open with a warning — with a
+        // cheap cache fallback for BOTH the UUID and the IP check.
+        // (Corrupt-row mapping errors are already fail-closed inside
+        // ModerationDatabase#findActiveBan/findActiveIpBan, which return a
+        // synthetic active record instead of throwing — only genuine DB
+        // failures reach the fail-open path here.)
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             BanRecord ban = null;
             if (banEnabledAsync) {
@@ -186,7 +202,13 @@ public class ModerationListener implements Listener {
                 } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().warning("Could not re-check ban status on join for "
                             + Objects.toString(playerName, "?") + ": " + e.getMessage());
-                    ban = manager.getActiveBan(uuid).orElse(null);
+                    try {
+                        ban = manager.getActiveBan(uuid).orElse(null);
+                    } catch (RuntimeException cacheEx) {
+                        plugin.getLogger().warning("Could not fall back to ban cache on join for "
+                                + Objects.toString(playerName, "?") + ": " + cacheEx.getMessage());
+                        ban = null;
+                    }
                 }
             }
 
@@ -197,6 +219,22 @@ public class ModerationListener implements Listener {
                 } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().warning("Could not re-check IP ban status on join for "
                             + Objects.toString(playerName, "?") + ": " + e.getMessage());
+                    // Same cache fallback as the UUID path above: a DB hiccup
+                    // must not fail open when the cache already knows the ban.
+                    try {
+                        long nowFallback = System.currentTimeMillis();
+                        for (IpBanRecord cached : manager.getActiveIpBans()) {
+                            if (cached != null && cached.ip() != null && cached.ip().equals(ipAsync)
+                                    && cached.isActive(nowFallback)) {
+                                ipBan = cached;
+                                break;
+                            }
+                        }
+                    } catch (RuntimeException cacheEx) {
+                        plugin.getLogger().warning("Could not fall back to IP-ban cache on join for "
+                                + Objects.toString(playerName, "?") + ": " + cacheEx.getMessage());
+                        ipBan = null;
+                    }
                 }
             }
             if (ban == null && ipBan == null) return;
@@ -206,13 +244,37 @@ public class ModerationListener implements Listener {
             Component screen;
             try {
                 screen = ban != null
-                        ? renderBanScreen(ban, ban.isPermanent() ? banTemplate : tempbanTemplate)
-                        : renderIpBanScreen(ipBan, ipbanTemplate);
+                        ? renderBanScreen(ban, ban.isPermanent() ? banTemplateAsync : tempbanTemplateAsync)
+                        : renderIpBanScreen(ipBan, ipbanTemplateAsync);
             } catch (RuntimeException e) {
                 plugin.getLogger().warning("Could not build join kick screen, using fallback: " + e.getMessage());
                 screen = Component.text("You are banned.");
             }
-            kickSafely(player, screen);
+            final Component finalScreen = screen;
+            // Back onto a region thread for all Bukkit API: re-resolve the
+            // target by UUID (the joining player may have logged off already —
+            // then getPlayer returns null/offline and nothing happens).
+            try {
+                Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                    Player target;
+                    try {
+                        target = Bukkit.getPlayer(uuid);
+                    } catch (RuntimeException e) {
+                        plugin.getLogger().warning("Could not resolve joining player for kick: " + e.getMessage());
+                        return;
+                    }
+                    if (target == null || !target.isOnline()) return;
+                    try {
+                        kickSafely(target, finalScreen);
+                    } catch (RuntimeException e) {
+                        plugin.getLogger().warning("Could not kick banned player on join "
+                                + Objects.toString(playerName, "?") + ": " + e.getMessage());
+                    }
+                });
+            } catch (RuntimeException e) {
+                plugin.getLogger().warning("Could not schedule join kick for "
+                        + Objects.toString(playerName, "?") + ": " + e.getMessage());
+            }
         });
     }
 
@@ -222,9 +284,19 @@ public class ModerationListener implements Listener {
      * on the target player's own region thread.
      */
     private void kickSafely(Player target, Component message) {
-        target.getScheduler().run(plugin, t -> {
-            if (target.isOnline()) target.kick(message);
-        }, null);
+        try {
+            target.getScheduler().run(plugin, t -> {
+                try {
+                    if (target.isOnline()) target.kick(message);
+                } catch (RuntimeException e) {
+                    plugin.getLogger().warning("Could not kick player "
+                            + Objects.toString(target.getUniqueId(), "?") + ": " + e.getMessage());
+                }
+            }, null);
+        } catch (RuntimeException e) {
+            plugin.getLogger().warning("Could not schedule kick for player "
+                    + Objects.toString(target.getUniqueId(), "?") + ": " + e.getMessage());
+        }
     }
 
     private Component banKickMessage(BanRecord ban, FileConfiguration modConfig) {

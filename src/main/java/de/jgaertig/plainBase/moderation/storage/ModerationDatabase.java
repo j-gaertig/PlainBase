@@ -67,7 +67,7 @@ public class ModerationDatabase {
             int port = modCfg.getInt("storage.mysql.port", 3306);
             String database = modCfg.getString("storage.mysql.database", "plainbase");
             boolean useSsl = modCfg.getBoolean("storage.mysql.useSSL", false);
-            if (host == null || !(host.matches("[A-Za-z0-9._-]+") || host.matches("\\[[0-9a-fA-F:.]+\\]"))) {
+            if (host == null || !(host.matches("[A-Za-z0-9._-]+") || host.matches("\\[[0-9a-fA-F:.]+\\]") || host.matches("[0-9a-fA-F:.]+"))) {
                 plugin.getLogger().warning("Invalid storage.mysql.host '" + host + "', falling back to localhost");
                 host = "localhost";
             }
@@ -79,7 +79,13 @@ public class ModerationDatabase {
                 plugin.getLogger().warning("Invalid storage.mysql.port '" + port + "', falling back to 3306");
                 port = 3306;
             }
-            config.setJdbcUrl("jdbc:mysql://" + host + ":" + port + "/" + database
+            // Bare IPv6 literals (e.g. ::1) must be bracketed in the JDBC URL
+            // (jdbc:mysql://[::1]:3306/db) — the config accepts them naked.
+            String jdbcHost = host;
+            if (!jdbcHost.startsWith("[") && jdbcHost.matches("[0-9a-fA-F:.]+") && jdbcHost.contains(":")) {
+                jdbcHost = "[" + jdbcHost + "]";
+            }
+            config.setJdbcUrl("jdbc:mysql://" + jdbcHost + ":" + port + "/" + database
                     + "?useSSL=" + useSsl + "&characterEncoding=utf8mb4"
                     + "&connectTimeout=5000&socketTimeout=10000");
             config.setUsername(modCfg.getString("storage.mysql.username", "root"));
@@ -144,7 +150,7 @@ public class ModerationDatabase {
         dataSource = new HikariDataSource(config);
 
         try {
-            try (Connection conn = dataSource.getConnection()) {
+            try (Connection conn = connOrThrow()) {
                 if (!mysql) {
                     // WAL + busy timeout reduce "database is locked" errors under
                     // concurrent load. Best-effort: failures must not break setup.
@@ -221,13 +227,36 @@ public class ModerationDatabase {
         // of NPE-ing SQL construction mid-reload.
         FileConfiguration modCfg = plugin.getModerationConfig();
         String p = mysql && modCfg != null ? modCfg.getString("storage.mysql.table-prefix", "pb_") : "pb_";
-        if (p == null) p = "pb_";
+        if (p == null || p.isEmpty()) return "pb_";
         // Table prefix is concatenated into SQL — never allow anything that
         // could break out of the identifier (SQL injection via config).
-        if (!p.matches("[A-Za-z0-9_]*")) {
+        // Strict: must start with a letter or underscore, then letters,
+        // digits or underscores (empty falls back to pb_ above, digit-start
+        // is rejected).
+        if (!p.matches("[A-Za-z_][A-Za-z0-9_]*")) {
             throw new IllegalArgumentException("Invalid moderation table prefix: " + p);
         }
         return p;
+    }
+
+    /**
+     * Null/closed guard for every public DB access: fails with a clear
+     * SQLException (callers fail open/closed explicitly) instead of NPE-ing
+     * on a null or closed pool after a failed connect or during reload.
+     */
+    private void ensureConnected() throws SQLException {
+        HikariDataSource ds = dataSource;
+        if (ds == null || ds.isClosed()) {
+            throw new SQLException("Moderation database is not connected.");
+        }
+    }
+
+    private Connection connOrThrow() throws SQLException {
+        HikariDataSource ds = dataSource;
+        if (ds == null || ds.isClosed()) {
+            throw new SQLException("Moderation database is not connected.");
+        }
+        return ds.getConnection();
     }
 
     private void createTables(Connection conn) throws SQLException {
@@ -325,6 +354,10 @@ public class ModerationDatabase {
      * that keeps VARCHAR(255) simply stays subject to the insert-time
      * {@link #clip255} guard on key columns, while overlong TEXT values would
      * fail loudly on that one legacy table instead of silently truncating.
+     * <p>
+     * Guarded via INFORMATION_SCHEMA: columns already TEXT (or MEDIUMTEXT /
+     * LONGTEXT, which are TEXT-compatible supersets) are skipped, so a second
+     * start issues no ALTER at all instead of re-modifying every table.
      */
     private void migrateTextColumns(Connection conn) {
         if (!mysql) return;
@@ -343,14 +376,49 @@ public class ModerationDatabase {
                 {p + "ip_bans", "reason", "staff_name", "unbanned_by_name"},
         };
         for (String[] table : tables) {
-            StringBuilder sql = new StringBuilder("ALTER TABLE " + table[0]);
+            List<String> pending = new ArrayList<>();
             for (int i = 1; i < table.length; i++) {
-                sql.append(i == 1 ? " MODIFY COLUMN " : ", MODIFY COLUMN ").append(table[i]).append(" TEXT");
+                try {
+                    if (needsTextMigration(conn, table[0], table[i])) pending.add(table[i]);
+                } catch (SQLException | RuntimeException e) {
+                    // Inspection failed (permissions, transient error): fall
+                    // back to attempting the MODIFY so legacy tables still get
+                    // migrated — the ALTER failure below is logged, never fatal.
+                    plugin.getLogger().warning("Could not inspect " + table[0] + "." + table[i]
+                            + ", attempting migration anyway: " + e.getMessage());
+                    pending.add(table[i]);
+                }
+            }
+            if (pending.isEmpty()) continue;
+            StringBuilder sql = new StringBuilder("ALTER TABLE " + table[0]);
+            for (int i = 0; i < pending.size(); i++) {
+                sql.append(i == 0 ? " MODIFY COLUMN " : ", MODIFY COLUMN ").append(pending.get(i)).append(" TEXT");
             }
             try (Statement st = conn.createStatement()) {
                 st.executeUpdate(sql.toString());
             } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().warning("Could not migrate " + table[0] + " text columns to TEXT: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * True when the given MySQL column is not yet TEXT-family (TEXT, MEDIUMTEXT
+     * or LONGTEXT all satisfy the migration goal) and therefore still needs a
+     * MODIFY COLUMN. Missing tables/columns return false (nothing to migrate —
+     * createTables owns creation).
+     */
+    private boolean needsTextMigration(Connection conn, String tableName, String columnName) throws SQLException {
+        String sql = "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, tableName);
+            ps.setString(2, columnName);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return false;
+                String type = rs.getString(1);
+                if (type == null) return true;
+                String t = type.trim().toLowerCase(java.util.Locale.ROOT);
+                return !(t.equals("text") || t.equals("mediumtext") || t.equals("longtext"));
             }
         }
     }
@@ -546,10 +614,11 @@ public class ModerationDatabase {
     // ---- Writes ----
 
     public BanRecord insertBan(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long duration) throws SQLException {
+        ensureConnected();
         long bannedAt = System.currentTimeMillis();
         String sql = "INSERT INTO " + prefixChecked() + "bans (uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = connOrThrow();
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
             ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, name);
@@ -577,10 +646,17 @@ public class ModerationDatabase {
      * {@code SELECT ... FOR UPDATE} transaction would be the full fix.
      *
      * @return number of rows revoked; unban success is decided on this count
+     * @deprecated Legacy revoke-by-key: revokes every unrevoked row for the
+     *             key, including a ban inserted concurrently after the guard
+     *             check. Retained only for external API compatibility — new
+     *             code must use {@link #revokeBansByIds} with a guard-time
+     *             snapshot from {@link #findActiveBanIds} instead.
      */
+    @Deprecated
     public int revokeBan(UUID uuid, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        ensureConnected();
         String sql = "UPDATE " + prefixChecked() + "bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE uuid = ? AND revoked = 0";
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, staffName);
             ps.setLong(3, unbannedAt);
@@ -598,9 +674,10 @@ public class ModerationDatabase {
      * No schema change, same columns, PreparedStatement only.
      */
     public List<Integer> findActiveBanIds(UUID uuid, long now) throws SQLException {
+        ensureConnected();
         String sql = "SELECT id FROM " + prefixChecked() + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
         List<Integer> ids = new ArrayList<>();
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setLong(2, now);
             try (ResultSet rs = ps.executeQuery()) {
@@ -619,6 +696,7 @@ public class ModerationDatabase {
      * @return number of rows revoked; unban success is decided on this count
      */
     public int revokeBansByIds(List<Integer> ids, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        ensureConnected();
         if (ids == null || ids.isEmpty()) return 0;
         StringBuilder sql = new StringBuilder("UPDATE " + prefixChecked()
                 + "bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE id IN (");
@@ -627,7 +705,7 @@ public class ModerationDatabase {
             sql.append("?");
         }
         sql.append(") AND revoked = 0");
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, staffName);
             ps.setLong(3, unbannedAt);
@@ -637,9 +715,10 @@ public class ModerationDatabase {
     }
 
     public KickRecord insertKick(UUID uuid, String name, String reason, UUID staffUuid, String staffName) throws SQLException {
+        ensureConnected();
         long kickedAt = System.currentTimeMillis();
         String sql = "INSERT INTO " + prefixChecked() + "kicks (uuid, name, reason, staff_uuid, staff_name, kicked_at) VALUES (?, ?, ?, ?, ?, ?)";
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = connOrThrow();
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
             ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, name);
@@ -657,12 +736,17 @@ public class ModerationDatabase {
     }
 
     public IpBanRecord insertIpBan(String ip, String reason, UUID staffUuid, String staffName, long duration) throws SQLException {
+        ensureConnected();
         long bannedAt = System.currentTimeMillis();
+        // Single storedIp for DB and cache record: the clip255 guard must apply
+        // to both, otherwise the in-memory record diverges from the persisted
+        // row (lookup by exact IP would miss after a clip).
+        String storedIp = clip255(ip, "ip_ban.ip");
         String sql = "INSERT INTO " + prefixChecked() + "ip_bans (ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = connOrThrow();
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, clip255(ip, "ip_ban.ip"));
+            ps.setString(1, storedIp);
             ps.setString(2, reason);
             ps.setString(3, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(4, staffName);
@@ -673,7 +757,7 @@ public class ModerationDatabase {
             try (ResultSet keys = ps.getGeneratedKeys()) {
                 id = keys.next() ? keys.getInt(1) : -1;
             }
-            return new IpBanRecord(id, ip, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
+            return new IpBanRecord(id, storedIp, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
         }
     }
 
@@ -683,10 +767,17 @@ public class ModerationDatabase {
      * {@link #revokeBan}.
      *
      * @return number of rows revoked
+     * @deprecated Legacy revoke-by-key: revokes every unrevoked row for the
+     *             key, including an IP ban inserted concurrently after the
+     *             guard check. Retained only for external API compatibility —
+     *             new code must use {@link #revokeIpBansByIds} with a
+     *             guard-time snapshot from {@link #findActiveIpBanIds} instead.
      */
+    @Deprecated
     public int revokeIpBan(String ip, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        ensureConnected();
         String sql = "UPDATE " + prefixChecked() + "ip_bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE ip = ? AND revoked = 0";
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, staffName);
             ps.setLong(3, unbannedAt);
@@ -701,9 +792,10 @@ public class ModerationDatabase {
      * {@link #findActiveIpBan}, but every matching id. No schema change.
      */
     public List<Integer> findActiveIpBanIds(String ip, long now) throws SQLException {
+        ensureConnected();
         String sql = "SELECT id FROM " + prefixChecked() + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
         List<Integer> ids = new ArrayList<>();
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, ip);
             ps.setLong(2, now);
             try (ResultSet rs = ps.executeQuery()) {
@@ -721,6 +813,7 @@ public class ModerationDatabase {
      * @return number of rows revoked
      */
     public int revokeIpBansByIds(List<Integer> ids, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        ensureConnected();
         if (ids == null || ids.isEmpty()) return 0;
         StringBuilder sql = new StringBuilder("UPDATE " + prefixChecked()
                 + "ip_bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE id IN (");
@@ -729,7 +822,7 @@ public class ModerationDatabase {
             sql.append("?");
         }
         sql.append(") AND revoked = 0");
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, staffName);
             ps.setLong(3, unbannedAt);
@@ -739,6 +832,7 @@ public class ModerationDatabase {
     }
 
     public void trackPlayerIp(UUID uuid, String name, String ip) throws SQLException {
+        ensureConnected();
         String tablePrefix = prefixChecked();
         String sql = mysql
                 ? "INSERT INTO " + tablePrefix + "player_ips (uuid, name, last_ip, last_seen) VALUES (?, ?, ?, ?) " +
@@ -748,7 +842,7 @@ public class ModerationDatabase {
         long now = System.currentTimeMillis();
         String clippedName = clip255(name, "player_ips.name");
         String clippedIp = clip255(ip, "player_ips.last_ip");
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, clippedName);
             ps.setString(3, clippedIp);
@@ -764,9 +858,28 @@ public class ModerationDatabase {
      * @return the last known IP for a player name, or null if unknown/never seen
      */
     public String findLastIpByName(String name) throws SQLException {
+        ensureConnected();
         String sql = "SELECT last_ip FROM " + prefixChecked() + "player_ips WHERE LOWER(name) = LOWER(?) ORDER BY last_seen DESC LIMIT 1";
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    /**
+     * UUID-based variant of {@link #findLastIpByName}: stable across name
+     * changes, exact match on the primary key (no LOWER() scan). Preferred
+     * whenever the target UUID is known (e.g. BanInfo after resolveTarget).
+     *
+     * @return the last known IP for the UUID, or null if unknown/never seen
+     */
+    public String findLastIpByUuid(UUID uuid) throws SQLException {
+        ensureConnected();
+        String sql = "SELECT last_ip FROM " + prefixChecked() + "player_ips WHERE uuid = ? LIMIT 1";
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             try (ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? rs.getString(1) : null;
             }
@@ -790,15 +903,22 @@ public class ModerationDatabase {
     private static final long HISTORY_WINDOW_MILLIS = 90L * 24 * 60 * 60 * 1000;
 
     public List<BanRecord> loadAllBans() throws SQLException {
+        ensureConnected();
         List<BanRecord> result = new ArrayList<>();
         String tablePrefix = prefixChecked();
-        long cutoff = System.currentTimeMillis() - HISTORY_WINDOW_MILLIS;
+        long now = System.currentTimeMillis();
+        long cutoff = now - HISTORY_WINDOW_MILLIS;
+        // Active OR recent: the expiry predicate mirrors findActiveBan, so
+        // expired tempbans drop out of the cache once they are no longer
+        // recent (the old "revoked = 0" filter kept them forever). Recent
+        // covers history display (banned_at/unbanned_at within the window).
         String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM "
-                + tablePrefix + "bans WHERE revoked = 0 OR banned_at > ? OR unbanned_at > ?";
-        try (Connection conn = dataSource.getConnection();
+                + tablePrefix + "bans WHERE (revoked = 0 AND (duration < 0 OR (? - banned_at < duration))) OR banned_at > ? OR unbanned_at > ?";
+        try (Connection conn = connOrThrow();
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, cutoff);
+            ps.setLong(1, now);
             ps.setLong(2, cutoff);
+            ps.setLong(3, cutoff);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     try {
@@ -816,12 +936,13 @@ public class ModerationDatabase {
     }
 
     public List<KickRecord> loadAllKicks() throws SQLException {
+        ensureConnected();
         List<KickRecord> result = new ArrayList<>();
         String tablePrefix = prefixChecked();
         long cutoff = System.currentTimeMillis() - HISTORY_WINDOW_MILLIS;
         String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, kicked_at FROM "
                 + tablePrefix + "kicks WHERE kicked_at > ?";
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = connOrThrow();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setLong(1, cutoff);
             try (ResultSet rs = ps.executeQuery()) {
@@ -839,15 +960,20 @@ public class ModerationDatabase {
     }
 
     public List<IpBanRecord> loadAllIpBans() throws SQLException {
+        ensureConnected();
         List<IpBanRecord> result = new ArrayList<>();
         String tablePrefix = prefixChecked();
-        long cutoff = System.currentTimeMillis() - HISTORY_WINDOW_MILLIS;
+        long now = System.currentTimeMillis();
+        long cutoff = now - HISTORY_WINDOW_MILLIS;
+        // Same active-OR-recent filter as loadAllBans (see there): expired
+        // temp-IP-bans must not linger in the cache forever.
         String sql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM "
-                + tablePrefix + "ip_bans WHERE revoked = 0 OR banned_at > ? OR unbanned_at > ?";
-        try (Connection conn = dataSource.getConnection();
+                + tablePrefix + "ip_bans WHERE (revoked = 0 AND (duration < 0 OR (? - banned_at < duration))) OR banned_at > ? OR unbanned_at > ?";
+        try (Connection conn = connOrThrow();
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, cutoff);
+            ps.setLong(1, now);
             ps.setLong(2, cutoff);
+            ps.setLong(3, cutoff);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     try {
@@ -871,8 +997,15 @@ public class ModerationDatabase {
      * Authoritative, always-fresh check — queries the DB directly rather than
      * a local cache, so a ban issued on another server (MySQL backend) is
      * enforced immediately on THIS server's very next login attempt.
+     * <p>
+     * Fail-closed on corrupt rows: a mapping error (bad UUID, unexpected
+     * null) is logged loudly and returns a synthetic permanent record (deny),
+     * never null. Only genuine DB failures (SQLException) propagate and let
+     * the caller fail open. This separation keeps a single corrupt row from
+     * becoming a fail-open bypass for that player.
      */
     public BanRecord findActiveBan(UUID uuid, long now) throws SQLException {
+        ensureConnected();
         // Overflow-free expiry check: (? - banned_at < duration) never adds
         // two large longs (banned_at + duration could wrap for huge tempbans).
         // Exact uuid = ? comparison (no LOWER() on the column): all writes
@@ -880,24 +1013,48 @@ public class ModerationDatabase {
         // index on uuid is actually used on every login check.
         String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at " +
                 "FROM " + prefixChecked() + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 1";
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setLong(2, now);
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? mapBan(rs) : null;
+                if (!rs.next()) return null;
+                try {
+                    return mapBan(rs);
+                } catch (RuntimeException e) {
+                    plugin.getLogger().severe("Corrupt active ban row for " + uuid
+                            + ", denying login fail-closed: " + e.getMessage());
+                    return new BanRecord(-1, uuid, null,
+                            "Corrupt ban entry - login denied for safety. Contact an admin.",
+                            null, null, now, -1, false, null, null, 0L);
+                }
             }
         }
     }
 
+    /**
+     * Authoritative, always-fresh IP check — same fail-closed mapping contract
+     * as {@link #findActiveBan}: corrupt rows deny (synthetic permanent
+     * record), genuine DB failures throw (caller fails open).
+     */
     public IpBanRecord findActiveIpBan(String ip, long now) throws SQLException {
+        ensureConnected();
         // Overflow-free expiry check (same reasoning as findActiveBan).
         String sql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at " +
                 "FROM " + prefixChecked() + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 1";
-        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, ip);
             ps.setLong(2, now);
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? mapIpBan(rs) : null;
+                if (!rs.next()) return null;
+                try {
+                    return mapIpBan(rs);
+                } catch (RuntimeException e) {
+                    plugin.getLogger().severe("Corrupt active IP-ban row for " + ip
+                            + ", denying login fail-closed: " + e.getMessage());
+                    return new IpBanRecord(-1, ip,
+                            "Corrupt IP-ban entry - login denied for safety. Contact an admin.",
+                            null, null, now, -1, false, null, null, 0L);
+                }
             }
         }
     }

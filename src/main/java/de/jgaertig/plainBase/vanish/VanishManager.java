@@ -24,8 +24,40 @@ public class VanishManager {
 
     private final PlainBase plugin;
     private final Set<UUID> vanishedPlayers = ConcurrentHashMap.newKeySet();
-    private record PrevSelfState(boolean collidable, boolean silent, boolean invisible) {}
+    /**
+     * Freshly unvanished UUIDs with a pending false-flush: an unvanish writes
+     * {@code vanished:false} async (see savePlayerData) which may be cancelled
+     * on kill/reload before hitting disk — the file would then stay stale
+     * {@code true} and re-vanish on next join. flushSync() rewrites these
+     * explicitly (false, or delete when persistence is off) so an unvanish
+     * right before a kill can never leave stale true behind.
+     */
+    private final Set<UUID> dirtyUnvanished = ConcurrentHashMap.newKeySet();
+    public record PrevSelfState(boolean collidable, boolean silent, boolean invisible) {}
     private final Map<UUID, PrevSelfState> prevSelfStates = new ConcurrentHashMap<>();
+
+    /**
+     * BUG-1 carry-over: snapshot of pre-vanish self states for reload.
+     * PlainBase.stopModules() copies this before dropping the manager so
+     * setupVanish() can restore it into the fresh instance — a re-vanish
+     * after reload then keeps the ORIGINAL pre-vanish values via putIfAbsent
+     * instead of snapshotting the still-vanished flags.
+     */
+    public Map<UUID, PrevSelfState> copyPrevSelfStates() {
+        return new java.util.HashMap<>(prevSelfStates);
+    }
+
+    /**
+     * BUG-1 carry-over: restores states snapshotted from the previous manager.
+     * Must run before restoreVanishState() re-vanishes, so putIfAbsent keeps them.
+     */
+    public void restorePrevSelfStates(Map<UUID, PrevSelfState> src) {
+        if (src == null || src.isEmpty()) return;
+        for (Map.Entry<UUID, PrevSelfState> e : src.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null) continue;
+            prevSelfStates.putIfAbsent(e.getKey(), e.getValue());
+        }
+    }
 
     public VanishManager(PlainBase plugin) {
         this.plugin = plugin;
@@ -72,6 +104,7 @@ public class VanishManager {
     public void vanish(Player player) {
         if (player == null || !player.isOnline()) return;
         vanishedPlayers.add(player.getUniqueId());
+        dirtyUnvanished.remove(player.getUniqueId());
         applySelfState(player);
 
         // Hide this player from everyone who can't see through vanish.
@@ -97,6 +130,18 @@ public class VanishManager {
         // vanish() is called from the entity/region thread (command or join),
         // where nearby-entity lookups are safe. Guarded so a Folia/thread
         // violation can never break the vanish itself.
+        detargetMobs(player);
+
+        savePlayerData(player.getUniqueId(), true);
+    }
+
+    /**
+     * BUG-6 helper: de-target loop extracted from vanish() so loadPlayerData's
+     * player-scheduler continuation can reuse it (same entity-thread safety).
+     * Never throws.
+     */
+    private void detargetMobs(Player player) {
+        if (player == null) return;
         try {
             for (Entity entity : player.getWorld().getNearbyEntities(player.getLocation(), 32, 32, 32)) {
                 if (entity instanceof Mob mob && player.equals(mob.getTarget())) {
@@ -106,15 +151,26 @@ public class VanishManager {
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to de-target mobs for vanished player " + player.getName() + ": " + e.getMessage());
         }
-
-        savePlayerData(player.getUniqueId(), true);
     }
 
     public void unvanish(Player player) {
         if (player == null) return;
-        vanishedPlayers.remove(player.getUniqueId());
-        if (!player.isOnline()) return;
+        UUID uuid = player.getUniqueId();
+        if (!player.isOnline()) {
+            vanishedPlayers.remove(uuid);
+            prevSelfStates.remove(uuid);
+            // Still track for the false-flush: the async save below may be
+            // cancelled on kill before hitting disk (see flushSync).
+            dirtyUnvanished.add(uuid);
+            savePlayerData(uuid, false);
+            return;
+        }
+        // BUG-1 order: resetSelfState BEFORE removing from vanishedPlayers so
+        // its synchronous wasVanished capture still sees us as vanished (the
+        // fallback path depends on it — the async task runs after the remove).
         resetSelfState(player);
+        vanishedPlayers.remove(uuid);
+        dirtyUnvanished.add(uuid);
 
         // V1 race fix (mirror of vanish): show immediately AND keep the
         // scheduled follow-up via showTo.
@@ -274,6 +330,10 @@ public class VanishManager {
                 vanishedPlayers.add(uuid);
                 applySelfState(player);
 
+                // BUG-6: same de-target as vanish() — runs here on the player
+                // scheduler (entity thread), so nearby-entity lookups are safe.
+                detargetMobs(player);
+
                 for (Player viewer : Bukkit.getOnlinePlayers()) {
                     if (viewer.equals(player)) continue;
                     if (isVanished(viewer)) {
@@ -309,6 +369,7 @@ public class VanishManager {
                         // disabled — they would re-vanish the player if persistence is
                         // enabled later.
                         if (file.exists()) file.delete();
+                        dirtyUnvanished.remove(uuid);
                         return;
                     }
 
@@ -328,6 +389,9 @@ public class VanishManager {
                     config.set("vanished", vanished);
 
                     saveAtomically(config, file, uuid);
+                    // Successful false-write settles the dirty entry: a later
+                    // flushSync need not rewrite it (see dirtyUnvanished).
+                    if (!vanished) dirtyUnvanished.remove(uuid);
                 }
             } finally {
                 pending.complete(null);
@@ -340,6 +404,12 @@ public class VanishManager {
      * stopModules() after awaiting tracked async saves: async tasks may be
      * cancelled on disable/reload and their changes would be lost, so the
      * authoritative state is rewritten directly. Never throws.
+     * <p>
+     * Also flushes freshly-unvanished UUIDs (dirtyUnvanished) as
+     * {@code vanished:false} (or deletes their files when persistence is off)
+     * so an unvanish right before a kill cannot leave a stale {@code true}
+     * behind, and purges orphaned prevSelfStates snapshots for UUIDs no
+     * longer vanished so players who never rejoin cannot leak memory.
      */
     public void flushSync() {
         FileConfiguration vanishConfig;
@@ -375,6 +445,69 @@ public class VanishManager {
             } catch (Exception e) {
                 plugin.getLogger().fine("Failed to flush vanish state for " + uuid + ": " + e.getMessage());
             }
+        }
+        // Freshly-unvanished dirty set: rewrite false (or delete when
+        // persistence is off) unless re-vanished since. Consumed regardless
+        // so a second flush need not repeat it.
+        for (UUID uuid : new java.util.HashSet<>(dirtyUnvanished)) {
+            if (uuid == null) {
+                dirtyUnvanished.remove(null);
+                continue;
+            }
+            if (vanishedPlayers.contains(uuid)) {
+                dirtyUnvanished.remove(uuid);
+                continue;
+            }
+            try {
+                synchronized (PlayerDataLocks.lockFor(uuid)) {
+                    if (!persist) {
+                        try {
+                            File stale = getPlayerDataFile(uuid);
+                            if (stale.isFile() && !stale.delete()) {
+                                plugin.getLogger().fine("Could not delete stale vanish state for " + uuid);
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    } else {
+                        try {
+                            File file = getPlayerDataFileForWrite(uuid);
+                            YamlConfiguration config = new YamlConfiguration();
+                            if (file.isFile()) {
+                                try {
+                                    config.load(file);
+                                } catch (Exception ignored) {
+                                }
+                            }
+                            config.set("vanished", false);
+                            saveAtomically(config, file, uuid);
+                        } catch (Exception e) {
+                            plugin.getLogger().fine("Failed to flush unvanish state for " + uuid + ": " + e.getMessage());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to flush unvanish state for " + uuid + ": " + e.getMessage());
+            } finally {
+                dirtyUnvanished.remove(uuid);
+                try {
+                    prevSelfStates.remove(uuid);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        // Purge orphaned self-state snapshots for UUIDs no longer vanished
+        // (quit while vanished but never rejoined): without this each such
+        // player leaks one map entry forever.
+        try {
+            for (UUID uuid : new java.util.HashSet<>(prevSelfStates.keySet())) {
+                if (uuid != null && !vanishedPlayers.contains(uuid)) {
+                    try {
+                        if (Bukkit.getPlayer(uuid) == null) prevSelfStates.remove(uuid);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -426,15 +559,38 @@ public class VanishManager {
     }
 
     /**
-     * Quit cleanup: the in-memory entry is ALWAYS removed so
+     * Quit cleanup: the in-memory vanish entry is ALWAYS removed so
      * vanishedPlayers can never grow without bound (one stale UUID per
      * ever-vanished player). With persist-on-rejoin=true the file on disk
      * keeps the state — applyOnJoin() re-vanishes on the next join via
      * hasPersistedVanish(). No periodic purge (would be a feature).
+     * <p>
+     * The self-state snapshot is kept only when the player quit while
+     * vanished AND persistence is on (the rejoin re-vanish then restores the
+     * ORIGINAL pre-vanish values via putIfAbsent). Otherwise it is dropped
+     * with the vanish entry so prevSelfStates can never leak.
      */
     public void handleQuit(Player player) {
         if (player == null) return;
-        vanishedPlayers.remove(player.getUniqueId());
+        UUID uuid;
+        try {
+            uuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
+        boolean wasVanished = vanishedPlayers.remove(uuid);
+        boolean persist = true;
+        try {
+            FileConfiguration cfg = plugin.getVanishConfig();
+            if (cfg != null) persist = cfg.getBoolean("vanish.persist-on-rejoin", true);
+        } catch (Exception ignored) {
+        }
+        if (!(persist && wasVanished)) {
+            try {
+                prevSelfStates.remove(uuid);
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     public boolean canSee(Player viewer, Player target) {
@@ -485,7 +641,10 @@ public class VanishManager {
             // execution (next tick) — guard against Paper throwing on stale entities.
             if (!viewer.isOnline() || !target.isOnline()) return;
             // Hiding the entity removes it from view and from the tab list.
-            viewer.hideEntity(plugin, target);
+            try {
+                viewer.hideEntity(plugin, target);
+            } catch (Exception ignored) {
+            }
         }, null);
     }
 
@@ -497,8 +656,17 @@ public class VanishManager {
             // The target may have disconnected between scheduling and execution
             // (next tick) — guard against Paper throwing on stale entities.
             if (!viewer.isOnline() || !target.isOnline()) return;
-            viewer.showEntity(plugin, target);
-            viewer.listPlayer(target);
+            try {
+                viewer.showEntity(plugin, target);
+            } catch (Exception ignored) {
+                return;
+            }
+            // BUG-4: listPlayer in try/catch like unvanish (line ~126) — it may
+            // throw while entity state settles; showEntity above already ran.
+            try {
+                viewer.listPlayer(target);
+            } catch (Exception ignored) {
+            }
         }, null);
     }
 
@@ -522,15 +690,25 @@ public class VanishManager {
             FileConfiguration config = plugin.getVanishConfig();
             if (config == null) config = snapshot;
             if (config == null) return;
-            // Save the previous state once (putIfAbsent): a second vanish
-            // without unvanish must keep the original, and a rejoin with
-            // persist must keep the pre-vanish values (not the still-vanished
-            // state from before the quit).
+            // Snapshot the ORIGINAL pre-vanish self state exactly once
+            // (putIfAbsent): a second vanish without unvanish must keep the
+            // original, and a rejoin with persist must keep the pre-vanish
+            // values (not the still-vanished state from before the quit).
+            // After a reload restoreVanishState() re-vanishes while the flags
+            // are still applied — that case is covered by the prevSelfStates
+            // carry-over in setupVanish() (putIfAbsent keeps the carried
+            // original), so every vanish with no stored prev snapshots here:
+            // skipping the snapshot when the flags "look vanished" would
+            // leave third-party states (silent/non-collidable set by another
+            // plugin) without a snapshot, and the unvanish fallback would
+            // then hardcode them away. Always snapshot when no prev exists.
             try {
                 UUID uuid = player.getUniqueId();
                 try {
-                    prevSelfStates.putIfAbsent(uuid,
-                            new PrevSelfState(player.isCollidable(), player.isSilent(), player.isInvisible()));
+                    if (!prevSelfStates.containsKey(uuid)) {
+                        prevSelfStates.putIfAbsent(uuid,
+                                new PrevSelfState(player.isCollidable(), player.isSilent(), player.isInvisible()));
+                    }
                 } catch (Exception ignored) {
                 }
             } catch (Exception ignored) {
@@ -542,14 +720,42 @@ public class VanishManager {
             if (config.getBoolean("vanish.no-step-sound", true)) {
                 player.setSilent(true);
             }
+
+            if (config.getBoolean("vanish.invisible", true)) {
+                try {
+                    player.setInvisible(true);
+                } catch (Exception ignored) {
+                }
+            }
         }, null);
     }
 
     private void resetSelfState(Player player) {
         if (player == null || !player.isOnline()) return;
+        UUID syncUuid;
+        try {
+            syncUuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
+        // BUG-1 guard fix: capture wasVanished synchronously — callers
+        // (unvanish/resetAll) invoke this BEFORE removing from vanishedPlayers,
+        // the async task below runs after the remove, so a live isVanished()
+        // check there would always see false and the fallback would never run.
+        final boolean wasVanished = isVanished(syncUuid);
         final FileConfiguration snapshot = plugin.getVanishConfig();
         player.getScheduler().run(plugin, (t) -> {
-            if (!player.isOnline()) return;
+            if (!player.isOnline()) {
+                // Stale task: the player quit before the reset ran. Drop any
+                // leftover snapshot so prevSelfStates can never leak via this
+                // early-return (unvanish/resetAll already removed the vanish
+                // entry synchronously; quit persistence needs no snapshot).
+                try {
+                    prevSelfStates.remove(syncUuid);
+                } catch (Exception ignored) {
+                }
+                return;
+            }
             UUID uuid;
             try {
                 uuid = player.getUniqueId();
@@ -575,13 +781,20 @@ public class VanishManager {
                 return;
             }
             // Fallback when no stored state exists (e.g. vanished before this
-            // fix, or manager rebuilt): only run while still vanished by us —
-            // otherwise the hardcoded setInvisible(false) below would clear
-            // third-party invisibility (potions, other plugins).
-            if (!isVanished(uuid)) return;
+            // fix, or manager rebuilt): only run when we were still vanished by
+            // us at call time (wasVanished, not live isVanished) — otherwise
+            // the hardcoded setInvisible(false) below would clear third-party
+            // invisibility (potions, other plugins).
+            if (!wasVanished) return;
             FileConfiguration config = plugin.getVanishConfig();
             if (config == null) config = snapshot;
-            player.setInvisible(false);
+            boolean resetInvisible = config == null || config.getBoolean("vanish.invisible", true);
+            if (resetInvisible) {
+                try {
+                    player.setInvisible(false);
+                } catch (Exception ignored) {
+                }
+            }
             boolean resetCollision = config == null || config.getBoolean("vanish.no-collision", true);
             boolean resetSilent = config == null || config.getBoolean("vanish.no-step-sound", true);
             if (resetCollision) {
@@ -630,12 +843,13 @@ public class VanishManager {
                 }
                 Player player = Bukkit.getPlayer(uuid);
                 if (player != null) {
-                    vanishedPlayers.remove(uuid);
+                    // BUG-1 order: resetSelfState before remove (see unvanish).
                     try {
                         resetSelfState(player);
                     } catch (Exception e) {
                         plugin.getLogger().fine("Failed to reset vanish state for " + uuid + ": " + e.getMessage());
                     }
+                    vanishedPlayers.remove(uuid);
                     try {
                         for (Player viewer : Bukkit.getOnlinePlayers()) {
                             if (viewer.equals(player)) continue;

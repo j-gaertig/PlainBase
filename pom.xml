@@ -55,6 +55,22 @@
                             <pattern>com.zaxxer.hikari</pattern>
                             <shadedPattern>de.jgaertig.plainBase.libs.hikari</shadedPattern>
                         </relocation>
+                        <relocation>
+                            <pattern>org.sqlite</pattern>
+                            <shadedPattern>de.jgaertig.plainBase.libs.sqlite</shadedPattern>
+                        </relocation>
+                        <relocation>
+                            <pattern>com.mysql</pattern>
+                            <shadedPattern>de.jgaertig.plainBase.libs.mysql</shadedPattern>
+                        </relocation>
+                        <relocation>
+                            <pattern>com.google.protobuf</pattern>
+                            <shadedPattern>de.jgaertig.plainBase.libs.protobuf</shadedPattern>
+                        </relocation>
+                        <relocation>
+                            <pattern>org.slf4j</pattern>
+                            <shadedPattern>de.jgaertig.plainBase.libs.slf4j</shadedPattern>
+                        </relocation>
                     </relocations>
                     <!-- JDBC drivers (sqlite-jdbc, mysql-connector-j) and HikariCP
                          register themselves via META-INF/services — this transformer

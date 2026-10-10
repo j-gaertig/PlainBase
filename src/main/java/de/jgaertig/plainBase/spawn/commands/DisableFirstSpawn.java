@@ -19,12 +19,24 @@ public class DisableFirstSpawn implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.spawn", false)) {
+        // Root-config read under the central configLock (same monitor as
+        // PlainBaseCommand toggle/suggest): the instance is fetched INSIDE the
+        // lock since reloadConfig() may swap it at any time.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.spawn", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
 
-        if (plugin.getSpawnConfig() == null) {
+        // Single snapshot, reused for the check and the write below (never
+        // re-fetched: a reload between the checks could otherwise hand back a
+        // different/null instance).
+        FileConfiguration disableConfig = plugin.getSpawnConfig();
+        if (disableConfig == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
             return;
         }
@@ -35,11 +47,7 @@ public class DisableFirstSpawn implements BasicCommand {
         }
 
         // Snapshot + locked read: writers mutate under synchronized(config).
-        FileConfiguration disableConfig = plugin.getSpawnConfig();
-        if (disableConfig == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
-            return;
-        }
+        // Reuses the disableConfig snapshot above (never re-fetched).
         boolean commandEnabled;
         synchronized (disableConfig) {
             commandEnabled = disableConfig.getBoolean("commands.disablefirstspawn.enabled", true);
@@ -54,13 +62,9 @@ public class DisableFirstSpawn implements BasicCommand {
             return;
         }
 
-        var config = plugin.getSpawnConfig();
-        if (config == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
-            return;
-        }
-        synchronized (config) {
-            config.set("first-spawn.enabled", false);
+        // Reuses the disableConfig snapshot (never re-fetched, see above).
+        synchronized (disableConfig) {
+            disableConfig.set("first-spawn.enabled", false);
         }
         plugin.saveSpawnConfigAsync();
 

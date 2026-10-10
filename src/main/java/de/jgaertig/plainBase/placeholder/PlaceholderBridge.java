@@ -1,7 +1,9 @@
 package de.jgaertig.plainBase.placeholder;
 
+import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
 
 /**
  * Isolated bridge to PlaceholderAPI so that PlainBase itself never links
@@ -34,9 +36,25 @@ public final class PlaceholderBridge {
     public static String apply(Player player, String text) {
         if (text == null || text.isEmpty()) return text;
 
-        String result = player != null ? text.replace("%player%", player.getName()) : text;
+        // The result is usually deserialized as MiniMessage by the caller —
+        // escape the player name first so a name like "<red>" can never
+        // inject formatting or click events (same pattern as
+        // MenuManager#applyPlaceholdersSafe).
+        String result = text;
+        if (player != null) {
+            String safeName;
+            try {
+                safeName = MiniMessage.miniMessage().escapeTags(player.getName());
+            } catch (Exception e) {
+                safeName = player.getName();
+            }
+            result = text.replace("%player%", safeName);
+        }
 
-        if (player != null && Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
+        // A present-but-disabled PlaceholderAPI must be treated like a missing
+        // one: its classes may be visible while the plugin itself is off.
+        Plugin papi = Bukkit.getPluginManager().getPlugin("PlaceholderAPI");
+        if (player != null && papi != null && papi.isEnabled()) {
             try {
                 result = me.clip.placeholderapi.PlaceholderAPI.setPlaceholders(player, result);
             } catch (Throwable e) {

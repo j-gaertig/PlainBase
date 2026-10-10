@@ -141,6 +141,9 @@ public class MessagesListener implements Listener {
                     try {
                         if (!player.isOnline()) return;
                         for (String line : motdLines) {
+                            // Skip blank lines: deserializing "" yields an empty
+                            // component that renders as a stray empty chat line.
+                            if (line == null || line.isBlank()) continue;
                             try {
                                 player.sendMessage(plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, line)));
                             } catch (Exception e) {

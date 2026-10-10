@@ -30,7 +30,7 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
 
         if (!checkPreconditions(sender, "plainbase.moderation.baninfo", "baninfo")) return;
 
-        if (args.length < 1) {
+        if (args.length != 1) {
             sender.sendMessage(render("<yellow>Usage: <gray>/baninfo <player>"));
             return;
         }
@@ -59,56 +59,59 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             }
 
             String name = displayName(offlinePlayer, targetName);
+            final java.util.UUID targetUuid = offlinePlayer.getUniqueId();
             // Counts come from the windowed cache (last 90 days, see
             // ModerationDatabase) — the labels below say so explicitly.
-            int bans = manager.getBanCount(offlinePlayer.getUniqueId());
-            int kicks = manager.getKickCount(offlinePlayer.getUniqueId());
-
-            if (bans == 0 && kicks == 0) {
-                sender.sendMessage(render(
-                        message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", esc(name))));
-                sender.sendMessage(render(message("baninfo-no-history", "<gray>No ban or kick history.")));
-                return;
-            }
+            int bans = manager.getBanCount(targetUuid);
+            int kicks = manager.getKickCount(targetUuid);
 
             sender.sendMessage(render(
                     message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", esc(name))));
 
-            Optional<BanRecord> active = manager.getActiveBan(offlinePlayer.getUniqueId());
-            if (active.isPresent()) {
-                long remaining = active.get().remainingMillis(System.currentTimeMillis());
-                // remaining <= 0 means the ban expired between the active check
-                // and this render — show plain "expired", never "expired left".
-                String durationText = active.get().isPermanent() ? "permanent"
-                        : (remaining <= 0 ? "expired" : DurationParser.format(remaining) + " left");
-                sender.sendMessage(render(
-                        message("baninfo-status-banned", "<gray>Status: <red>Banned (%duration_left%)").replace("%duration_left%", durationText)));
+            if (bans == 0 && kicks == 0) {
+                sender.sendMessage(render(message("baninfo-no-history", "<gray>No ban or kick history.")));
+                // No early return: the IP check below must still run — a
+                // player with no name-ban history may still sit on a banned
+                // IP (previously this returned here and hid that).
             } else {
-                sender.sendMessage(render(message("baninfo-status-clear", "<gray>Status: <green>Not banned")));
+                Optional<BanRecord> active = manager.getActiveBan(targetUuid);
+                if (active.isPresent()) {
+                    long remaining = active.get().remainingMillis(System.currentTimeMillis());
+                    // remaining <= 0 means the ban expired between the active check
+                    // and this render — show plain "expired", never "expired left".
+                    String durationText = active.get().isPermanent() ? "permanent"
+                            : (remaining <= 0 ? "expired" : DurationParser.format(remaining) + " left");
+                    sender.sendMessage(render(
+                            message("baninfo-status-banned", "<gray>Status: <red>Banned (%duration_left%)").replace("%duration_left%", durationText)));
+                } else {
+                    sender.sendMessage(render(message("baninfo-status-clear", "<gray>Status: <green>Not banned")));
+                }
+
+                sender.sendMessage(render(
+                        message("baninfo-total-bans", "<gray>Total bans (last 90 days): <yellow>%bans%").replace("%bans%", String.valueOf(bans))));
+                sender.sendMessage(render(
+                        message("baninfo-total-kicks", "<gray>Total kicks (last 90 days): <yellow>%kicks%").replace("%kicks%", String.valueOf(kicks))));
+
+                manager.getLastBan(targetUuid).ifPresent(last ->
+                        sender.sendMessage(render(
+                                message("baninfo-last-ban", "<gray>Last ban reason: <yellow>%reason% by %staff%")
+                                        .replace("%reason%", esc(last.reason()))
+                                        .replace("%staff%", esc(last.staffName())))));
             }
 
-            sender.sendMessage(render(
-                    message("baninfo-total-bans", "<gray>Total bans (last 90 days): <yellow>%bans%").replace("%bans%", String.valueOf(bans))));
-            sender.sendMessage(render(
-                    message("baninfo-total-kicks", "<gray>Total kicks (last 90 days): <yellow>%kicks%").replace("%kicks%", String.valueOf(kicks))));
-
-            manager.getLastBan(offlinePlayer.getUniqueId()).ifPresent(last ->
-                    sender.sendMessage(render(
-                            message("baninfo-last-ban", "<gray>Last ban reason: <yellow>%reason% by %staff%")
-                                    .replace("%reason%", esc(last.reason()))
-                                    .replace("%staff%", esc(last.staffName())))));
-
-            // findLastIpByNameStrict() and queryActiveIpBanNow() do blocking
+            // findLastIpByUuidStrict() and queryActiveIpBanNow() do blocking
             // JDBC I/O — never call them on the main/region thread. Both run
             // on the async scheduler here; only the final sendMessage hops
             // back to the region thread. Uses the strict variant so a DB
             // failure reports a database error (like IpBanCommand) instead of
             // silently looking like "no IP, nothing to show".
+            // UUID-based (stable across name changes) — the name-based lookup
+            // would miss after a rename and could hit another player's row.
             org.bukkit.Bukkit.getAsyncScheduler().runNow(plugin, task -> {
                 String lastIp = null;
                 boolean dbError = false;
                 try {
-                    lastIp = manager.findLastIpByNameStrict(name);
+                    lastIp = manager.findLastIpByUuidStrict(targetUuid);
                 } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().warning("Could not look up last IP for " + name + ": " + e.getMessage());
                     dbError = true;
