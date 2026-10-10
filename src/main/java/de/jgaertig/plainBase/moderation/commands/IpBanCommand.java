@@ -40,17 +40,17 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
         BanManager manager = plugin.getBanManager();
         FileConfiguration moderationConfig = plugin.getModerationConfig();
         if (manager == null || moderationConfig == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
             return;
         }
 
         if (!moderationConfig.getBoolean("ip-ban.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>IP banning is currently disabled."));
+            sender.sendMessage(render("<red>IP banning is currently disabled."));
             return;
         }
 
         if (args.length < 1) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/banip <ip|player> [reason]"));
+            sender.sendMessage(render("<yellow>Usage: <gray>/banip <ip|player> [reason]"));
             return;
         }
 

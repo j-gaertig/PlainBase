@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Scanner;
 import java.util.Set;
+import java.util.logging.Level;
 import java.util.stream.Stream;
 
 public class PlainBaseCommand implements BasicCommand {
@@ -76,15 +77,18 @@ public class PlainBaseCommand implements BasicCommand {
                         // under one lock, snapshot newStatus; saveConfig() runs
                         // after the lock but on the same global thread, so no
                         // interleaved toggle can slip between modify and save.
-                        org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
-                        if (rootCfg == null) {
-                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
-                            return;
-                        }
                         String actualKey = null;
                         boolean newStatus = false;
                         boolean found;
                         synchronized (plugin.getConfigLock()) {
+                            // The config reference is fetched INSIDE the lock:
+                            // reloadConfig() may swap the instance at any time,
+                            // so a reference taken before the lock can be stale.
+                            org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
+                            if (rootCfg == null) {
+                                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
+                                return;
+                            }
                             try {
                                 ConfigurationSection sec = rootCfg.getConfigurationSection("modules");
                                 if (sec != null && !moduleName.contains(".") && !moduleName.contains(" ")) {
@@ -116,7 +120,7 @@ public class PlainBaseCommand implements BasicCommand {
                                 "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
                         ));
                     } catch (Exception e) {
-                        plugin.getLogger().warning("Failed to toggle module " + moduleName + ": " + e.getMessage());
+                        plugin.getLogger().log(Level.WARNING, "Failed to toggle module " + moduleName, e);
                         try {
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
                         } catch (Exception ignored) {
@@ -141,7 +145,7 @@ public class PlainBaseCommand implements BasicCommand {
                         if (sender instanceof Player player && !player.isOnline()) return;
                         sender.sendMessage(plugin.getMiniMessage().deserialize("<green>Config reloaded and modules updated!"));
                     } catch (Exception e) {
-                        plugin.getLogger().warning("Failed to reload modules: " + e.getMessage());
+                        plugin.getLogger().log(Level.WARNING, "Failed to reload modules", e);
                         try {
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reload modules!"));
                         } catch (Exception ignored) {
@@ -241,10 +245,12 @@ public class PlainBaseCommand implements BasicCommand {
             // the config on the global thread. Snapshot the key set under the
             // central configLock (toggle uses the same monitor), then filter
             // outside the lock.
-            org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
-            if (cfg == null) return List.of();
             java.util.Set<String> snapshot;
             synchronized (plugin.getConfigLock()) {
+                // Fetched inside the lock (see toggle above): the instance
+                // may be swapped by reloadConfig() at any time.
+                org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
+                if (cfg == null) return List.of();
                 try {
                     ConfigurationSection sec = cfg.getConfigurationSection("modules");
                     snapshot = (sec == null) ? Set.of() : Set.copyOf(sec.getKeys(false));

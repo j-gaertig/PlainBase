@@ -36,17 +36,17 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
         BanManager manager = plugin.getBanManager();
         FileConfiguration moderationConfig = plugin.getModerationConfig();
         if (manager == null || moderationConfig == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
             return;
         }
 
         if (!moderationConfig.getBoolean("ban.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Banning is currently disabled."));
+            sender.sendMessage(render("<red>Banning is currently disabled."));
             return;
         }
 
         if (args.length < 1) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/ban <player> [reason]"));
+            sender.sendMessage(render("<yellow>Usage: <gray>/ban <player> [reason]"));
             return;
         }
 
@@ -61,11 +61,11 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
         resolveTarget(sender, targetName, offlinePlayer -> {
             if (isGone(sender)) return;
             if (manager == null || moderationConfig == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+                sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
                 return;
             }
             if (offlinePlayer == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
                 return;
             }
@@ -74,7 +74,7 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
 
             // Never allow self-bans (would instantly lock the staffer out).
             if (staffUuid != null && offlinePlayer.getUniqueId().equals(staffUuid)) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("self-ban", "<red>You cannot ban yourself.")));
                 return;
             }
@@ -82,33 +82,33 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
             Player onlineTarget = offlinePlayer.getPlayer();
             if (onlineTarget != null) {
                 if (isExempt(offlinePlayer, sender) || isProtectedTarget(onlineTarget, sender)) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+                    sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
                     return;
                 }
             } else if (!isAdmin(sender)) {
                 // Offline players expose no permission API, so exempt/admin
                 // status cannot be verified — non-admins must not ban them at
                 // all (hard reject, not just a log line). Admins bypass.
-                sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+                sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
                 return;
             }
 
             manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, -1L, (result, dbError) -> {
                 if (isGone(sender)) return;
                 if (dbError) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("db-error", "<red>Database error, please try again later.")));
                     return;
                 }
                 if (result.isEmpty()) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("already-banned", "<red>%player% is already banned.").replace("%player%", esc(name))));
                     return;
                 }
 
                 Player online = offlinePlayer.getPlayer();
                 if (online != null) {
-                    kickSafely(online, plugin.getMiniMessage().deserialize(
+                    kickSafely(online, render(
                             message("ban-screen", "<red>You are banned.\n<gray>Reason: %reason%")
                                     .replace("%reason%", esc(reason))
                                     .replace("%staff%", esc(staffName))));
@@ -125,14 +125,14 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
                         if (!played) {
                             Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                                 if (isGone(sender)) return;
-                                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                                sender.sendMessage(render(
                                         message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", esc(name))));
                             });
                         }
                     });
                 }
 
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("ban-success", "<green>%player% has been permanently banned. <gray>(%reason%)")
                                 .replace("%player%", esc(name)).replace("%reason%", esc(reason))));
 

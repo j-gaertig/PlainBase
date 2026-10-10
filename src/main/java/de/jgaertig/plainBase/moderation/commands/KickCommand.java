@@ -37,17 +37,17 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
         FileConfiguration moderationConfig = plugin.getModerationConfig();
         BanManager banManager = plugin.getBanManager();
         if (moderationConfig == null || banManager == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
             return;
         }
 
         if (!moderationConfig.getBoolean("kick.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Kicking is currently disabled."));
+            sender.sendMessage(render("<red>Kicking is currently disabled."));
             return;
         }
 
         if (args.length < 1) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/kick <player> [reason]"));
+            sender.sendMessage(render("<yellow>Usage: <gray>/kick <player> [reason]"));
             return;
         }
 
@@ -55,13 +55,13 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
         // kick the wrong player on a typo ("Alex" also matches "Alexander").
         Player target = onlinePlayerExactFirst(args[0], sender);
         if (target == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(args[0]))));
             return;
         }
 
         if (isExempt(target, sender) || isProtectedTarget(target, sender)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+            sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
             return;
         }
 
@@ -79,7 +79,7 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
         // after the async write below stays — the target can still leave
         // during the DB hop.
         if (Bukkit.getPlayer(targetUuid) == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(targetName))));
             return;
         }
@@ -92,16 +92,16 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
             // never happened).
             Player stillOnline = Bukkit.getPlayer(targetUuid);
             if (stillOnline == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(targetName))));
                 return;
             }
-            kickSafely(stillOnline, plugin.getMiniMessage().deserialize(
+            kickSafely(stillOnline, render(
                     message("kick-screen", "<red>You have been kicked.\n<gray>Reason: %reason%")
                             .replace("%reason%", esc(reason))
                             .replace("%staff%", esc(staffName))));
 
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("kick-success", "<green>%player% has been kicked. <gray>(%reason%)")
                             .replace("%player%", esc(targetName)).replace("%reason%", esc(reason))));
 

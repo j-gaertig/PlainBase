@@ -33,4 +33,4 @@ commands:
     enabled: true
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.2
+version: "1.2"

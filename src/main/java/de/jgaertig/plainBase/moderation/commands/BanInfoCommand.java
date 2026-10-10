@@ -31,7 +31,7 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
         if (!checkPreconditions(sender, "plainbase.moderation.baninfo", "baninfo")) return;
 
         if (args.length < 1) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/baninfo <player>"));
+            sender.sendMessage(render("<yellow>Usage: <gray>/baninfo <player>"));
             return;
         }
 
@@ -48,12 +48,12 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             // a stale/gone sender.
             if (isGone(sender)) return;
             if (manager == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+                sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
                 return;
             }
 
             if (offlinePlayer == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
                 return;
             }
@@ -65,13 +65,13 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             int kicks = manager.getKickCount(offlinePlayer.getUniqueId());
 
             if (bans == 0 && kicks == 0) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", esc(name))));
-                sender.sendMessage(plugin.getMiniMessage().deserialize(message("baninfo-no-history", "<gray>No ban or kick history.")));
+                sender.sendMessage(render(message("baninfo-no-history", "<gray>No ban or kick history.")));
                 return;
             }
 
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("baninfo-header", "<gray>--- Ban info for %player% ---").replace("%player%", esc(name))));
 
             Optional<BanRecord> active = manager.getActiveBan(offlinePlayer.getUniqueId());
@@ -81,19 +81,19 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                 // and this render — show plain "expired", never "expired left".
                 String durationText = active.get().isPermanent() ? "permanent"
                         : (remaining <= 0 ? "expired" : DurationParser.format(remaining) + " left");
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("baninfo-status-banned", "<gray>Status: <red>Banned (%duration_left%)").replace("%duration_left%", durationText)));
             } else {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(message("baninfo-status-clear", "<gray>Status: <green>Not banned")));
+                sender.sendMessage(render(message("baninfo-status-clear", "<gray>Status: <green>Not banned")));
             }
 
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("baninfo-total-bans", "<gray>Total bans (last 90 days): <yellow>%bans%").replace("%bans%", String.valueOf(bans))));
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("baninfo-total-kicks", "<gray>Total kicks (last 90 days): <yellow>%kicks%").replace("%kicks%", String.valueOf(kicks))));
 
             manager.getLastBan(offlinePlayer.getUniqueId()).ifPresent(last ->
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("baninfo-last-ban", "<gray>Last ban reason: <yellow>%reason% by %staff%")
                                     .replace("%reason%", esc(last.reason()))
                                     .replace("%staff%", esc(last.staffName())))));

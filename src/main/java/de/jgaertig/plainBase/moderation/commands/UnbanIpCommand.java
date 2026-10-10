@@ -27,7 +27,7 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         if (!checkPreconditions(sender, "plainbase.moderation.unbanip", "unbanip")) return;
 
         if (args.length < 1) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/unbanip <ip>"));
+            sender.sendMessage(render("<yellow>Usage: <gray>/unbanip <ip>"));
             return;
         }
 
@@ -36,7 +36,7 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         // resolved here — only raw IP literals. normalizeIp itself is also
         // DNS-free, so this is defense-in-depth.
         if (!isIpLike(rawIp)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("invalid-ip", "<red>Invalid IP address: %ip%").replace("%ip%", esc(rawIp))));
             return;
         }
@@ -44,7 +44,7 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         // match the stored ban row regardless of input spelling.
         String ip = normalizeIp(rawIp);
         if (ip == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("invalid-ip", "<red>Invalid IP address: %ip%").replace("%ip%", esc(rawIp))));
             return;
         }
@@ -57,7 +57,7 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         // keeps the callback working instead of NPE-ing.
         BanManager manager = plugin.getBanManager();
         if (manager == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
             return;
         }
 
@@ -71,7 +71,7 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
                         .filter(r -> r != null && finalIp.equals(r.ip()))
                         .findFirst();
                 if (active.isPresent() && isProtectedIpBan(active.get(), finalIp)) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("exempt", "<red>You cannot punish this player.")));
                     return;
                 }
@@ -83,17 +83,17 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         manager.unbanIpAsync(finalIp, staffUuid, staffName, (unbanned, dbError) -> {
             if (isGone(sender)) return;
             if (dbError) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("db-error", "<red>Database error, please try again later.")));
                 return;
             }
             if (!unbanned) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("ip-not-banned", "<red>%ip% is not currently banned.").replace("%ip%", esc(finalIp))));
                 return;
             }
 
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("unbanip-success", "<green>%ip% has been unbanned.").replace("%ip%", esc(finalIp))));
 
             broadcast(message("unbanip-broadcast", "").replace("%ip%", esc(finalIp)).replace("%staff%", esc(staffName)));

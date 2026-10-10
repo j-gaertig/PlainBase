@@ -11,6 +11,7 @@ import org.bukkit.entity.Player;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.Map;
@@ -326,11 +327,7 @@ public class VanishManager {
 
                     config.set("vanished", vanished);
 
-                    try {
-                        config.save(file);
-                    } catch (IOException e) {
-                        plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
-                    }
+                    saveAtomically(config, file, uuid);
                 }
             } finally {
                 pending.complete(null);
@@ -373,11 +370,7 @@ public class VanishManager {
                         }
                     }
                     config.set("vanished", true);
-                    try {
-                        config.save(file);
-                    } catch (IOException e) {
-                        plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
-                    }
+                    saveAtomically(config, file, uuid);
                 }
             } catch (Exception e) {
                 plugin.getLogger().fine("Failed to flush vanish state for " + uuid + ": " + e.getMessage());
@@ -395,6 +388,27 @@ public class VanishManager {
             Files.move(file.toPath(), backup.toPath(), StandardCopyOption.REPLACE_EXISTING);
         } catch (Exception e) {
             plugin.getLogger().fine("Could not back up corrupt player data " + file.getName() + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Crash-safe write: dump to "{@code <uuid>.yml.tmp}" in the same directory,
+     * then move over the target atomically (non-atomic fallback where the file
+     * system lacks atomic-move support), so a crash can never leave a
+     * half-written playerdata file behind. Same pattern as
+     * TeamManager.saveQuietly(). Never throws.
+     */
+    private void saveAtomically(YamlConfiguration config, File target, UUID uuid) {
+        File tmp = new File(target.getParentFile(), target.getName() + ".tmp");
+        try {
+            config.save(tmp);
+            try {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
         }
     }
 
@@ -561,7 +575,10 @@ public class VanishManager {
                 return;
             }
             // Fallback when no stored state exists (e.g. vanished before this
-            // fix, or manager rebuilt): config-guarded defaults, no feature.
+            // fix, or manager rebuilt): only run while still vanished by us —
+            // otherwise the hardcoded setInvisible(false) below would clear
+            // third-party invisibility (potions, other plugins).
+            if (!isVanished(uuid)) return;
             FileConfiguration config = plugin.getVanishConfig();
             if (config == null) config = snapshot;
             player.setInvisible(false);

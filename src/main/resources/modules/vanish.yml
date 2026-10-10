@@ -7,6 +7,7 @@ vanish:
   invincible: false               # true = vanished player takes no damage at all
   projectiles-pass-through: true  # Arrows & co. don't hit vanished players
   mobs-ignore: true               # Mobs don't target or look at vanished players
+  pickup-block: true             # Vanished players don't pick up items
   hide-join-quit-messages: true   # No join/quit messages for vanished players
   op-see: true                    # OPs (with plainbase.vanish.see) can see vanished players
 
@@ -20,4 +21,4 @@ vanish:
       enabled: true
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.1
+version: "1.1"

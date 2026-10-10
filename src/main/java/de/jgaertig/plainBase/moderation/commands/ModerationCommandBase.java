@@ -373,8 +373,11 @@ public abstract class ModerationCommandBase {
     }
 
     /**
-     * Resolves a target by name: online players resolve instantly, Paper's cached
-     * offline-player lookup resolves instantly too. Only an uncached, never-joined
+     * Resolves a target by name: exact matches win over fuzzy ones. A fuzzy
+     * online prefix match (Bukkit#getPlayer matches "Alex" to "Alexander")
+     * must never shadow an exact offline-cache entry — so the order is:
+     * exact online first, then the exact offline cache, and only then the
+     * fuzzy online fallback. Only an uncached, never-joined
      * name falls back to Bukkit#getOfflinePlayer(String), which can block on a
      * Mojang lookup — so that call always runs on the async scheduler, and the
      * callback is always dispatched back onto the main/region thread afterwards
@@ -387,15 +390,34 @@ public abstract class ModerationCommandBase {
      * disk I/O lands on the main thread.
      */
     protected void resolveTarget(CommandSender sender, String name, Consumer<OfflinePlayer> callback) {
-        Player online = onlinePlayerExactFirst(name, sender);
-        if (online != null) {
-            callback.accept(online);
+        Player exactOnline = null;
+        try {
+            exactOnline = Bukkit.getPlayerExact(name);
+        } catch (Exception ignored) {
+        }
+        if (exactOnline != null) {
+            callback.accept(exactOnline);
             return;
         }
 
-        OfflinePlayer cached = Bukkit.getOfflinePlayerIfCached(name);
+        // Exact offline cache BEFORE the fuzzy online fallback: a cached
+        // exact profile (e.g. offline "Alex") must win over a fuzzy online
+        // prefix hit (e.g. online "Alexander").
+        OfflinePlayer cached = null;
+        try {
+            cached = name == null ? null : Bukkit.getOfflinePlayerIfCached(name);
+        } catch (Exception ignored) {
+        }
         if (cached != null) {
             callback.accept(cached);
+            return;
+        }
+
+        // Reuses the exact+fuzzy+vanish logic: the exact hit above was null,
+        // so this only contributes the vanish-guarded fuzzy fallback.
+        Player fuzzyOnline = onlinePlayerExactFirst(name, sender);
+        if (fuzzyOnline != null) {
+            callback.accept(fuzzyOnline);
             return;
         }
 

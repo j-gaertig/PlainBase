@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.vanish;
 
 import de.jgaertig.plainBase.PlainBase;
+import org.bukkit.event.player.PlayerAttemptPickupItemEvent;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
@@ -9,6 +10,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
@@ -147,6 +149,29 @@ public class VanishListener implements Listener {
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to handle vanish advancement state for " + event.getPlayer().getName() + ": " + e.getMessage());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPickup(EntityPickupItemEvent event) {
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (plugin.getVanishManager() == null || vanishConfig == null) return;
+        if (!vanishConfig.getBoolean("vanish.pickup-block", true)) return;
+        if (!(event.getEntity() instanceof Player player)) return;
+
+        if (plugin.getVanishManager().isVanished(player)) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onAttemptPickup(PlayerAttemptPickupItemEvent event) {
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (plugin.getVanishManager() == null || vanishConfig == null) return;
+        if (!vanishConfig.getBoolean("vanish.pickup-block", true)) return;
+
+        if (plugin.getVanishManager().isVanished(event.getPlayer())) {
+            event.setCancelled(true);
         }
     }
 

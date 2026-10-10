@@ -63,9 +63,6 @@ rtp:
       - SWEET_BERRY_BUSH
       - WITHER_ROSE
       - POWDER_SNOW
-      - AIR
-      - CAVE_AIR
-      - VOID_AIR
       - BEDROCK
       - BARRIER
       - STRUCTURE_VOID
@@ -81,4 +78,4 @@ rtp:
         enabled: true
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.0
+version: "1.0"

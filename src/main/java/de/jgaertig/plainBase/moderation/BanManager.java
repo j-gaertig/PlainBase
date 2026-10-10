@@ -375,21 +375,29 @@ public class BanManager {
         }
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             long now = System.currentTimeMillis();
-            // Only an ACTIVE ban can be unbanned: revokeBan() matches every
-            // unrevoked row (revoked = 0) regardless of expiry, so without
-            // this guard an already-expired tempban would still revoke rows
-            // and report "unbanned". No active ban means "not banned" (covers
-            // expired and absent). Live check, outside the lock.
-            boolean active;
+            // Only an ACTIVE ban can be unbanned: without this guard an
+            // already-expired tempban would still revoke rows and report
+            // "unbanned". No active ban means "not banned" (covers expired
+            // and absent). Live check, outside the lock.
+            // The guard ALSO snapshots the active row IDs: the revoke below
+            // touches ONLY these IDs (per-ID, not revoke-by-key). A ban
+            // inserted between guard and revoke has a new id, is not in the
+            // list, and therefore survives the unban.
+            List<Integer> guardIds = new ArrayList<>();
             boolean guardFailed = false;
             try {
-                active = db.findActiveBan(uuid, now) != null;
+                guardIds.addAll(db.findActiveBanIds(uuid, now));
             } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().warning("Could not live-check ban for " + uuid + ", falling back to cache: " + e.getMessage());
                 guardFailed = true;
-                active = getActiveBan(uuid).isPresent();
+                List<BanRecord> history = bansByUuid.get(uuid);
+                if (history != null) {
+                    for (BanRecord r : history) {
+                        if (r.isActive(now)) guardIds.add(r.id());
+                    }
+                }
             }
-            if (!active) {
+            if (guardIds.isEmpty()) {
                 // A failed guard with an empty (possibly stale) cache cannot
                 // tell "not banned" from "DB down" — report a database error
                 // instead of a misleading "not banned".
@@ -397,11 +405,12 @@ public class BanManager {
                 complete(() -> callback.accept(false, dbError));
                 return;
             }
-            // Revoke-by-key revokes ALL unrevoked rows for this uuid;
-            // success is decided on the row count (0 = nothing to unban).
+            // Per-ID revoke: only the guard-time IDs, never a freshly
+            // inserted ban (see above). Success is decided on the row count
+            // (0 = nothing to unban).
             int revoked;
             try {
-                revoked = db.revokeBan(uuid, staffUuid, staffName, now);
+                revoked = db.revokeBansByIds(guardIds, staffUuid, staffName, now);
             } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().severe("Could not revoke ban for " + uuid + ": " + e.getMessage());
                 complete(() -> callback.accept(false, true));
@@ -409,7 +418,7 @@ public class BanManager {
             }
             if (revoked > 0) {
                 synchronized (mutationLock) {
-                    revokeAllBansInCache(uuid, staffUuid, staffName, now);
+                    revokeBansInCacheByIds(uuid, new java.util.HashSet<>(guardIds), staffUuid, staffName, now);
                 }
                 complete(() -> callback.accept(true, false));
             } else {
@@ -473,7 +482,7 @@ public class BanManager {
                 complete(() -> callback.accept(Optional.empty(), false));
                 return;
             }
-            if (!liveOk && ipBansCache.stream().anyMatch(r -> r.ip().equals(ip) && r.isActive(now))) {
+            if (!liveOk && ipBansCache.stream().anyMatch(r -> r.ip() != null && r.ip().equals(ip) && r.isActive(now))) {
                 complete(() -> callback.accept(Optional.empty(), false));
                 return;
             }
@@ -519,26 +528,30 @@ public class BanManager {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             long now = System.currentTimeMillis();
             // Same active-only guard as unbanPlayerAsync: an expired
-            // temp-IP-ban must report "not banned", not "unbanned".
-            boolean active;
+            // temp-IP-ban must report "not banned", not "unbanned". The guard
+            // snapshots the active row IDs; the revoke below touches ONLY
+            // these IDs so an IP ban inserted in between survives.
+            List<Integer> guardIds = new ArrayList<>();
             boolean guardFailed = false;
             try {
-                active = db.findActiveIpBan(ip, now) != null;
+                guardIds.addAll(db.findActiveIpBanIds(ip, now));
             } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
                 guardFailed = true;
-                active = getActiveIpBans().stream().anyMatch(r -> r.ip() != null && r.ip().equals(ip) && r.isActive(now));
+                for (IpBanRecord r : ipBansCache) {
+                    if (r.ip() != null && r.ip().equals(ip) && r.isActive(now)) guardIds.add(r.id());
+                }
             }
-            if (!active) {
+            if (guardIds.isEmpty()) {
                 boolean dbError = guardFailed;
                 complete(() -> callback.accept(false, dbError));
                 return;
             }
-            // Same revoke-by-key pattern as unbanPlayerAsync: all
-            // unrevoked rows for this IP, row count decides success.
+            // Same per-ID pattern as unbanPlayerAsync: only guard-time IDs,
+            // row count decides success.
             int revoked;
             try {
-                revoked = db.revokeIpBan(ip, staffUuid, staffName, now);
+                revoked = db.revokeIpBansByIds(guardIds, staffUuid, staffName, now);
             } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
                 complete(() -> callback.accept(false, true));
@@ -546,7 +559,7 @@ public class BanManager {
             }
             if (revoked > 0) {
                 synchronized (mutationLock) {
-                    revokeAllIpBansInCache(ip, staffUuid, staffName, now);
+                    revokeIpBansInCacheByIds(new java.util.HashSet<>(guardIds), staffUuid, staffName, now);
                 }
                 complete(() -> callback.accept(true, false));
             } else {
@@ -573,32 +586,32 @@ public class BanManager {
     }
 
     /**
-     * Marks every unrevoked cached ban for the uuid as revoked (mirrors the
-     * revoke-by-key UPDATE, which touches all rows, not just one id).
-     * Must be called while holding {@code mutationLock}.
+     * Marks only the guard-time IDs as revoked in the cache (mirrors the
+     * per-ID UPDATE, which touches just those rows, not every unrevoked row
+     * for the uuid). Must be called while holding {@code mutationLock}.
      */
-    private void revokeAllBansInCache(UUID uuid, UUID staffUuid, String staffName, long now) {
+    private void revokeBansInCacheByIds(UUID uuid, java.util.Set<Integer> ids, UUID staffUuid, String staffName, long now) {
         List<BanRecord> history = bansByUuid.get(uuid);
         if (history != null) {
             for (int i = 0; i < history.size(); i++) {
                 BanRecord r = history.get(i);
-                if (!r.revoked()) history.set(i, r.withRevoked(staffUuid, staffName, now));
+                if (!r.revoked() && ids.contains(r.id())) history.set(i, r.withRevoked(staffUuid, staffName, now));
             }
         }
         for (int i = 0; i < bansCache.size(); i++) {
             BanRecord r = bansCache.get(i);
-            if (!r.revoked() && r.uuid().equals(uuid)) bansCache.set(i, r.withRevoked(staffUuid, staffName, now));
+            if (!r.revoked() && ids.contains(r.id())) bansCache.set(i, r.withRevoked(staffUuid, staffName, now));
         }
     }
 
     /**
-     * Marks every unrevoked cached IP ban for the ip as revoked.
+     * Marks only the guard-time IDs as revoked in the cache.
      * Must be called while holding {@code mutationLock}.
      */
-    private void revokeAllIpBansInCache(String ip, UUID staffUuid, String staffName, long now) {
+    private void revokeIpBansInCacheByIds(java.util.Set<Integer> ids, UUID staffUuid, String staffName, long now) {
         for (int i = 0; i < ipBansCache.size(); i++) {
             IpBanRecord r = ipBansCache.get(i);
-            if (!r.revoked() && r.ip() != null && r.ip().equals(ip)) ipBansCache.set(i, r.withRevoked(staffUuid, staffName, now));
+            if (!r.revoked() && ids.contains(r.id())) ipBansCache.set(i, r.withRevoked(staffUuid, staffName, now));
         }
     }
 

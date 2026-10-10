@@ -38,17 +38,17 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
         BanManager manager = plugin.getBanManager();
         FileConfiguration moderationConfig = plugin.getModerationConfig();
         if (manager == null || moderationConfig == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
             return;
         }
 
         if (!moderationConfig.getBoolean("ban.enabled", true)) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Banning is currently disabled."));
+            sender.sendMessage(render("<red>Banning is currently disabled."));
             return;
         }
 
         if (args.length < 2) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/tempban <player> <duration> [reason]"));
+            sender.sendMessage(render("<yellow>Usage: <gray>/tempban <player> <duration> [reason]"));
             return;
         }
 
@@ -58,7 +58,7 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
             durationMillis = DurationParser.parse(args[1]);
         } catch (IllegalArgumentException e) {
             String detail = e.getMessage() != null ? " (" + esc(e.getMessage()) + ")" : "";
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
+            sender.sendMessage(render(
                     message("invalid-duration", "<red>Invalid duration. Use e.g. 1d, 2h30m, 7d, permanent or forever.") + detail));
             return;
         }
@@ -74,11 +74,11 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
         resolveTarget(sender, targetName, offlinePlayer -> {
             if (isGone(sender)) return;
             if (manager == null || moderationConfig == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+                sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
                 return;
             }
             if (offlinePlayer == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
                 return;
             }
@@ -87,7 +87,7 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
 
             // Never allow self-bans (would instantly lock the staffer out).
             if (staffUuid != null && offlinePlayer.getUniqueId().equals(staffUuid)) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("self-ban", "<red>You cannot ban yourself.")));
                 return;
             }
@@ -95,36 +95,43 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
             Player onlineTarget = offlinePlayer.getPlayer();
             if (onlineTarget != null) {
                 if (isExempt(offlinePlayer, sender) || isProtectedTarget(onlineTarget, sender)) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+                    sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
                     return;
                 }
             } else if (!isAdmin(sender)) {
                 // Offline players expose no permission API, so exempt/admin
                 // status cannot be verified — non-admins must not ban them at
                 // all (hard reject, not just a log line). Admins bypass.
-                sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+                sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
                 return;
             }
 
             manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, (result, dbError) -> {
                 if (isGone(sender)) return;
                 if (dbError) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("db-error", "<red>Database error, please try again later.")));
                     return;
                 }
                 if (result.isEmpty()) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("already-banned", "<red>%player% is already banned.").replace("%player%", esc(name))));
                     return;
                 }
 
                 String durationText = DurationParser.format(finalDuration);
+                // "permanent"/"perm"/"-1" behave like /ban: use the permanent
+                // ban texts (ban-screen/ban-success/ban-broadcast), mirroring
+                // ModerationListener's isPermanent() template choice.
+                boolean permanent = finalDuration < 0;
 
                 Player online = offlinePlayer.getPlayer();
                 if (online != null) {
-                    kickSafely(online, plugin.getMiniMessage().deserialize(
-                            message("tempban-screen", "<red>You are temporarily banned.\n<gray>Reason: %reason%\n<gray>Remaining: %remaining%")
+                    String screenTemplate = permanent
+                            ? message("ban-screen", "<red>You are banned.\n<gray>Reason: %reason%")
+                            : message("tempban-screen", "<red>You are temporarily banned.\n<gray>Reason: %reason%\n<gray>Remaining: %remaining%");
+                    kickSafely(online, render(
+                            screenTemplate
                                     .replace("%reason%", esc(reason))
                                     .replace("%staff%", esc(staffName))
                                     .replace("%remaining%", esc(durationText))));
@@ -141,18 +148,24 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                         if (!played) {
                             Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                                 if (isGone(sender)) return;
-                                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                                sender.sendMessage(render(
                                         message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", esc(name))));
                             });
                         }
                     });
                 }
 
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("tempban-success", "<green>%player% has been banned for %duration%. <gray>(%reason%)")
+                String successTemplate = permanent
+                        ? message("ban-success", "<green>%player% has been permanently banned. <gray>(%reason%)")
+                        : message("tempban-success", "<green>%player% has been banned for %duration%. <gray>(%reason%)");
+                sender.sendMessage(render(
+                        successTemplate
                                 .replace("%player%", esc(name)).replace("%duration%", esc(durationText)).replace("%reason%", esc(reason))));
 
-                broadcast(message("tempban-broadcast", "")
+                String broadcastTemplate = permanent
+                        ? message("ban-broadcast", "")
+                        : message("tempban-broadcast", "");
+                broadcast(broadcastTemplate
                         .replace("%player%", esc(name)).replace("%staff%", esc(staffName))
                         .replace("%duration%", esc(durationText)).replace("%reason%", esc(reason)));
             });

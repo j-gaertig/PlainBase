@@ -50,11 +50,20 @@ public class JoinItemsListener implements Listener {
 
         // Code default matches the shipped joinitems.yml (op-bypass: false):
         // OPs are restricted like everyone else unless the admin opts in.
+        // plainbase.admin always bypasses (no new permission node needed —
+        // paper-plugin.yml declares no joinitems wildcard to reuse).
+        if (player.hasPermission("plainbase.admin")) {
+            return false;
+        }
         if (player.isOp() && cfg.getBoolean("settings.op-bypass", false)) {
             return false;
         }
 
         String configKey = item.getItemMeta().getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
+        // Fail-closed for stale PDC keys: a join item whose config entry is
+        // gone must stay restricted, never silently become movable/droppable.
+        if (configKey == null) return true;
+        if (cfg.getConfigurationSection("items." + configKey) == null) return true;
         List<String> flags = cfg.getStringList("items." + configKey + ".flags");
 
         return flags.contains(restrictionFlag);
@@ -92,13 +101,26 @@ public class JoinItemsListener implements Listener {
                 if (!flags.contains(requiredFlag)) continue;
             }
 
+            // Re-give dupe guard: if an exemplar of this key is already
+            // anywhere in the inventory, skip the re-give (covers moved
+            // originals after /clear or death).
+            if (requiredFlag != null && inventoryHasJoinItemKey(player, key)) {
+                continue;
+            }
+
             // Explicit slot presence check: a missing slot key must never
             // default to 0 and overwrite slot 0 — skip with a warning.
             if (!itemsSection.contains(key + ".slot")) {
                 plugin.getLogger().warning("Missing slot for join item '" + key + "', skipping.");
                 continue;
             }
-            int slot = itemsSection.getInt(key + ".slot");
+            int slot;
+            try {
+                slot = Integer.parseInt(String.valueOf(itemsSection.get(key + ".slot")));
+            } catch (Exception e) {
+                plugin.getLogger().warning("Invalid slot for join item '" + key + "', skipping.");
+                continue;
+            }
             // Slot validation: player inventory slots are 0-35. An invalid
             // slot must never throw or write elsewhere — skip with a warning.
             if (slot < 0 || slot >= 36) {
@@ -109,7 +131,10 @@ public class JoinItemsListener implements Listener {
             String name = itemsSection.getString(key + ".name", "");
             List<String> loreStrings = itemsSection.getStringList(key + ".lore");
 
-            if (material == null) continue;
+            if (material == null) {
+                plugin.getLogger().warning("Invalid material in join item '" + key + "'");
+                continue;
+            }
 
             ItemStack item = new ItemStack(material);
             ItemMeta meta = item.getItemMeta();
@@ -471,7 +496,7 @@ public class JoinItemsListener implements Listener {
         if (configKey == null) return false;
         // Explicit null-guard: config may be gone after a reload — fail closed.
         org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
-        if (cfg == null) return false;
+        if (cfg == null) return true;
         try {
             return cfg.getStringList("items." + configKey + ".flags")
                     .contains(flag);
@@ -483,6 +508,55 @@ public class JoinItemsListener implements Listener {
     private boolean isJoinItem(ItemStack item) {
         if (item == null || item.getType() == Material.AIR || !item.hasItemMeta()) return false;
         return item.getItemMeta().getPersistentDataContainer().has(joinItemKey, PersistentDataType.STRING);
+    }
+
+    private boolean inventoryHasJoinItemKey(Player player, String key) {
+        try {
+            for (ItemStack stack : player.getInventory().getContents()) {
+                if (stackHasJoinItemKey(stack, key, 2)) return true;
+            }
+            // P1: Ender chest scan — same PDC-key check, otherwise
+            // original-in-enderchest + /clear bypasses the re-give guard.
+            for (ItemStack stack : player.getEnderChest().getContents()) {
+                if (stackHasJoinItemKey(stack, key, 2)) return true;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed join item re-give check: " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * PDC-key check for one stack incl. shulker nesting (max depth 2).
+     * Never throws: meta casts are guarded, failures return false.
+     */
+    private boolean stackHasJoinItemKey(ItemStack stack, String key, int depth) {
+        try {
+            if (stack == null || stack.getType().isAir()) return false;
+            if (isJoinItem(stack)) {
+                ItemMeta meta = stack.getItemMeta();
+                if (meta != null
+                        && key.equals(meta.getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING))) {
+                    return true;
+                }
+            }
+            if (depth <= 0 || !stack.hasItemMeta()) return false;
+            ItemMeta meta = stack.getItemMeta();
+            if (!(meta instanceof org.bukkit.inventory.meta.BlockStateMeta blockMeta)) return false;
+            org.bukkit.block.BlockState state;
+            try {
+                state = blockMeta.getBlockState();
+            } catch (Exception e) {
+                return false;
+            }
+            if (!(state instanceof org.bukkit.block.ShulkerBox shulker)) return false;
+            for (ItemStack nested : shulker.getInventory().getContents()) {
+                if (stackHasJoinItemKey(nested, key, depth - 1)) return true;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
     }
 
     /**

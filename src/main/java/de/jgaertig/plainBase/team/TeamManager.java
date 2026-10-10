@@ -542,6 +542,10 @@ public class TeamManager {
             // on the same team (last-admin invariant), same order as add()
             // (player lock first, team lock second — no deadlock).
             synchronized (teamLockFor(id)) {
+                if (isMember(uuid, id)) {
+                    player.sendMessage(msg(cfgSnapshot, "already-member", "team", id));
+                    return;
+                }
                 if (getPlayerTeams(uuid).size() >= maxTeams) {
                     player.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", player.getName(), "max", String.valueOf(maxTeams)));
                     return;
@@ -974,6 +978,7 @@ public class TeamManager {
         }
         for (String teamId : memberOf) {
             Role role = getRole(player.getUniqueId(), teamId);
+            if (role == null) continue;
             player.sendMessage(msg(cfgSnapshot, "your-teams-entry", "team", teamId, "role", role.name().toLowerCase(Locale.ROOT)));
         }
     }
@@ -1025,8 +1030,12 @@ public class TeamManager {
         UUID uuid = player.getUniqueId();
         String teamId = scoreboardTeamOf.remove(uuid);
         if (teamId == null || scoreboard == null) return;
+        String sbName = scoreboardName(teamId);
+        // Never touch foreign teams: only scoreboard teams created by this
+        // instance may be mutated (same guard as shutdown/sync).
+        if (!sbName.startsWith("pb_") || !ownedScoreboardTeams.contains(sbName)) return;
         try {
-            Team team = scoreboard.getTeam(scoreboardName(teamId));
+            Team team = scoreboard.getTeam(sbName);
             if (team != null) {
                 try {
                     team.removeEntry(player.getName());
@@ -1336,6 +1345,10 @@ public class TeamManager {
             Team team;
             try {
                 team = scoreboard.getTeam(name);
+                if (team != null && !ownedScoreboardTeams.contains(name)) {
+                    plugin.getLogger().warning("Scoreboard team '" + name + "' already exists and was not created by PlainBase — skipping (not hijacking foreign team).");
+                    continue;
+                }
                 if (team == null) team = scoreboard.registerNewTeam(name);
             } catch (IllegalArgumentException | IllegalStateException e) {
                 // Duplicate/stale registration or a broken scoreboard — skip
@@ -1397,6 +1410,11 @@ public class TeamManager {
 
     private void assignScoreboardTeam(UUID uuid, String teamId) {
         if (scoreboard == null) return;
+        // Never track foreign teams: without this the mirror map would hold
+        // ids whose vanilla team belongs to another plugin, and handleQuit
+        // would mutate that foreign team on quit.
+        String sbName = scoreboardName(teamId);
+        if (!sbName.startsWith("pb_") || !ownedScoreboardTeams.contains(sbName)) return;
         String previous = scoreboardTeamOf.put(uuid, teamId);
         if (previous != null && !previous.equals(teamId)) {
             refreshScoreboardEntries(previous);

@@ -295,7 +295,10 @@ public class ModerationListener implements Listener {
     private Component kickMessage(String text) {
         try {
             return plugin.getMiniMessage().deserialize(text);
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // Throwable, not just Exception: an Error from a broken admin
+            // template must never escape the login deny path — fail closed
+            // to the plain-text screen.
             plugin.getLogger().warning("Invalid ban-screen MiniMessage, using plain fallback: " + e.getMessage());
             return Component.text(stripTags(text));
         }

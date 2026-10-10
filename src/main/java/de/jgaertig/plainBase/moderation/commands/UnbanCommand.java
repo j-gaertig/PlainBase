@@ -31,7 +31,7 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
         if (!checkPreconditions(sender, "plainbase.moderation.unban", "unban")) return;
 
         if (args.length < 1) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/unban <player>"));
+            sender.sendMessage(render("<yellow>Usage: <gray>/unban <player>"));
             return;
         }
 
@@ -47,11 +47,11 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
         resolveTarget(sender, targetName, offlinePlayer -> {
             if (isGone(sender)) return;
             if (manager == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+                sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
                 return;
             }
             if (offlinePlayer == null) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
                 return;
             }
@@ -67,7 +67,7 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
                 try {
                     if (isProtectedBan(manager.getActiveBan(offlinePlayer.getUniqueId()).orElse(null),
                             offlinePlayer, sender)) {
-                        sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        sender.sendMessage(render(
                                 message("exempt", "<red>You cannot punish this player.")));
                         return;
                     }
@@ -79,17 +79,17 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
             manager.unbanPlayerAsync(offlinePlayer.getUniqueId(), staffUuid, staffName, (unbanned, dbError) -> {
                 if (isGone(sender)) return;
                 if (dbError) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("db-error", "<red>Database error, please try again later.")));
                     return;
                 }
                 if (!unbanned) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("not-banned", "<red>%player% is not currently banned. <gray>(Name change? Bans are UUID-based.)").replace("%player%", esc(name))));
                     return;
                 }
 
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("unban-success", "<green>%player% has been unbanned.").replace("%player%", esc(name))));
 
                 broadcast(message("unban-broadcast", "").replace("%player%", esc(name)).replace("%staff%", esc(staffName)));

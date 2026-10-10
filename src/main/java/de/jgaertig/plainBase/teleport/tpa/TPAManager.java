@@ -95,6 +95,14 @@ public class TPAManager {
                     return;
                 }
             }
+            // Cross-request guard: the requester already has an incoming
+            // pending request (someone waits for them). A reverse request
+            // (B->A while A->B is pending) must not coexist — reuse the
+            // outgoing message, no new key.
+            if (activeSessions.containsKey(requesterId)) {
+                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You already have an outgoing teleport request! Use /tpacancel to cancel it."));
+                return;
+            }
 
             // Atomic reservation: only one request per target can win. The timeout
             // task is scheduled only after the reservation succeeded, so a lost
@@ -273,6 +281,7 @@ public class TPAManager {
             if (!a.canSee(b) || !b.canSee(a)) return true;
         } catch (Exception e) {
             plugin.getLogger().fine("Vanish visibility check failed for " + a.getName() + "/" + b.getName() + ": " + e.getMessage());
+            return true;
         }
         return false;
     }
@@ -582,6 +591,13 @@ public class TPAManager {
                 if (partner != null && partner.isOnline()) {
                     partner.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
                 }
+            } else if (warmup != null) {
+                // Direct-warmup case: the quitter was the teleporting player,
+                // the anchor holds no warmup entry — still inform the anchor.
+                Player partner = Bukkit.getPlayer(partnerId);
+                if (partner != null && partner.isOnline()) {
+                    partner.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                }
             }
         }
 
@@ -712,7 +728,7 @@ public class TPAManager {
                 try {
                     Player partner = Bukkit.getPlayer(partnerId);
                     if (partner != null && partner.isOnline()) {
-                        partner.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                        partner.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: Request cancelled."));
                     }
                 } catch (Exception ignored) {
                 }

@@ -674,10 +674,9 @@ public class RTPManager {
         org.bukkit.block.Block b2 = loc.getBlock().getRelative(0, 2, 0);
         if (!b1.isPassable() || !b2.isPassable()) return false;
         // Headroom uses the same configured block blacklist as the ground
-        // check above (plus passability). AIR/CAVE_AIR/VOID_AIR entries in
-        // that list can never match here — headroom blocks at a candidate
-        // spot are real blocks — so they are simply never hit, no special
-        // handling needed.
+        // check above (plus passability). AIR/CAVE_AIR/VOID_AIR are exempted
+        // code-side: old teleport.yml files keep them in the list (defaults
+        // are only merged, never pruned), and headroom at a valid spot is air.
         String head1Name = b1.getType().name();
         String head2Name = b2.getType().name();
         // Same always-unsafe basis for headroom (portal/powder-snow are
@@ -686,7 +685,8 @@ public class RTPManager {
         if (head1Name.contains("LEAVES") || head2Name.contains("LEAVES")) return false;
         if (blacklistEnabled) {
             java.util.List<String> blacklist = teleportConfig.getStringList("rtp.blacklist.blocks");
-            if (blacklist.contains(head1Name) || blacklist.contains(head2Name)) return false;
+            if ((!isAirVariant(b1.getType()) && blacklist.contains(head1Name))
+                    || (!isAirVariant(b2.getType()) && blacklist.contains(head2Name))) return false;
         } else {
             Material head1 = b1.getType();
             Material head2 = b2.getType();
@@ -699,6 +699,10 @@ public class RTPManager {
         }
 
         return true;
+    }
+
+    private static boolean isAirVariant(Material material) {
+        return material == Material.AIR || material == Material.CAVE_AIR || material == Material.VOID_AIR;
     }
 
     /**
@@ -785,15 +789,39 @@ public class RTPManager {
     }
 
     public void cancelSearch(Player player) {
+        cancelSearch(player, null);
+    }
+
+    public void cancelSearch(Player player, String reason) {
         if (player == null) return;
-        searching.remove(player.getUniqueId());
+        UUID uuid;
+        try {
+            uuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
+        boolean wasSearching = searching.remove(uuid);
+        if (wasSearching) {
+            // A search that never reached a warmup/teleport must not consume
+            // the cooldown (same as handleQuit/cancelAll).
+            cooldowns.remove(uuid);
+            try {
+                if (player.isOnline()) {
+                    String msg = (reason != null && !reason.isEmpty())
+                            ? "<red>RTP cancelled: " + reason
+                            : "<red>RTP search cancelled.";
+                    player.sendMessage(plugin.getMiniMessage().deserialize(msg));
+                }
+            } catch (Exception ignored) {
+            }
+        }
         // Opportunistic purge of this player's entry on quit/cancel so stale
         // entries of players who never come back cannot accumulate. Only
         // expired entries are removed — an active cooldown is never deleted.
         long now = System.currentTimeMillis();
-        Long expiry = cooldowns.get(player.getUniqueId());
+        Long expiry = cooldowns.get(uuid);
         if (expiry != null && expiry <= now) {
-            cooldowns.remove(player.getUniqueId(), expiry);
+            cooldowns.remove(uuid, expiry);
         }
         // Global opportunistic purge of all expired cooldowns (quit/cancel
         // path): without this, cooldowns of players who quit with an active

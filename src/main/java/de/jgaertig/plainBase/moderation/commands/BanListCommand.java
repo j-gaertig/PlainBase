@@ -35,7 +35,7 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
         // local reference keeps working instead of NPE-ing.
         BanManager banManager = plugin.getBanManager();
         if (banManager == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
             return;
         }
 
@@ -48,7 +48,7 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                 parsed = Math.min(10000L, Math.max(1L, parsed));
                 page = (int) parsed;
             } catch (NumberFormatException e) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>'" + esc(args[0]) + "' is not a valid page number — showing page 1."));
+                sender.sendMessage(render("<red>'" + esc(args[0]) + "' is not a valid page number — showing page 1."));
             }
         }
 
@@ -56,12 +56,12 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
         long now = System.currentTimeMillis();
 
         if (active.isEmpty()) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(message("banlist-empty", "<gray>There are currently no active bans.")));
+            sender.sendMessage(render(message("banlist-empty", "<gray>There are currently no active bans.")));
         } else {
             long fromLong = ((long) page - 1L) * (long) PAGE_SIZE;
             int from = (int) Math.min(fromLong, Integer.MAX_VALUE);
             if (fromLong < active.size()) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("banlist-header", "<gray>--- Active bans (%count%) ---").replace("%count%", String.valueOf(active.size()))));
 
                 int to = Math.min(from + PAGE_SIZE, active.size());
@@ -73,14 +73,14 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                     String duration = record.isPermanent() ? "permanent"
                             : (remaining <= 0 ? "expired"
                                     : DurationParser.format(remaining) + " left");
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("banlist-entry", "<yellow>%player% <gray>- %reason% (%duration%)")
                                     .replace("%player%", esc(record.name()))
                                     .replace("%reason%", esc(record.reason()))
                                     .replace("%duration%", duration)));
                 }
             } else {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("banlist-empty-page", "<gray>There are no entries on this page (page %page%).").replace("%page%", String.valueOf(page))));
             }
         }
@@ -90,7 +90,7 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
             long fromLong = ((long) page - 1L) * (long) PAGE_SIZE;
             int from = (int) Math.min(fromLong, Integer.MAX_VALUE);
             if (fromLong < activeIps.size()) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("banlist-ip-header", "<gray>--- Active IP bans (%count%) ---").replace("%count%", String.valueOf(activeIps.size()))));
 
                 int to = Math.min(from + PAGE_SIZE, activeIps.size());
@@ -99,14 +99,14 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                     String duration = record.isPermanent() ? "permanent"
                             : (remaining <= 0 ? "expired"
                                     : DurationParser.format(remaining) + " left");
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("banlist-ip-entry", "<yellow>%ip% <gray>- %reason% (%duration%)")
                                     .replace("%ip%", esc(record.ip()))
                                     .replace("%reason%", esc(record.reason()))
                                     .replace("%duration%", duration)));
                 }
             } else {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("banlist-ip-empty-page", "<gray>There are no IP bans on this page (page %page%).").replace("%page%", String.valueOf(page))));
             }
         }

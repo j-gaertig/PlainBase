@@ -156,8 +156,14 @@ public class ModerationDatabase {
                 }
                 createTables(conn);
                 migrateTextColumns(conn);
-                normalizeUuidCase(conn);
-                normalizeIpSpellings(conn);
+                // normalizeUuidCase()/normalizeIpSpellings() are full-table
+                // scans over unbounded history tables — they must not run
+                // synchronously on the calling (main) thread at startup.
+                // connect() returns fast once tables exist; normalization is
+                // deferred to the async scheduler below (idempotent, converges
+                // to a no-op — reads use exact comparisons either way, a
+                // legacy row simply matches only after its async pass).
+                scheduleAsyncNormalization();
             }
         } catch (SQLException | RuntimeException e) {
             // createTables()/getConnection() failed AFTER the pool was opened —
@@ -182,6 +188,31 @@ public class ModerationDatabase {
             } catch (Exception e) {
                 plugin.getLogger().fine("Could not close moderation pool: " + e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Defers the one-time legacy-data normalizations (UUID case, IP
+     * spellings) off the calling (main) thread: both scan whole history
+     * tables synchronously, which stalls startup on large databases.
+     * connect() returns as soon as tables exist; this runs the scans on the
+     * async scheduler afterwards. Idempotent and best-effort (failures are
+     * logged inside the callees, never fatal) — no schema change, same SQL.
+     */
+    private void scheduleAsyncNormalization() {
+        try {
+            org.bukkit.Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+                HikariDataSource ds = dataSource;
+                if (ds == null || ds.isClosed()) return;
+                try (Connection conn = ds.getConnection()) {
+                    normalizeUuidCase(conn);
+                    normalizeIpSpellings(conn);
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not normalize moderation legacy data: " + e.getMessage());
+                }
+            });
+        } catch (RuntimeException e) {
+            plugin.getLogger().warning("Could not schedule moderation normalization: " + e.getMessage());
         }
     }
 
@@ -558,6 +589,53 @@ public class ModerationDatabase {
         }
     }
 
+    /**
+     * IDs of ALL currently-active (unrevoked, unexpired) bans for the uuid —
+     * the guard-time snapshot for {@code revokeBansByIds}. Same WHERE
+     * semantics as {@link #findActiveBan} (which returns only the latest row),
+     * but returns every matching id so a per-ID revoke covers legacy
+     * duplicate rows without touching bans inserted after the guard moment.
+     * No schema change, same columns, PreparedStatement only.
+     */
+    public List<Integer> findActiveBanIds(UUID uuid, long now) throws SQLException {
+        String sql = "SELECT id FROM " + prefixChecked() + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
+        List<Integer> ids = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
+            ps.setLong(2, now);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) ids.add(rs.getInt(1));
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Revokes ONLY the given row IDs (guard-time snapshot) instead of every
+     * unrevoked row for the uuid: a ban inserted between the guard check and
+     * this UPDATE (new id, not in the list) survives. Placeholders only — the
+     * ID list is bound, never concatenated as values. No schema change.
+     *
+     * @return number of rows revoked; unban success is decided on this count
+     */
+    public int revokeBansByIds(List<Integer> ids, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        if (ids == null || ids.isEmpty()) return 0;
+        StringBuilder sql = new StringBuilder("UPDATE " + prefixChecked()
+                + "bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE id IN (");
+        for (int i = 0; i < ids.size(); i++) {
+            if (i > 0) sql.append(", ");
+            sql.append("?");
+        }
+        sql.append(") AND revoked = 0");
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
+            ps.setString(2, staffName);
+            ps.setLong(3, unbannedAt);
+            for (int i = 0; i < ids.size(); i++) ps.setInt(4 + i, ids.get(i));
+            return ps.executeUpdate();
+        }
+    }
+
     public KickRecord insertKick(UUID uuid, String name, String reason, UUID staffUuid, String staffName) throws SQLException {
         long kickedAt = System.currentTimeMillis();
         String sql = "INSERT INTO " + prefixChecked() + "kicks (uuid, name, reason, staff_uuid, staff_name, kicked_at) VALUES (?, ?, ?, ?, ?, ?)";
@@ -613,6 +691,49 @@ public class ModerationDatabase {
             ps.setString(2, staffName);
             ps.setLong(3, unbannedAt);
             ps.setString(4, ip);
+            return ps.executeUpdate();
+        }
+    }
+
+    /**
+     * IDs of ALL currently-active IP bans for the address — guard-time
+     * snapshot for {@code revokeIpBansByIds}. Same WHERE semantics as
+     * {@link #findActiveIpBan}, but every matching id. No schema change.
+     */
+    public List<Integer> findActiveIpBanIds(String ip, long now) throws SQLException {
+        String sql = "SELECT id FROM " + prefixChecked() + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
+        List<Integer> ids = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, ip);
+            ps.setLong(2, now);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) ids.add(rs.getInt(1));
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Revokes ONLY the given row IDs (guard-time snapshot): an IP ban
+     * inserted between guard and revoke survives. Placeholders only, no
+     * schema change.
+     *
+     * @return number of rows revoked
+     */
+    public int revokeIpBansByIds(List<Integer> ids, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        if (ids == null || ids.isEmpty()) return 0;
+        StringBuilder sql = new StringBuilder("UPDATE " + prefixChecked()
+                + "ip_bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE id IN (");
+        for (int i = 0; i < ids.size(); i++) {
+            if (i > 0) sql.append(", ");
+            sql.append("?");
+        }
+        sql.append(") AND revoked = 0");
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
+            ps.setString(2, staffName);
+            ps.setLong(3, unbannedAt);
+            for (int i = 0; i < ids.size(); i++) ps.setInt(4 + i, ids.get(i));
             return ps.executeUpdate();
         }
     }

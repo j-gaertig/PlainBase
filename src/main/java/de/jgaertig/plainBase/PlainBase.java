@@ -90,6 +90,12 @@ public final class PlainBase extends JavaPlugin {
     private volatile TPAManager tpaManager;
     private volatile RTPManager rtpManager;
     private volatile VanishManager vanishManager;
+    /**
+     * Vanish carry-over by value across reloads: stopModules() always drops
+     * the manager instance and snapshots the vanished IDs here; setupVanish()
+     * re-hides from this copy (take-and-clear). Never holds a live manager.
+     */
+    private volatile Set<java.util.UUID> carriedVanishedIds = Set.of();
     private volatile MenuManager menuManager;
     private volatile BanManager banManager;
     private volatile TeamManager teamManager;
@@ -189,7 +195,7 @@ public final class PlainBase extends JavaPlugin {
 
         reloadModules();
 
-        getLogger().info("Successfully Enabled!");
+        getLogger().info("Successfully Enabled! (Version " + getPluginMeta().getVersion() + ")");
     }
 
     @Override
@@ -219,7 +225,7 @@ public final class PlainBase extends JavaPlugin {
 
         removePermissions();
 
-        getLogger().info("Successfully Disabled!");
+        getLogger().info("Successfully Disabled! (Version " + getPluginMeta().getVersion() + ")");
     }
 
     /**
@@ -559,7 +565,9 @@ public final class PlainBase extends JavaPlugin {
         // in the configs map are untouched by reloadConfig(), so the
         // spawn/menu flush inside stopModules() still sees the old data.
         reloadConfig();
-        stopModules();
+        // Reload path: never block the global region thread on pending async
+        // writes or synchronous disk I/O (the disable path uses stopModules()).
+        stopModules(false);
 
         // Each module is guarded so one broken module (corrupt config, dead
         // database, ...) disables only itself instead of killing every module
@@ -623,12 +631,18 @@ public final class PlainBase extends JavaPlugin {
      * an update), which hides misconfiguration. Logging only, no migration.
      */
     private boolean isModuleEnabled(String moduleName) {
-        if (!getConfig().contains("modules." + moduleName)) {
-            getLogger().warning("Missing config key 'modules." + moduleName
-                    + "' in config.yml, assuming disabled. Add it or regenerate config.yml.");
-            return false;
+        // Root-config read under the central configLock (same monitor as
+        // toggle/suggest/GlobalListener/checkAllConfigVersions): the instance
+        // is fetched INSIDE the lock since reloadConfig() may swap it.
+        synchronized (configLock) {
+            FileConfiguration rootCfg = getConfig();
+            if (rootCfg == null || !rootCfg.contains("modules." + moduleName)) {
+                getLogger().warning("Missing config key 'modules." + moduleName
+                        + "' in config.yml, assuming disabled. Add it or regenerate config.yml.");
+                return false;
+            }
+            return rootCfg.getBoolean("modules." + moduleName, false);
         }
-        return getConfig().getBoolean("modules." + moduleName, false);
     }
 
     /**
@@ -639,7 +653,7 @@ public final class PlainBase extends JavaPlugin {
         try {
             setup.run();
         } catch (Exception e) {
-            getLogger().severe("Failed to enable the " + moduleName + " module: " + e.getMessage());
+            getLogger().log(java.util.logging.Level.SEVERE, "Failed to enable the " + moduleName + " module", e);
         }
     }
 
@@ -656,7 +670,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     /**
-     * Tracks an async persistence future so {@link #awaitPendingSaves()} can
+     * Tracks an async persistence future so {@link #awaitPendingSaves(boolean)} can
      * await it during reload/disable. Used by VanishManager/TPAManager
      * per-player saves (which historically ran untracked and could be lost to
      * a cancelled async task on shutdown). Never throws.
@@ -668,23 +682,40 @@ public final class PlainBase extends JavaPlugin {
                 pendingSaves.removeIf(CompletableFuture::isDone);
                 pendingSaves.add(future);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            getLogger().fine("Failed to track pending async save: " + e.getMessage());
         }
     }
 
     /**
-     * Waits (bounded, 5s) for pending async config writes tracked in
-     * {@link #pendingSaves}. Minimal flush barrier for reload/disable —
-     * completed futures are removed. On timeout the snapshot entries are
-     * abandoned (removeAll) so they can never leak across reloads, and the
-     * abandon is logged. Never throws.
+     * Flush barrier for pending async config writes tracked in
+     * {@link #pendingSaves}. Completed futures are removed. On timeout the
+     * snapshot entries are abandoned (removeAll) so they can never leak
+     * across reloads, and the abandon is logged. Never throws.
+     *
+     * @param block {@code true} on the disable path: waits bounded (5s) for
+     *              the writes. {@code false} on the reload path: never stalls
+     *              the global region thread — attaches an async cleanup and
+     *              returns immediately while the writes finish in the
+     *              background.
      */
-    private void awaitPendingSaves() {
+    private void awaitPendingSaves(boolean block) {
         CompletableFuture<?>[] snapshot;
         synchronized (pendingSaves) {
             pendingSaves.removeIf(CompletableFuture::isDone);
             if (pendingSaves.isEmpty()) return;
             snapshot = pendingSaves.toArray(new CompletableFuture[0]);
+        }
+        if (!block) {
+            CompletableFuture.allOf(snapshot).whenComplete((v, t) -> {
+                if (t != null) {
+                    getLogger().warning("Async config writes failed during reload: " + t.getMessage());
+                }
+                synchronized (pendingSaves) {
+                    pendingSaves.removeAll(java.util.Arrays.asList(snapshot));
+                }
+            });
+            return;
         }
         try {
             CompletableFuture.allOf(snapshot).get(5, TimeUnit.SECONDS);
@@ -703,7 +734,22 @@ public final class PlainBase extends JavaPlugin {
         }
     }
 
+    /**
+     * Disable-path entry point: blocks (bounded) on pending async writes and
+     * flushes module configs synchronously. Reload callers must use
+     * {@link #stopModules(boolean)} with {@code false} instead so the global
+     * region thread never stalls on disk I/O.
+     */
     public void stopModules() {
+        stopModules(true);
+    }
+
+    /**
+     * @param block {@code true} on the disable path (bounded blocking wait +
+     *              synchronous config flush), {@code false} on the reload path
+     *              (async continuation, no disk I/O on the calling thread).
+     */
+    public void stopModules(boolean block) {
         // Thread-guard (warn-only by design): onDisable() must run
         // synchronously even when called during shutdown where rescheduling
         // would silently drop the whole shutdown path. Reload callers already
@@ -714,37 +760,86 @@ public final class PlainBase extends JavaPlugin {
             }
         } catch (Exception ignored) {
         }
-        // Flush pending async writes first (bounded wait): async tasks may be
-        // cancelled on disable/reload and their changes would be lost.
-        awaitPendingSaves();
-        // Synchronous vanish flush: per-player vanish/tpauto saves run async
-        // and may have been cancelled above — rewrite the authoritative
-        // in-memory vanish state directly so a kill right after /vanish (or a
-        // reload) cannot lose it. Runs before the resetAll handling below.
+        // Flush pending async writes first: async tasks may be cancelled on
+        // disable/reload and their changes would be lost. Disable path waits
+        // bounded; reload path continues async without blocking the global
+        // region thread.
+        awaitPendingSaves(block);
+        // Synchronous vanish flush on the disable path only: per-player
+        // vanish saves run async and may have been cancelled on shutdown —
+        // rewrite the authoritative in-memory vanish state directly so a kill
+        // right after /vanish cannot lose it. Runs before the resetAll
+        // handling below. Reload path (block==false): never stall the global
+        // region thread on per-player file I/O — flush async and track the
+        // future so a later disable still awaits it (bounded) via
+        // awaitPendingSaves(true); the already-tracked per-player saves keep
+        // running in the background meanwhile (Folia never cancels tasks on
+        // reload, only on disable).
         if (vanishManager != null) {
-            try {
-                vanishManager.flushSync();
-            } catch (Exception e) {
-                getLogger().fine("Failed to flush vanish state on shutdown: " + e.getMessage());
+            if (block) {
+                try {
+                    vanishManager.flushSync();
+                } catch (Exception e) {
+                    getLogger().warning("Failed to flush vanish state on shutdown: " + e.getMessage());
+                }
+            } else {
+                final VanishManager vm = vanishManager;
+                final CompletableFuture<Void> flushFuture = new CompletableFuture<>();
+                trackPendingSave(flushFuture);
+                try {
+                    Bukkit.getAsyncScheduler().runNow(this, task -> {
+                        try {
+                            vm.flushSync();
+                        } catch (Exception e) {
+                            getLogger().warning("Failed to flush vanish state on reload: " + e.getMessage());
+                        } finally {
+                            flushFuture.complete(null);
+                        }
+                    });
+                } catch (Exception e) {
+                    getLogger().warning("Could not schedule async vanish flush on reload: " + e.getMessage());
+                    flushFuture.complete(null);
+                }
             }
         }
-        // Synchronously flush pending async config writes first: async tasks
-        // may be cancelled on disable/reload and their changes would be lost.
+        // Disable path: synchronous flush (shutdown runs off the tick path,
+        // sync disk I/O is allowed there). Reload path: async variants so the
+        // global region thread never blocks on disk I/O (the sync methods are
+        // shutdown/fallback-only per their Javadoc).
         // Only spawn.yml and menu.yml are flushed here by design — everything
         // else stays async and may be dropped on a hard kill: vanish
         // per-player files (VanishManager), tpauto flags
         // (data/playerdata/<uuid>.yml via TPAManager) and the moderation
         // cache/database (BanManager.shutdown() closes the pool; unwritten
         // cache entries are lost).
-        try {
-            saveSpawnConfig();
-        } catch (Exception e) {
-            getLogger().fine("Failed to flush spawn.yml on shutdown: " + e.getMessage());
-        }
-        try {
-            saveMenuConfig();
-        } catch (Exception e) {
-            getLogger().fine("Failed to flush menu.yml on shutdown: " + e.getMessage());
+        if (block) {
+            try {
+                saveSpawnConfig();
+            } catch (Exception e) {
+                getLogger().warning("Failed to flush spawn.yml on shutdown: " + e.getMessage());
+            }
+            try {
+                saveMenuConfig();
+            } catch (Exception e) {
+                getLogger().warning("Failed to flush menu.yml on shutdown: " + e.getMessage());
+            }
+        } else {
+            // Null-guarded: a disabled module has no config loaded — the
+            // async writer would only log a "not loaded" warning for it.
+            if (getSpawnConfig() != null) {
+                try {
+                    saveSpawnConfigAsync();
+                } catch (Exception e) {
+                    getLogger().warning("Failed to schedule async flush of spawn.yml on reload: " + e.getMessage());
+                }
+            }
+            if (getMenuConfig() != null) {
+                try {
+                    saveMenuConfigAsync();
+                } catch (Exception e) {
+                    getLogger().warning("Failed to schedule async flush of menu.yml on reload: " + e.getMessage());
+                }
+            }
         }
 
         // Cache the vanish config BEFORE configs.clear() below: after clearing,
@@ -754,7 +849,16 @@ public final class PlainBase extends JavaPlugin {
         // sees modules.vanish=false here. onDisable() has no prior reload and
         // correctly sees the current flags.
         FileConfiguration vanishConfig = getVanishConfig();
-        boolean vanishEnabled = getConfig().getBoolean("modules.vanish", false);
+        // Root-config read under the central configLock (same monitor as
+        // toggle/suggest/GlobalListener/checkAllConfigVersions/isModuleEnabled):
+        // reloadModules() reloads the root config just before this, and a
+        // concurrent toggle must never interleave with this snapshot.
+        // Lock order stays configLock-only here (no nested config monitor).
+        boolean vanishEnabled;
+        synchronized (configLock) {
+            FileConfiguration rootCfg = getConfig();
+            vanishEnabled = rootCfg != null && rootCfg.getBoolean("modules.vanish", false);
+        }
         boolean persist = vanishConfig != null && vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
 
         if (broadcastManager != null) {
@@ -769,20 +873,28 @@ public final class PlainBase extends JavaPlugin {
         // Reveal everyone when the vanish module is switched off, or when
         // persist-on-rejoin is disabled (reload must not keep anyone hidden).
         // A plain reload with persist enabled keeps vanished players hidden
-        // and setupVanish() re-applies their state.
-        // F1: a throwing resetAll must not abort the rest of stopModules(),
-        // and a disabled module must drop the manager reference — otherwise
-        // the stale manager (and its hidden players) survives the toggle-off
-        // because setupVanish() never runs to replace it.
+        // and setupVanish() re-applies their state from the copied ID set.
+        // F1: a throwing resetAll must not abort the rest of stopModules().
+        // The manager reference is always dropped below (even when the module
+        // stays enabled) — otherwise the stale manager survives the reload;
+        // carry-over is by value via carriedVanishedIds, never a live instance.
         if (vanishManager != null && (!vanishEnabled || !persist)) {
             try {
                 vanishManager.resetAll();
             } catch (Exception e) {
-                getLogger().fine("Failed to reset vanish state: " + e.getMessage());
+                getLogger().warning("Failed to reset vanish state: " + e.getMessage());
             }
         }
-        if (!vanishEnabled) {
+        if (vanishManager != null) {
+            try {
+                carriedVanishedIds = Set.copyOf(vanishManager.getVanishedPlayers());
+            } catch (Exception e) {
+                getLogger().warning("Failed to snapshot vanish state, vanished players may be revealed: " + e.getMessage());
+                carriedVanishedIds = Set.of();
+            }
             vanishManager = null;
+        } else {
+            carriedVanishedIds = Set.of();
         }
 
         // Close any open menu inventories before the listeners are
@@ -796,12 +908,12 @@ public final class PlainBase extends JavaPlugin {
             try {
                 menuManager.closeAllMenusSyncAwait(3000);
             } catch (Exception e) {
-                getLogger().fine("Failed to close menus: " + e.getMessage());
+                getLogger().warning("Failed to close menus: " + e.getMessage());
             }
             try {
                 menuManager.closeAllMenusSyncBestEffort();
             } catch (Exception e) {
-                getLogger().fine("Failed to close menus (sync): " + e.getMessage());
+                getLogger().warning("Failed to close menus (sync): " + e.getMessage());
             }
         }
         menuManager = null;
@@ -815,7 +927,7 @@ public final class PlainBase extends JavaPlugin {
             try {
                 banManager.shutdown();
             } catch (Exception e) {
-                getLogger().fine("Failed to shut down ban manager: " + e.getMessage());
+                getLogger().warning("Failed to shut down ban manager: " + e.getMessage());
             }
         }
         banManager = null;
@@ -826,7 +938,7 @@ public final class PlainBase extends JavaPlugin {
             try {
                 teamManager.shutdown();
             } catch (Exception e) {
-                getLogger().fine("Failed to shut down team manager: " + e.getMessage());
+                getLogger().warning("Failed to shut down team manager: " + e.getMessage());
             }
         }
         teamManager = null;
@@ -889,6 +1001,46 @@ public final class PlainBase extends JavaPlugin {
         // The unregister above also removed the global listener: drop the
         // reference so reloadModules() re-registers it via ensureGlobalListener().
         globalListener = null;
+    }
+
+    /**
+     * Reloads the root config and merges jar defaults for missing keys only
+     * (module-config analogue: {@link #mergeMissingDefaults}): an outdated
+     * config.yml keeps working after an update instead of silently assuming
+     * defaults. In-memory only — like the module merge, missing keys persist
+     * on the next saveConfig() (no comment-stripping rewrite here). Never
+     * throws.
+     */
+    @Override
+    public void reloadConfig() {
+        super.reloadConfig();
+        mergeMissingRootDefaults();
+    }
+
+    private void mergeMissingRootDefaults() {
+        try (InputStream in = getResource("config.yml")) {
+            if (in == null) return;
+            try (InputStreamReader reader = new InputStreamReader(in, StandardCharsets.UTF_8)) {
+                FileConfiguration defaults = YamlConfiguration.loadConfiguration(reader);
+                // Root mutation under the central configLock (same monitor as
+                // toggle/suggest/GlobalListener/checkAllConfigVersions): the
+                // live instance is fetched INSIDE the lock since reloadConfig()
+                // may swap it. Lock order stays configLock-only (no nested
+                // config monitor), so no new deadlock is introduced.
+                synchronized (configLock) {
+                    FileConfiguration live = getConfig();
+                    if (live == null) return;
+                    live.setDefaults(defaults);
+                    for (String key : defaults.getKeys(true)) {
+                        if (!live.contains(key)) {
+                            live.set(key, defaults.get(key));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            getLogger().fine("Could not merge defaults for config.yml: " + e.getMessage());
+        }
     }
 
     public @Nullable FileConfiguration loadModuleConfig(String fileName) {
@@ -1078,7 +1230,7 @@ public final class PlainBase extends JavaPlugin {
                 try {
                     config.save(new File(getDataFolder(), "modules/spawn.yml"));
                 } catch (IOException e) {
-                    getLogger().severe("Could not save spawn.yml!");
+                    getLogger().log(java.util.logging.Level.SEVERE, "Could not save spawn.yml!", e);
                 }
             }
         }
@@ -1131,29 +1283,74 @@ public final class PlainBase extends JavaPlugin {
 
     public void setupVanish() {
         if (!ensureGlobalThread("setupVanish", this::setupVanish)) return;
-        // Carry over the old in-memory vanish set across reloads: stopModules()
-        // keeps vanished players hidden when persist-on-rejoin is enabled, so
-        // the fresh manager must know them again (no vanish leak window until
-        // the async per-player persist load catches up). Offline players are
-        // covered by their persisted player-data files via applyOnJoin().
+        // Carry over the vanished IDs snapshotted by stopModules() (by value —
+        // the old manager instance is already gone): the fresh manager must
+        // know them again so nobody is revealed by the reload and nobody stays
+        // hidden without backing state (no vanish leak window until the async
+        // per-player persist load catches up). Offline players are covered by
+        // their persisted player-data files via applyOnJoin().
         // No bulk copyFrom by design: restoreVanishState() re-applies via
         // vanish() so hide effects are preserved (resetAll did not run here).
-        Set<java.util.UUID> previousVanished = vanishManager != null
-                ? vanishManager.getVanishedPlayers() : Set.of();
+        // Take-and-clear: a later setupVanish() without an intermediate
+        // stopModules() must never re-hide a stale set.
+        Set<java.util.UUID> previousVanished = carriedVanishedIds;
+        carriedVanishedIds = Set.of();
 
         FileConfiguration vanishCfg = loadModuleConfig("vanish.yml");
         if (vanishCfg == null) {
             getLogger().severe("Could not load vanish.yml! The vanish module stays disabled until this is fixed.");
-            // Error path must not leave a stale manager with hidden players
-            // behind: reveal everyone and drop the reference so no vanished
-            // state survives without a backing config.
-            if (vanishManager != null) {
+            // Error path: no manager exists to resetAll with (stopModules()
+            // always drops it), so reveal the carried players best-effort —
+            // nobody may stay hidden without a backing manager. Mirrors
+            // VanishManager.unvanish()'s scheduled show plus the no-stored-state
+            // fallback of its self-state reset; per-player guarded, never throws.
+            // Folia: entity visibility/state is entity-thread-only — every call
+            // hops via the viewer/player scheduler (same pattern as
+            // VanishManager.showTo/resetSelfState), never direct on this thread.
+            for (java.util.UUID uuid : previousVanished) {
                 try {
-                    vanishManager.resetAll();
+                    Player player = Bukkit.getPlayer(uuid);
+                    if (player == null || !player.isOnline()) continue;
+                    final Player target = player;
+                    for (Player viewer : Bukkit.getOnlinePlayers()) {
+                        if (viewer.equals(target)) continue;
+                        final Player v = viewer;
+                        try {
+                            v.getScheduler().run(this, t -> {
+                                if (!v.isOnline() || !target.isOnline()) return;
+                                try {
+                                    v.showEntity(this, target);
+                                    try {
+                                        v.listPlayer(target);
+                                    } catch (Exception ignored) {
+                                    }
+                                } catch (Exception ignored) {
+                                }
+                            }, null);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    try {
+                        target.getScheduler().run(this, t -> {
+                            if (!target.isOnline()) return;
+                            try {
+                                target.setInvisible(false);
+                            } catch (Exception ignored) {
+                            }
+                            try {
+                                target.setCollidable(true);
+                            } catch (Exception ignored) {
+                            }
+                            try {
+                                target.setSilent(false);
+                            } catch (Exception ignored) {
+                            }
+                        }, null);
+                    } catch (Exception ignored) {
+                    }
                 } catch (Exception e) {
-                    getLogger().fine("Failed to reset vanish state: " + e.getMessage());
+                    getLogger().warning("Failed to reveal vanished player " + uuid + " without vanish config: " + e.getMessage());
                 }
-                vanishManager = null;
             }
             return;
         }
@@ -1216,8 +1413,8 @@ public final class PlainBase extends JavaPlugin {
         } catch (Exception e) {
             FileConfiguration moderationConfig = getModerationConfig();
             String storageType = moderationConfig != null ? moderationConfig.getString("storage.type", "sqlite") : "<unknown>";
-            getLogger().severe("Could not connect the moderation database (storage.type=" +
-                    storageType + "): " + e.getMessage());
+            getLogger().log(java.util.logging.Level.SEVERE, "Could not connect the moderation database (storage.type=" +
+                    storageType + ")", e);
             getLogger().severe("The moderation module is disabled until this is fixed and /plainbase reload is run.");
             banManager = null;
             return;
@@ -1317,7 +1514,7 @@ public final class PlainBase extends JavaPlugin {
                 try {
                     config.save(new File(getDataFolder(), "modules/menu.yml"));
                 } catch (IOException e) {
-                    getLogger().severe("Could not save menu.yml!");
+                    getLogger().log(java.util.logging.Level.SEVERE, "Could not save menu.yml!", e);
                 }
             }
         }
@@ -1353,7 +1550,7 @@ public final class PlainBase extends JavaPlugin {
             try {
                 data = config.saveToString();
             } catch (Exception e) {
-                getLogger().severe("Could not save " + fileName + "!");
+                getLogger().log(java.util.logging.Level.SEVERE, "Could not save " + fileName + "!", e);
                 return;
             }
         }
@@ -1395,7 +1592,7 @@ public final class PlainBase extends JavaPlugin {
                     }
                 }
             } catch (Exception e) {
-                getLogger().severe("Could not save " + fileName + "!");
+                getLogger().log(java.util.logging.Level.SEVERE, "Could not save " + fileName + "!", e);
             } finally {
                 future.complete(null);
             }

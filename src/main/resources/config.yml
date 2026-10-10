@@ -10,4 +10,4 @@ modules:
   team: false # More Settings in team.yml
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
-version: 1.7
+version: "1.7"

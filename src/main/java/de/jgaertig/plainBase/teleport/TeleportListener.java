@@ -150,7 +150,7 @@ public class TeleportListener implements Listener {
             if (cachedRtpCancelOn.contains(flag) && plugin.getRTPManager() != null) {
                 plugin.getRTPManager().cancelWarmup(p, generateReason(flag));
                 try {
-                    plugin.getRTPManager().cancelSearch(p);
+                    plugin.getRTPManager().cancelSearch(p, generateReason(flag));
                 } catch (Exception ignored) {
                 }
             }
@@ -224,7 +224,7 @@ public class TeleportListener implements Listener {
             if (plugin.getRTPManager() != null) {
                 plugin.getRTPManager().cancelWarmup(p, reason);
                 try {
-                    plugin.getRTPManager().cancelSearch(p);
+                    plugin.getRTPManager().cancelSearch(p, reason);
                 } catch (Exception ignored) {
                 }
             }
