@@ -55,16 +55,28 @@ public class TPDENYCommand implements BasicCommand {
             return;
         }
 
-        if (tpaManager == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA is currently unavailable."));
-            return;
-        }
-
-        if (args.length != 0) {
+        if (args.length > 1) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/tpdeny"));
             return;
         }
 
+        // An optional single arg (e.g. player name from tab-complete) is
+        // deliberately ignored: deny still processes the pending request.
+        // No multi-request feature — more than one arg stays a usage error.
+        // R3 UX: same typo hint as /tpaccept — deny semantics unchanged.
+        if (args.length == 1) {
+            try {
+                String expected = tpaManager.getPendingRequesterName(player);
+                if (expected != null && !args[0].equalsIgnoreCase(expected)) {
+                    player.sendMessage(plugin.getMiniMessage().deserialize(
+                            "<yellow>Note: <gray>your pending request is from <yellow>"
+                                    + plugin.getMiniMessage().escapeTags(expected)
+                                    + "<gray>, ignoring argument '<white>"
+                                    + plugin.getMiniMessage().escapeTags(args[0]) + "<gray>'."));
+                }
+            } catch (Exception ignored) {
+            }
+        }
         tpaManager.denyRequest(player);
 
     }

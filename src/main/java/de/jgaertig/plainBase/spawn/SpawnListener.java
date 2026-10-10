@@ -64,11 +64,24 @@ public class SpawnListener implements Listener {
                     player.getScheduler().run(plugin, t -> {
                         try {
                             if (!player.isOnline()) return;
-                            if (firstJoin && firstEnabled) {
+                            // Re-check enabled right before scheduling: the spawn
+                            // module may have been disabled during the async hop.
+                            FileConfiguration live = plugin.getSpawnConfig();
+                            boolean liveFirst = firstEnabled;
+                            boolean liveSpawn = spawnOnJoin;
+                            if (live != null) {
+                                synchronized (live) {
+                                    liveFirst = live.getBoolean("first-spawn.enabled", false);
+                                    liveSpawn = live.getBoolean("spawn.enabled", false);
+                                }
+                            } else {
+                                return;
+                            }
+                            if (firstJoin && liveFirst) {
                                 player.getScheduler().runDelayed(plugin, t2 -> teleportToConfigLocation(player, "first-spawn.location"), null, 1L);
                                 return; // Wenn First-Spawn, dann kein normaler Spawn Teleport nötig
                             }
-                            if (spawnOnJoin) {
+                            if (liveSpawn) {
                                 player.getScheduler().runDelayed(plugin, t2 -> teleportToConfigLocation(player, "spawn.location"), null, 1L);
                             }
                         } catch (Exception e) {
@@ -108,6 +121,7 @@ public class SpawnListener implements Listener {
             final double rawYaw;
             final double rawPitch;
             final boolean spawnEnabled;
+            final boolean firstSpawnEnabled;
             synchronized (config) {
                 worldName = config.getString(path + ".world");
                 rawX = config.getDouble(path + ".x");
@@ -116,6 +130,18 @@ public class SpawnListener implements Listener {
                 rawYaw = config.getDouble(path + ".yaw");
                 rawPitch = config.getDouble(path + ".pitch");
                 spawnEnabled = config.getBoolean("spawn.enabled", false);
+                firstSpawnEnabled = config.getBoolean("first-spawn.enabled", false);
+            }
+            // Re-check enabled for the requested path right before teleporting:
+            // the module may have been disabled between join and this delayed
+            // task (async hop + 1 tick). Never teleport to a disabled spawn.
+            boolean enabledForPath = "spawn.location".equals(path) ? spawnEnabled : firstSpawnEnabled;
+            // Defensive: any other path (future) requires spawn.enabled.
+            if (!"spawn.location".equals(path) && !"first-spawn.location".equals(path)) {
+                enabledForPath = spawnEnabled;
+            }
+            if (!enabledForPath) {
+                return;
             }
             if (worldName == null) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn location is not set correctly. Contact an admin!"));

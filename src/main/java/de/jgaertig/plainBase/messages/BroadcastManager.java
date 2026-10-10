@@ -7,13 +7,13 @@ import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.entity.Player;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 public class BroadcastManager {
 
     private final PlainBase plugin;
-    private final List<ScheduledTask> activeTasks = new ArrayList<>();
+    private final List<ScheduledTask> activeTasks = new CopyOnWriteArrayList<>();
 
     public BroadcastManager(PlainBase plugin) {
         this.plugin = plugin;
@@ -41,7 +41,7 @@ public class BroadcastManager {
             // Clamp like tpa.request_timeout: negative/huge values must never
             // leak into the scheduler delay (huge values could overflow ticks).
             long cooldownSeconds = Math.max(5, Math.min(86400, section.getLong(key + ".cooldown", 60)));
-            long ticks = cooldownSeconds * 20L; // Mindestens 5 Sekunden Cooldown
+            long ticks = cooldownSeconds * 20L; // At least 5 seconds cooldown
 
             final String broadcastKey = key;
             final String broadcastText = text;
@@ -52,9 +52,30 @@ public class BroadcastManager {
                     // B2: name escaped before deserialize (see MessagesListener),
                     // so a name like "<red>" cannot inject MiniMessage.
                     for (Player player : Bukkit.getOnlinePlayers()) {
-                        Component message = plugin.getMiniMessage()
-                                .deserialize(applyPlaceholdersSafe(player, broadcastText));
-                        player.sendMessage(message);
+                        final Player recipient = player;
+                        if (recipient == null) continue;
+                        try {
+                            // Entity-scheduler dispatch (Folia): placeholder
+                            // resolution and sending both run on the
+                            // recipient's own entity thread — getName()/PAPI
+                            // must never run on the global thread.
+                            try {
+                                recipient.getScheduler().run(plugin, send -> {
+                                    try {
+                                        if (!recipient.isOnline()) return;
+                                        Component message = plugin.getMiniMessage()
+                                                .deserialize(applyPlaceholdersSafe(recipient, broadcastText));
+                                        recipient.sendMessage(message);
+                                    } catch (Exception e) {
+                                        plugin.getLogger().fine("Failed broadcast to " + recipient.getName() + ": " + e.getMessage());
+                                    }
+                                }, null);
+                            } catch (Exception e) {
+                                plugin.getLogger().fine("Failed to schedule broadcast '" + broadcastKey + "': " + e.getMessage());
+                            }
+                        } catch (Exception e) {
+                            plugin.getLogger().fine("Failed to dispatch broadcast '" + broadcastKey + "': " + e.getMessage());
+                        }
                     }
                 } catch (Exception e) {
                     plugin.getLogger().warning("Failed to send broadcast '" + broadcastKey + "': " + e.getMessage());

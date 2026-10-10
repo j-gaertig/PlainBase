@@ -19,6 +19,23 @@ import java.util.concurrent.ThreadLocalRandom;
 public class RTPManager {
     private final PlainBase plugin;
 
+    // Generation guard for the warmup body (same pattern as TPAManager): a
+    // /plainbase reload constructs a fresh RTPManager and cancels pending
+    // warmups, but an already-firing task of the previous instance must never
+    // teleport. The body checks that this instance is still the live one.
+    private static final java.util.concurrent.atomic.AtomicLong GENERATION = new java.util.concurrent.atomic.AtomicLong(0);
+    private final long generation = GENERATION.incrementAndGet();
+
+    /**
+     * Region-hop budget: only real candidates (after the cheap distance
+     * prefilter below) consume an attempt. Prefilter resamples are free pure
+     * X/Z math with no world access. Raised from 20 so small borders / large
+     * exclusion radii still find a spot without spamming region hops.
+     */
+    private static final int MAX_ATTEMPTS = 100;
+    /** Cheap prefilter resamples per attempt (no world access, no counting). */
+    private static final int PREFILTER_TRIES = 20;
+
     // In-memory only by design: a /plainbase reload constructs a fresh RTPManager
     // (see PlainBase stopModules/setupTeleport, which also cancels pending warmups
     // and searches), so pending RTP cooldowns reset on reload. No persistence —
@@ -78,6 +95,76 @@ public class RTPManager {
         }
     }
 
+    private void scheduleNextAttempt(Player player, World world, double centerX, double centerZ,
+                                       double halfSize, Location spawnLoc, Location originLoc, int nextAttempt) {
+        if (player == null) return;
+        UUID uuid;
+        try {
+            uuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
+        try {
+            Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
+                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+        } catch (Exception e) {
+            searching.remove(uuid);
+            cooldowns.remove(uuid);
+            plugin.getLogger().warning("Could not continue RTP search for " + player.getName() + ": " + e.getMessage());
+        }
+    }
+
+    private boolean isInsideBorder(World world, Location loc) {
+        if (world == null || loc == null) return false;
+        try {
+            var border = world.getWorldBorder();
+            if (border == null) return true;
+            double centerX = border.getCenter().getX();
+            double centerZ = border.getCenter().getZ();
+            double half = border.getSize() / 2.0;
+            if (!Double.isFinite(centerX) || !Double.isFinite(centerZ) || !Double.isFinite(half)) return true;
+            double x = loc.getX();
+            double z = loc.getZ();
+            if (!Double.isFinite(x) || !Double.isFinite(z)) return false;
+            return Math.abs(x - centerX) <= half && Math.abs(z - centerZ) <= half;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /**
+     * Cheap distance prefilter (pure X/Z math, no world/chunk access): mirrors
+     * the spawn (256) and origin-snapshot (500) checks of
+     * {@link #runAttemptOnRegion} so violating picks are discarded BEFORE the
+     * expensive region hop. The live-position re-check stays on the region
+     * thread (needs player.getLocation()), as do the border re-checks in
+     * proceedToWarmup/executeTeleport. Never throws.
+     */
+    private static boolean passesDistancePrefilter(int x, int z, World world,
+                                                    Location spawnLoc, Location originLoc) {
+        double cx = x + 0.5;
+        double cz = z + 0.5;
+        try {
+            if (spawnLoc != null && spawnLoc.getWorld() != null && spawnLoc.getWorld().equals(world)) {
+                double dx = cx - spawnLoc.getX();
+                double dz = cz - spawnLoc.getZ();
+                if (!Double.isFinite(dx) || !Double.isFinite(dz)) return false;
+                if (dx * dx + dz * dz < 256 * 256) return false;
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            if (originLoc != null && originLoc.getWorld() != null && originLoc.getWorld().equals(world)) {
+                double dx = cx - originLoc.getX();
+                double dz = cz - originLoc.getZ();
+                if (!Double.isFinite(dx) || !Double.isFinite(dz)) return false;
+                if (dx * dx + dz * dz < 500 * 500) return false;
+            }
+        } catch (Exception ignored) {
+        }
+        return true;
+    }
+
     private void tryNextAttempt(Player player, World world, double centerX, double centerZ,
                                 double halfSize, Location spawnLoc, Location originLoc, int attempt) {
         if (player == null) return;
@@ -89,9 +176,8 @@ public class RTPManager {
             searching.remove(uuid);
             return;
         }
-        int maxAttempts = 20;
 
-        if (attempt >= maxAttempts) {
+        if (attempt >= MAX_ATTEMPTS) {
             // A failed search must not punish with a cooldown.
             cooldowns.remove(uuid);
             try {
@@ -112,6 +198,14 @@ public class RTPManager {
 
         int x = (int) (centerX + (ThreadLocalRandom.current().nextDouble() * halfSize * 2 - halfSize));
         int z = (int) (centerZ + (ThreadLocalRandom.current().nextDouble() * halfSize * 2 - halfSize));
+        // Cheap prefilter loop: resample without consuming an attempt until a
+        // candidate passes the spawn/origin distances (or the budget is up —
+        // then the last pick goes to the region thread anyway and counts as
+        // the real candidate, so tiny borders still terminate via MAX_ATTEMPTS).
+        for (int i = 0; i < PREFILTER_TRIES && !passesDistancePrefilter(x, z, world, spawnLoc, originLoc); i++) {
+            x = (int) (centerX + (ThreadLocalRandom.current().nextDouble() * halfSize * 2 - halfSize));
+            z = (int) (centerZ + (ThreadLocalRandom.current().nextDouble() * halfSize * 2 - halfSize));
+        }
         final int finalX = x;
         final int finalZ = z;
         int chunkX = finalX >> 4;
@@ -156,6 +250,9 @@ public class RTPManager {
     private void runAttemptOnRegion(Player player, World world, double centerX, double centerZ,
                                     double halfSize, Location spawnLoc, Location originLoc,
                                     UUID uuid, int finalX, int finalZ, int nextAttempt) {
+        // Stale async chain: the search was cancelled (quit, TPA start, death,
+        // cancelAll) while this attempt was queued — never continue.
+        if (uuid == null || !searching.contains(uuid)) return;
         if (!player.isOnline()) {
             searching.remove(uuid);
             return;
@@ -187,14 +284,12 @@ public class RTPManager {
         try {
             y = world.getHighestBlockYAt(finalX, finalZ);
         } catch (Exception e) {
-            Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+            scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
             return;
         }
 
         if (y <= world.getMinHeight() || y + 1 >= world.getMaxHeight() - 2) {
-            Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+            scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
             return;
         }
 
@@ -204,8 +299,7 @@ public class RTPManager {
             double dx = (finalX + 0.5) - spawnLoc.getX();
             double dz = (finalZ + 0.5) - spawnLoc.getZ();
             if (dx * dx + dz * dz < 256 * 256) {
-                Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                        tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+                scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
                 return;
             }
         }
@@ -214,9 +308,22 @@ public class RTPManager {
             double dx = (finalX + 0.5) - originLoc.getX();
             double dz = (finalZ + 0.5) - originLoc.getZ();
             if (dx * dx + dz * dz < 500 * 500) {
-                Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                        tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+                scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
                 return;
+            }
+            // Re-check distance against the player's current position: they may
+            // have moved since the search started (originLoc is a snapshot).
+            try {
+                Location current = player.getLocation();
+                if (current != null && current.getWorld() != null && current.getWorld().equals(world)) {
+                    double cdx = (finalX + 0.5) - current.getX();
+                    double cdz = (finalZ + 0.5) - current.getZ();
+                    if (cdx * cdx + cdz * cdz < 500 * 500) {
+                        scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
+                        return;
+                    }
+                }
+            } catch (Exception ignored) {
             }
         }
 
@@ -239,8 +346,7 @@ public class RTPManager {
                 }
             }, null);
         } else {
-            Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+            scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
         }
     }
 
@@ -294,6 +400,37 @@ public class RTPManager {
             return;
         }
 
+        // Border re-validation: the border may have shrunk/moved during the
+        // async search — never warm up towards a spot outside the CURRENT border.
+        try {
+            if (!isInsideBorder(player.getWorld(), foundLoc)) {
+                cooldowns.remove(player.getUniqueId());
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: location is outside the world border. Try again!"));
+                return;
+            }
+        } catch (Exception e) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
+
+        // Distance re-check against the CURRENT position: the player may have
+        // moved since the search started (origin snapshot is stale).
+        try {
+            Location current = player.getLocation();
+            if (current != null && current.getWorld() != null && current.getWorld().equals(foundLoc.getWorld())) {
+                double dx = foundLoc.getX() - current.getX();
+                double dz = foundLoc.getZ() - current.getZ();
+                if (dx * dx + dz * dz < 500 * 500) {
+                    cooldowns.remove(player.getUniqueId());
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer far enough away. Try again!"));
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
+
         long seconds = teleportConfig.getLong("rtp.counter.seconds", 3);
         // Clamp like tpa.counter.seconds: negative/huge values must never
         // leak into the scheduler delay or the displayed countdown.
@@ -309,7 +446,11 @@ public class RTPManager {
         player.sendMessage(plugin.getMiniMessage().deserialize("<green>Safe location found!"));
         player.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleporting in <yellow>" + seconds + " <gray>seconds. Do not move, take damage or interact!"));
 
+        final long capturedGeneration = generation;
         ScheduledTask warmupTask = player.getScheduler().runDelayed(plugin, (wt) -> {
+            // Generation guard: a stale task of a previous manager instance
+            // (reload) must never teleport.
+            if (capturedGeneration != GENERATION.get() || plugin.getRTPManager() != this) return;
             activeWarmups.remove(player.getUniqueId());
             executeTeleport(player, foundLoc);
         }, null, seconds * 20L);
@@ -329,6 +470,15 @@ public class RTPManager {
 
     private void executeTeleport(Player player, Location loc) {
         if (player == null || !player.isOnline()) return;
+        // Dead players must never be teleported (warmup death always cancels,
+        // this is the race guard when death lands after the warmup fired).
+        try {
+            if (player.isDead()) {
+                cooldowns.remove(player.getUniqueId());
+                return;
+            }
+        } catch (Exception ignored) {
+        }
         // Runs on the entity thread: re-validate world and safety — the spot
         // was checked seconds ago at search time and the terrain or the
         // player's world may have changed during the warmup.
@@ -346,6 +496,37 @@ public class RTPManager {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
                 }
                 return;
+            }
+        } catch (Exception e) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
+        // Border re-validation: the border may have changed during the warmup.
+        try {
+            if (!isInsideBorder(dest.getWorld(), dest)) {
+                cooldowns.remove(player.getUniqueId());
+                if (player.isOnline()) {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: location is outside the world border. Try again!"));
+                }
+                return;
+            }
+        } catch (Exception e) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
+        // Distance re-check against the CURRENT position (warmup move).
+        try {
+            Location current = player.getLocation();
+            if (current != null && current.getWorld() != null && current.getWorld().equals(dest.getWorld())) {
+                double dx = dest.getX() - current.getX();
+                double dz = dest.getZ() - current.getZ();
+                if (dx * dx + dz * dz < 500 * 500) {
+                    cooldowns.remove(player.getUniqueId());
+                    if (player.isOnline()) {
+                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer far enough away. Try again!"));
+                    }
+                    return;
+                }
             }
         } catch (Exception e) {
             cooldowns.remove(player.getUniqueId());
@@ -403,6 +584,13 @@ public class RTPManager {
         if (player == null || !player.isOnline()) {
             if (uuid != null) cooldowns.remove(uuid);
             return;
+        }
+        try {
+            if (player.isDead()) {
+                if (uuid != null) cooldowns.remove(uuid);
+                return;
+            }
+        } catch (Exception ignored) {
         }
         if (dest == null || dest.getWorld() == null) {
             if (uuid != null) cooldowns.remove(uuid);

@@ -13,6 +13,7 @@ import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 import org.jspecify.annotations.NonNull;
 
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
@@ -25,6 +26,11 @@ import java.util.Set;
 import java.util.stream.Stream;
 
 public class PlainBaseCommand implements BasicCommand {
+
+    /** Modrinth project id for PlainBase update checks. */
+    private static final String MODRINTH_PROJECT_ID = "yfx0z1Sw";
+    /** Max Modrinth response body kept in memory (OOM guard). */
+    private static final int MODRINTH_MAX_BYTES = 256 * 1024;
 
     private final PlainBase plugin;
 
@@ -63,37 +69,44 @@ public class PlainBaseCommand implements BasicCommand {
                         // stray key. Reject anything with a dot and anything not
                         // in the live key set.
                         // F3: toggle and suggest() race on the live YamlConfiguration
-                        // (suggest may run off-thread while this mutates). Capture
-                        // the reference once and do every read/mutation under
-                        // synchronized on that same instance; the key set is
-                        // snapshotted inside the lock so getKeys() never sees a
-                        // concurrent mutation mid-iteration.
+                        // (suggest may run off-thread while this mutates). All
+                        // reads/mutations go through the central configLock (not
+                        // the config instance, which reloadConfig() may swap).
+                        // Single critical section: whitelist check + read-modify
+                        // under one lock, snapshot newStatus; saveConfig() runs
+                        // after the lock but on the same global thread, so no
+                        // interleaved toggle can slip between modify and save.
                         org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
                         if (rootCfg == null) {
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
                             return;
                         }
-                        boolean known;
-                        synchronized (rootCfg) {
-                            boolean k = false;
+                        String actualKey = null;
+                        boolean newStatus = false;
+                        boolean found;
+                        synchronized (plugin.getConfigLock()) {
                             try {
                                 ConfigurationSection sec = rootCfg.getConfigurationSection("modules");
                                 if (sec != null && !moduleName.contains(".") && !moduleName.contains(" ")) {
-                                    k = sec.getKeys(false).contains(moduleName);
+                                    for (String k : sec.getKeys(false)) {
+                                        if (k.equalsIgnoreCase(moduleName)) {
+                                            actualKey = k;
+                                            break;
+                                        }
+                                    }
                                 }
                             } catch (Exception ignored) {
                             }
-                            known = k;
+                            found = (actualKey != null);
+                            if (found) {
+                                String path = "modules." + actualKey;
+                                newStatus = !rootCfg.getBoolean(path);
+                                rootCfg.set(path, newStatus);
+                            }
                         }
-                        if (!known) {
+                        if (!found) {
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
                             return;
-                        }
-                        String path = "modules." + moduleName;
-                        boolean newStatus;
-                        synchronized (rootCfg) {
-                            newStatus = !rootCfg.getBoolean(path);
-                            rootCfg.set(path, newStatus);
                         }
                         plugin.saveConfig();
                         plugin.reloadModules();
@@ -149,7 +162,7 @@ public class PlainBaseCommand implements BasicCommand {
 
             try {
                 Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-                String latestVersion = getLatestVersionFromModrinth("yfx0z1Sw", serverVersion);
+                String latestVersion = getLatestVersionFromModrinth(MODRINTH_PROJECT_ID, serverVersion);
 
                 // P2: the plugin may have been disabled while the Modrinth
                 // request was in flight — scheduling on a disabled plugin
@@ -176,7 +189,7 @@ public class PlainBaseCommand implements BasicCommand {
                     String currentVersion = plugin.getPluginMeta().getVersion();
                     String safeLatest = plugin.getMiniMessage().escapeTags(latestVersion);
                     String safeCurrent = plugin.getMiniMessage().escapeTags(currentVersion);
-                    if (currentVersion.equalsIgnoreCase(latestVersion)) {
+                    if (compareVersions(currentVersion, latestVersion) >= 0) {
                         sender.sendMessage(plugin.getMiniMessage().deserialize("<green>You are running the latest version! (" + safeCurrent + ")"));
                     } else {
                         sender.sendMessage(plugin.getMiniMessage().deserialize(
@@ -225,13 +238,13 @@ public class PlainBaseCommand implements BasicCommand {
 
         if (args.length == 2 && args[0].equalsIgnoreCase("toggle")) {
             // F3: suggestions may run off-thread while toggle/reload mutates
-            // the config on the global thread. Capture the reference once and
-            // snapshot the key set under synchronized on that same instance
-            // (toggle uses the same monitor), then filter outside the lock.
+            // the config on the global thread. Snapshot the key set under the
+            // central configLock (toggle uses the same monitor), then filter
+            // outside the lock.
             org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
             if (cfg == null) return List.of();
             java.util.Set<String> snapshot;
-            synchronized (cfg) {
+            synchronized (plugin.getConfigLock()) {
                 try {
                     ConfigurationSection sec = cfg.getConfigurationSection("modules");
                     snapshot = (sec == null) ? Set.of() : Set.copyOf(sec.getKeys(false));
@@ -241,7 +254,7 @@ public class PlainBaseCommand implements BasicCommand {
             }
             String input = args[1].toLowerCase(Locale.ROOT);
             return snapshot.stream()
-                    .filter(s -> s.startsWith(input))
+                    .filter(s -> s.toLowerCase(Locale.ROOT).startsWith(input))
                     .toList();
         }
         return List.of();
@@ -266,7 +279,16 @@ public class PlainBaseCommand implements BasicCommand {
             if (responseCode == 200) {
                 try (Scanner scanner = new Scanner(conn.getInputStream(), StandardCharsets.UTF_8)) {
                     StringBuilder builder = new StringBuilder();
-                    while (scanner.hasNextLine()) builder.append(scanner.nextLine());
+                    int bytes = 0;
+                    while (scanner.hasNextLine()) {
+                        String line = scanner.nextLine();
+                        bytes += line.getBytes(StandardCharsets.UTF_8).length + 1;
+                        if (bytes > MODRINTH_MAX_BYTES) {
+                            plugin.getLogger().warning("Modrinth response exceeded 256KB, aborting update check.");
+                            return null;
+                        }
+                        builder.append(line);
+                    }
 
                     JsonArray versions = JsonParser.parseString(builder.toString()).getAsJsonArray();
                     if (versions.isEmpty()) {
@@ -280,6 +302,11 @@ public class PlainBaseCommand implements BasicCommand {
                 }
             } else {
                 plugin.getLogger().warning("Modrinth API responded with HTTP " + responseCode);
+                // Drain + close the error stream so the connection can be reused.
+                try (InputStream err = conn.getErrorStream()) {
+                    if (err != null) err.readAllBytes();
+                } catch (Exception ignored) {
+                }
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to check for updates: " + e.getMessage());
@@ -289,5 +316,33 @@ public class PlainBaseCommand implements BasicCommand {
             }
         }
         return null;
+    }
+
+    /**
+     * Segment-wise version compare ("1.10" &gt; "1.9"): a plain
+     * equalsIgnoreCase would miss equivalent-but-differently-cased versions
+     * and a double compare would collapse 1.10 to 1.1. Non-numeric segments
+     * count as 0, missing segments count as 0.
+     */
+    private static int compareVersions(String a, String b) {
+        String left = a == null ? "0" : a;
+        String right = b == null ? "0" : b;
+        String[] pa = left.split("\\.", -1);
+        String[] pb = right.split("\\.", -1);
+        int len = Math.max(pa.length, pb.length);
+        for (int i = 0; i < len; i++) {
+            int na = parseSegment(i < pa.length ? pa[i] : "0");
+            int nb = parseSegment(i < pb.length ? pb[i] : "0");
+            if (na != nb) return Integer.compare(na, nb);
+        }
+        return 0;
+    }
+
+    private static int parseSegment(String segment) {
+        try {
+            return Integer.parseInt(segment.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 }

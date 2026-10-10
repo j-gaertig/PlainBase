@@ -265,6 +265,23 @@ public class TeamCommand implements BasicCommand {
 
         if (args.length == 2) {
             String input = args[1].toLowerCase(Locale.ROOT);
+            // R3: team ids enumerate only on demand — global admins and
+            // non-player senders keep full prefix-filtered suggestions; players
+            // without a global bypass only get prefix-filtered matches once
+            // they typed something, and on empty input just their own
+            // memberships (prevents harvesting the full team list via
+            // tab-complete). Execute() behavior is untouched.
+            if (sender instanceof Player player && !hasPermission(sender, "plainbase.team.admin")
+                    && input.isEmpty()) {
+                try {
+                    return teams.getPlayerTeams(player.getUniqueId()).stream()
+                            .filter(id -> id.startsWith(input))
+                            .sorted()
+                            .toList();
+                } catch (Exception e) {
+                    return List.of();
+                }
+            }
             return teams.getTeams().stream().map(TeamManager.TeamDefinition::id)
                     .filter(id -> id.startsWith(input)).toList();
         }

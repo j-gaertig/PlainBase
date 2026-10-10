@@ -28,6 +28,9 @@ public class TeleportListener implements Listener {
     private volatile org.bukkit.configuration.file.FileConfiguration cachedConfig;
     private volatile List<String> cachedTpaCancelOn = List.of();
     private volatile List<String> cachedRtpCancelOn = List.of();
+    // Type-error warnings once per key (not per move event): PlayerMoveEvent
+    // fires very frequently, a config type mistake must never spam the log.
+    private static final java.util.Set<String> WARNED_TYPE_KEYS = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public TeleportListener(PlainBase plugin) {
         this.plugin = plugin;
@@ -106,7 +109,12 @@ public class TeleportListener implements Listener {
 
     @EventHandler
     public void onDeath(PlayerDeathEvent event) {
+        // Death always breaks the warmup (like world change/teleport) — even
+        // when "death" is not in cancel_on. A dead player must never be
+        // teleported when the warmup fires afterwards (isDead guards in the
+        // managers are only the second line of defense for the firing race).
         checkAndCancel(event.getEntity(), "death");
+        cancelWarmupsUnconditionally(event.getEntity(), "death");
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -130,8 +138,8 @@ public class TeleportListener implements Listener {
             // nothing to check against, same as the old NPE-caught path.
             if (cfg == null) return;
             if (cfg != cachedConfig) {
-                cachedTpaCancelOn = List.copyOf(cfg.getStringList("tpa.counter.cancel_on"));
-                cachedRtpCancelOn = List.copyOf(cfg.getStringList("rtp.counter.cancel_on"));
+                cachedTpaCancelOn = List.copyOf(readCancelList(cfg, "tpa.counter.cancel_on"));
+                cachedRtpCancelOn = List.copyOf(readCancelList(cfg, "rtp.counter.cancel_on"));
                 cachedConfig = cfg;
             }
 
@@ -141,9 +149,53 @@ public class TeleportListener implements Listener {
 
             if (cachedRtpCancelOn.contains(flag) && plugin.getRTPManager() != null) {
                 plugin.getRTPManager().cancelWarmup(p, generateReason(flag));
+                try {
+                    plugin.getRTPManager().cancelSearch(p);
+                } catch (Exception ignored) {
+                }
             }
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to check teleport cancel flag '" + flag + "' for " + p.getName() + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Reads a cancel_on list tolerantly: a proper YAML list is used as-is, a
+     * single plain string (common admin mistake: {@code cancel_on: move}
+     * instead of {@code cancel_on: [move]}) is accepted as a one-element list
+     * with a warning. Anything else warns once and yields an empty list.
+     * Only called on cache rebuild (once per config instance), never per event.
+     */
+    private List<String> readCancelList(org.bukkit.configuration.file.FileConfiguration cfg, String path) {
+        Object raw;
+        try {
+            raw = cfg.get(path);
+        } catch (Exception e) {
+            warnOnce(path, "Could not read teleport.yml '" + path + "', ignoring cancel_on: " + e.getMessage());
+            return List.of();
+        }
+        if (raw == null) return List.of();
+        if (raw instanceof List<?> list) {
+            List<String> out = new java.util.ArrayList<>();
+            for (Object o : list) {
+                if (o != null) out.add(o.toString());
+            }
+            return out;
+        }
+        if (raw instanceof String single) {
+            plugin.getLogger().warning("teleport.yml '" + path + "' should be a list (e.g. [move, damage]), "
+                    + "got a single value '" + single + "' — accepting it as a one-element list. Fix the config to silence this warning.");
+            String trimmed = single.trim();
+            return trimmed.isEmpty() ? List.of() : List.of(trimmed);
+        }
+        warnOnce(path, "teleport.yml '" + path + "' has an unsupported type ("
+                + raw.getClass().getSimpleName() + "), expected a list of strings — ignoring.");
+        return List.of();
+    }
+
+    private void warnOnce(String key, String message) {
+        if (WARNED_TYPE_KEYS.add(key)) {
+            plugin.getLogger().warning(message);
         }
     }
 
@@ -155,17 +207,26 @@ public class TeleportListener implements Listener {
      * cancel_on only gates move/damage/death/interact.
      */
     private void cancelWarmupsUnconditionally(Player p) {
+        cancelWarmupsUnconditionally(p, "move");
+    }
+
+    private void cancelWarmupsUnconditionally(Player p, String flag) {
         if (p == null) return;
+        String reason = generateReason(flag);
         try {
             if (plugin.getTPAManager() != null) {
-                plugin.getTPAManager().cancelWarmup(p, generateReason("move"));
+                plugin.getTPAManager().cancelWarmup(p, reason);
             }
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to cancel TPA warmup on teleport/world-change for " + p.getName() + ": " + e.getMessage());
         }
         try {
             if (plugin.getRTPManager() != null) {
-                plugin.getRTPManager().cancelWarmup(p, generateReason("move"));
+                plugin.getRTPManager().cancelWarmup(p, reason);
+                try {
+                    plugin.getRTPManager().cancelSearch(p);
+                } catch (Exception ignored) {
+                }
             }
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to cancel RTP warmup on teleport/world-change for " + p.getName() + ": " + e.getMessage());

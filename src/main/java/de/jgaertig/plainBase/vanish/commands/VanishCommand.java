@@ -167,6 +167,18 @@ public class VanishCommand implements BasicCommand {
         return true;
     }
 
+    /**
+     * Single-state bulk toggle (NOT per-player flips): when ANY target is
+     * still visible, EVERY target is vanished (the executor included — they
+     * are part of the target list); only when ALL targets are already vanished
+     * are they revealed together. Per-player toggling would leave a mixed
+     * group in the exact same mixed state (a no-op with noise), hence the
+     * anyVisible election below. /vanish world scopes the targets to the
+     * executor's current world, /vanish all covers every online player.
+     * No-op targets are skipped silently; only actual state changes count
+     * toward the vanished/revealed totals. Non-executor targets always get a
+     * direct notice so nobody is vanished without knowing it.
+     */
     private void toggleAll(Player executor, List<Player> targets) {
         // Determine a single target state instead of toggling each player
         // individually: if anyone is still visible, vanish everyone —

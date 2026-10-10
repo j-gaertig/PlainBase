@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.teleport.tpa;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.PlayerDataLocks;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -10,18 +11,29 @@ import org.bukkit.entity.Player;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class TPAManager {
 
     private final PlainBase plugin;
+
+    // Generation guard for warmup bodies: a /plainbase reload constructs a
+    // fresh TPAManager and cancels pending warmups, but an already-firing
+    // task of the previous instance must never teleport. The body checks
+    // that this instance is still the live one before acting.
+    private static final AtomicLong GENERATION = new AtomicLong(0);
+    private final long generation = GENERATION.incrementAndGet();
 
 
     private final Map<UUID, TpaSession> activeSessions = new ConcurrentHashMap<>();
@@ -72,20 +84,25 @@ public class TPAManager {
             return;
         }
 
-        for (TpaSession session : activeSessions.values()) {
-            if (session.requesterId().equals(requesterId)) {
-                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You already have an outgoing teleport request! Use /tpacancel to cancel it."));
+        // Atomic check+reserve: the outgoing scan and the target reservation
+        // must hold the same monitor — otherwise two concurrent requests from
+        // the same requester to different targets could both pass the scan.
+        TpaSession stub = new TpaSession(requesterId, type, null);
+        synchronized (activeSessions) {
+            for (TpaSession session : activeSessions.values()) {
+                if (session != null && session.requesterId().equals(requesterId)) {
+                    requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You already have an outgoing teleport request! Use /tpacancel to cancel it."));
+                    return;
+                }
+            }
+
+            // Atomic reservation: only one request per target can win. The timeout
+            // task is scheduled only after the reservation succeeded, so a lost
+            // race never leaks a timeout task or overwrites the winner.
+            if (activeSessions.putIfAbsent(targetId, stub) != null) {
+                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>This player already has a pending teleport request. Try again later."));
                 return;
             }
-        }
-
-        // Atomic reservation: only one request per target can win. The timeout
-        // task is scheduled only after the reservation succeeded, so a lost
-        // race never leaks a timeout task or overwrites the winner.
-        TpaSession stub = new TpaSession(requesterId, type, null);
-        if (activeSessions.putIfAbsent(targetId, stub) != null) {
-            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>This player already has a pending teleport request. Try again later."));
-            return;
         }
 
         requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleport request sent to <yellow>" + esc(target.getName()) + "<gray>."));
@@ -144,6 +161,29 @@ public class TPAManager {
     public void acceptRequest(Player target) {
         if (!acceptIfPresent(target)) {
             target.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any pending requests!"));
+        }
+    }
+
+    /**
+     * R3 UX hint (no behavior change): name of the player whose request is
+     * currently pending for target, or null when none (or the requester went
+     * offline). Lets /tpaccept and /tpdeny tell a typo'd argument apart from
+     * the real requester without changing accept/deny semantics. Never throws.
+     */
+    public String getPendingRequesterName(Player target) {
+        if (target == null) return null;
+        TpaSession session;
+        try {
+            session = activeSessions.get(target.getUniqueId());
+        } catch (Exception e) {
+            return null;
+        }
+        if (session == null) return null;
+        try {
+            Player requester = Bukkit.getPlayer(session.requesterId());
+            return requester != null ? requester.getName() : null;
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -221,8 +261,10 @@ public class TPAManager {
     /**
      * Vanish re-check: Bukkit visibility can change between request and
      * teleport (a side vanishes mid-warmup). A teleport where either side can
-     * no longer see the other — or where either side is vanished per
-     * VanishManager — must not proceed. Uses the generic not-found/left
+     * no longer see the other must not proceed. Visibility only (canSee) —
+     * no separate isVanished check: canSee already encodes vanish state plus
+     * permissions, a pure isVanished clause would block staff-to-staff
+     * teleports that canSee allows. Uses the generic not-found/left
      * message so vanish state is never leaked.
      */
     private boolean isBlockedByVanish(Player a, Player b) {
@@ -231,15 +273,6 @@ public class TPAManager {
             if (!a.canSee(b) || !b.canSee(a)) return true;
         } catch (Exception e) {
             plugin.getLogger().fine("Vanish visibility check failed for " + a.getName() + "/" + b.getName() + ": " + e.getMessage());
-        }
-        try {
-            if (plugin.getVanishManager() != null
-                    && (plugin.getVanishManager().isVanished(a.getUniqueId())
-                    || plugin.getVanishManager().isVanished(b.getUniqueId()))) {
-                return true;
-            }
-        } catch (Exception e) {
-            plugin.getLogger().fine("Vanish state check failed for " + a.getName() + "/" + b.getName() + ": " + e.getMessage());
         }
         return false;
     }
@@ -366,10 +399,14 @@ public class TPAManager {
 
         UUID toTeleportId = toTeleport.getUniqueId();
         UUID destinationId = destination.getUniqueId();
+        final long capturedGeneration = generation;
 
         ScheduledTask warmupTask;
         try {
             warmupTask = toTeleport.getScheduler().runDelayed(plugin, (task) -> {
+                // Generation guard: a stale task of a previous manager
+                // instance (reload) must never teleport.
+                if (capturedGeneration != GENERATION.get() || plugin.getTPAManager() != this) return;
                 activeWarmups.remove(toTeleportId);
                 removeWarmupPartner(toTeleportId);
                 performTeleport(toTeleport, destination);
@@ -412,6 +449,13 @@ public class TPAManager {
     private void performTeleport(Player toTeleport, Player destination) {
         if (toTeleport == null || destination == null) return;
         if (!toTeleport.isOnline() || !destination.isOnline()) return;
+        // Dead players must never be teleported (warmup death always cancels
+        // via TeleportListener, this is the race guard when death lands after
+        // the warmup already fired).
+        try {
+            if (toTeleport.isDead() || destination.isDead()) return;
+        } catch (Exception ignored) {
+        }
         // Last-moment vanish check before hopping threads: either side may
         // have vanished during the warmup.
         if (isBlockedByVanish(toTeleport, destination)) {
@@ -423,6 +467,10 @@ public class TPAManager {
 
         destination.getScheduler().run(plugin, t -> {
             if (!destination.isOnline() || !toTeleport.isOnline()) return;
+            try {
+                if (toTeleport.isDead() || destination.isDead()) return;
+            } catch (Exception ignored) {
+            }
             // Second hop, same re-check: vanish state may have changed between
             // the two scheduler hops.
             if (isBlockedByVanish(toTeleport, destination)) {
@@ -435,6 +483,10 @@ public class TPAManager {
             if (destLoc.getWorld() == null) return;
             toTeleport.getScheduler().run(plugin, t2 -> {
                 if (!toTeleport.isOnline() || !destination.isOnline()) return;
+                try {
+                    if (toTeleport.isDead() || destination.isDead()) return;
+                } catch (Exception ignored) {
+                }
                 if (isBlockedByVanish(toTeleport, destination)) {
                     if (toTeleport.isOnline()) {
                         toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
@@ -570,12 +622,19 @@ public class TPAManager {
     }
 
     public void cancelOutgoingRequest(Player requester) {
+        if (requester == null) return;
+        UUID requesterId;
+        try {
+            requesterId = requester.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
 
         UUID targetUUID = null;
         TpaSession expected = null;
         for (Map.Entry<UUID, TpaSession> entry : new ArrayList<>(activeSessions.entrySet())) {
             TpaSession s = entry.getValue();
-            if (s != null && s.requesterId().equals(requester.getUniqueId())) {
+            if (s != null && s.requesterId().equals(requesterId)) {
                 targetUUID = entry.getKey();
                 expected = s;
                 break;
@@ -588,7 +647,13 @@ public class TPAManager {
             // scan above and now — remove(key, expected) never deletes that
             // foreign session.
             if (!activeSessions.remove(targetUUID, expected)) {
-                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any outgoing requests!"));
+                // Lost the race — the slot holds a foreign session now. Still
+                // check for a running warmup below before reporting "no outgoing".
+                if (cancelAnyWarmupInvolving(requesterId)) {
+                    requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Your teleport request has been <red>cancelled<gray>."));
+                } else {
+                    requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any outgoing requests!"));
+                }
                 return;
             }
             if (expected.timeoutTask() != null) expected.timeoutTask().cancel();
@@ -598,41 +663,152 @@ public class TPAManager {
             if (target != null) {
                 target.sendMessage(plugin.getMiniMessage().deserialize("<yellow>" + esc(requester.getName()) + " <gray>cancelled their teleport request."));
             }
+            // A warmup may already run for this requester (accepted but not yet
+            // teleported) — cancel it too so /tpacancel always stops the teleport.
+            cancelAnyWarmupInvolving(requesterId);
         } else {
-            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any outgoing requests!"));
+            // No pending session — a post-accept warmup may still run keyed by
+            // either side. Cancel it instead of reporting "no outgoing".
+            if (cancelAnyWarmupInvolving(requesterId)) {
+                requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Your teleport request has been <red>cancelled<gray>."));
+            } else {
+                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any outgoing requests!"));
+            }
         }
     }
 
+    /**
+     * Cancels any active warmup involving the given player — either keyed
+     * directly by them (they teleport) or via the anchor mapping (they are
+     * the destination). Returns true iff a warmup was cancelled.
+     */
+    private boolean cancelAnyWarmupInvolving(UUID uuid) {
+        if (uuid == null) return false;
+        ScheduledTask direct = activeWarmups.remove(uuid);
+        if (direct != null) {
+            try {
+                direct.cancel();
+            } catch (Exception ignored) {
+            }
+            removeWarmupPartner(uuid);
+            try {
+                Player p = Bukkit.getPlayer(uuid);
+                if (p != null && p.isOnline()) {
+                    p.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: Request cancelled."));
+                }
+            } catch (Exception ignored) {
+            }
+            return true;
+        }
+        UUID partnerId = warmupPartners.get(uuid);
+        if (partnerId != null && !partnerId.equals(uuid)) {
+            ScheduledTask partnerTask = activeWarmups.remove(partnerId);
+            if (partnerTask != null) {
+                try {
+                    partnerTask.cancel();
+                } catch (Exception ignored) {
+                }
+                removeWarmupPartner(partnerId);
+                try {
+                    Player partner = Bukkit.getPlayer(partnerId);
+                    if (partner != null && partner.isOnline()) {
+                        partner.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                    }
+                } catch (Exception ignored) {
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
     private File getPlayerDataFile(UUID uuid) {
+        // Read path: never creates directories as a side effect.
+        return new File(new File(plugin.getDataFolder(), "data/playerdata"), uuid.toString() + ".yml");
+    }
+
+    private File getPlayerDataFileForWrite(UUID uuid) {
         File folder = new File(plugin.getDataFolder(), "data/playerdata");
-        if (!folder.exists()) folder.mkdirs();
+        if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
+            plugin.getLogger().warning("Could not create directory: " + folder);
+        }
         return new File(folder, uuid.toString() + ".yml");
     }
 
     public void loadPlayerData(Player player) {
+        UUID uuid;
+        try {
+            uuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
+        final UUID id = uuid;
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
-            File file = getPlayerDataFile(player.getUniqueId());
-            if (!file.exists()) return;
+            // Shared per-UUID lock with VanishManager (same physical file).
+            synchronized (PlayerDataLocks.lockFor(id)) {
+                File file = getPlayerDataFile(id);
+                if (!file.isFile()) return;
 
-            FileConfiguration config = YamlConfiguration.loadConfiguration(file);
-            if (config.getBoolean("tpauto", false)) {
-                tpAutoPlayers.add(player.getUniqueId());
+                YamlConfiguration config = new YamlConfiguration();
+                try {
+                    config.load(file);
+                } catch (org.bukkit.configuration.InvalidConfigurationException corrupt) {
+                    backupCorrupt(file);
+                    plugin.getLogger().warning("Corrupt player data for " + id + " moved aside, ignoring tpauto flag.");
+                    return;
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Could not read player data for " + id + ": " + e.getMessage());
+                    return;
+                }
+                if (config.getBoolean("tpauto", false)) {
+                    tpAutoPlayers.add(id);
+                }
             }
         });
     }
 
+    private void backupCorrupt(File file) {
+        try {
+            File backup = new File(file.getParentFile(), file.getName() + ".corrupt-" + System.currentTimeMillis());
+            Files.move(file.toPath(), backup.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception e) {
+            plugin.getLogger().fine("Could not back up corrupt player data " + file.getName() + ": " + e.getMessage());
+        }
+    }
+
     private void savePlayerData(UUID uuid, boolean tpAutoStatus) {
+        CompletableFuture<Void> pending = new CompletableFuture<>();
+        plugin.trackPendingSave(pending);
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
-            File file = getPlayerDataFile(uuid);
-            FileConfiguration config = YamlConfiguration.loadConfiguration(file);
-
-            config.set("tpauto", tpAutoStatus);
-            // Hier können später weitere Werte mit config.set(...) hinzugefügt werden
-
             try {
-                config.save(file);
-            } catch (IOException e) {
-                plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
+                // Shared per-UUID lock with VanishManager: load-merge-save must
+                // never interleave with a concurrent vanish save of the same
+                // file (both keys would otherwise overwrite each other).
+                synchronized (PlayerDataLocks.lockFor(uuid)) {
+                    File file = getPlayerDataFileForWrite(uuid);
+                    YamlConfiguration config = new YamlConfiguration();
+                    if (file.isFile()) {
+                        try {
+                            config.load(file);
+                        } catch (org.bukkit.configuration.InvalidConfigurationException corrupt) {
+                            backupCorrupt(file);
+                            plugin.getLogger().warning("Corrupt player data for " + uuid + " moved aside, rewriting tpauto flag.");
+                        } catch (Exception e) {
+                            plugin.getLogger().warning("Could not read player data for " + uuid + ": " + e.getMessage());
+                        }
+                    }
+
+                    config.set("tpauto", tpAutoStatus);
+                    // Hier können später weitere Werte mit config.set(...) hinzugefügt werden
+
+                    try {
+                        config.save(file);
+                    } catch (IOException e) {
+                        plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
+                    }
+                }
+            } finally {
+                pending.complete(null);
             }
         });
     }

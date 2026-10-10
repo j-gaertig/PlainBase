@@ -63,9 +63,9 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
             return;
         }
 
-        String reason = args.length > 2
+        String reason = defaultReason(args.length > 2
                 ? String.join(" ", Arrays.copyOfRange(args, 2, args.length))
-                : message("default-reason", "No reason specified.");
+                : null);
 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
@@ -106,8 +106,13 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                 return;
             }
 
-            manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, result -> {
+            manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, (result, dbError) -> {
                 if (isGone(sender)) return;
+                if (dbError) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("db-error", "<red>Database error, please try again later.")));
+                    return;
+                }
                 if (result.isEmpty()) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("already-banned", "<red>%player% is already banned.").replace("%player%", esc(name))));

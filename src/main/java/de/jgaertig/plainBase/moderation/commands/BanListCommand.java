@@ -67,10 +67,12 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                 int to = Math.min(from + PAGE_SIZE, active.size());
                 for (BanRecord record : active.subList(from, to)) {
                     // remaining <= 0: expired between the active check and this
-                    // render — show "expired", never "expired left".
+                    // render — show "expired", never "expired left". Computed
+                    // once per record, not once per branch.
+                    long remaining = record.remainingMillis(now);
                     String duration = record.isPermanent() ? "permanent"
-                            : (record.remainingMillis(now) <= 0 ? "expired"
-                                    : DurationParser.format(record.remainingMillis(now)) + " left");
+                            : (remaining <= 0 ? "expired"
+                                    : DurationParser.format(remaining) + " left");
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("banlist-entry", "<yellow>%player% <gray>- %reason% (%duration%)")
                                     .replace("%player%", esc(record.name()))
@@ -93,9 +95,10 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
 
                 int to = Math.min(from + PAGE_SIZE, activeIps.size());
                 for (IpBanRecord record : activeIps.subList(from, to)) {
+                    long remaining = record.remainingMillis(now);
                     String duration = record.isPermanent() ? "permanent"
-                            : (record.remainingMillis(now) <= 0 ? "expired"
-                                    : DurationParser.format(record.remainingMillis(now)) + " left");
+                            : (remaining <= 0 ? "expired"
+                                    : DurationParser.format(remaining) + " left");
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("banlist-ip-entry", "<yellow>%ip% <gray>- %reason% (%duration%)")
                                     .replace("%ip%", esc(record.ip()))

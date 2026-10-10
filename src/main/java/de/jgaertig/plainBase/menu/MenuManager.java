@@ -149,7 +149,7 @@ public class MenuManager {
     }
 
     public Set<String> getMenuNames() {
-        return menus.keySet();
+        return Set.copyOf(menus.keySet());
     }
 
     public boolean hasMenu(String name) {
@@ -226,6 +226,48 @@ public class MenuManager {
             } catch (Exception e) {
                 plugin.getLogger().fine("Failed to schedule menu close: " + e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Ordered shutdown close for stopModules(): sync best-effort first (menus
+     * confirmed closed before the MenuListener is unregistered), then the
+     * deferred entity-thread closes with a bounded wait so the async backup
+     * cannot still be in flight when the listener is gone. Never throws.
+     */
+    public void closeAllMenusSyncAwait(long timeoutMillis) {
+        closeAllMenusSyncBestEffort();
+        List<java.util.concurrent.CompletableFuture<Void>> futures = new ArrayList<>();
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (player == null) continue;
+            java.util.concurrent.CompletableFuture<Void> done = new java.util.concurrent.CompletableFuture<>();
+            futures.add(done);
+            try {
+                player.getScheduler().run(plugin, (t) -> {
+                    try {
+                        if (player.isOnline()) {
+                            Inventory top = player.getOpenInventory().getTopInventory();
+                            if (top != null && top.getHolder() instanceof MenuHolder) {
+                                player.closeInventory();
+                            }
+                        }
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to close menu for " + player.getName() + ": " + e.getMessage());
+                    } finally {
+                        done.complete(null);
+                    }
+                }, null);
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to schedule menu close: " + e.getMessage());
+                done.complete(null);
+            }
+        }
+        if (futures.isEmpty()) return;
+        try {
+            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
+                    .get(Math.max(0, timeoutMillis), java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            plugin.getLogger().fine("Menu close wait timed out: " + e.getMessage());
         }
     }
 
@@ -364,9 +406,10 @@ public class MenuManager {
         config.set("menus." + name, null);
         // Async persist (see createMenu): in-memory state is authoritative here.
         plugin.saveMenuConfigAsync();
-        // Close open GUIs first: after reloadMenus() the MenuListener no longer
-        // knows this menu, and clicks in a stale open inventory would no
-        // longer be cancelled (item-takeout exploit).
+        // ORDERING (must stay close-before-reload): close open GUIs FIRST,
+        // then reload. After reloadMenus() the MenuListener no longer knows
+        // this menu, and clicks in a stale open inventory would no longer be
+        // cancelled (item-takeout exploit). Never swap these two calls.
         closeAllMenus();
         reloadMenus();
     }

@@ -5,6 +5,7 @@ import de.jgaertig.plainBase.moderation.commands.ModerationCommandBase;
 import de.jgaertig.plainBase.moderation.storage.ModerationDatabase;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
+import org.bukkit.configuration.file.FileConfiguration;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -15,7 +16,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 /**
  * Ban/kick/IP-ban storage backed by a real database (SQLite by default,
@@ -88,23 +89,54 @@ public class BanManager {
     }
 
     public void shutdown() {
-        if (refreshTask != null) refreshTask.cancel();
-        db.close();
+        ScheduledTask task = refreshTask;
+        refreshTask = null;
+        if (task != null) {
+            try {
+                task.cancel();
+            } catch (Exception e) {
+                plugin.getLogger().fine("Could not cancel moderation refresh task: " + e.getMessage());
+            }
+        }
+        try {
+            db.close();
+        } catch (Exception e) {
+            plugin.getLogger().fine("Could not close moderation database: " + e.getMessage());
+        }
     }
 
     // ---- Cache refresh ----
 
     private void startPeriodicRefresh() {
-        long seconds = Math.max(5, plugin.getModerationConfig().getLong("storage.refresh-interval-seconds", 30));
-        refreshTask = Bukkit.getAsyncScheduler().runAtFixedRate(plugin, task -> refreshCacheBlocking(), seconds, seconds, TimeUnit.SECONDS);
+        FileConfiguration cfg = null;
+        try {
+            cfg = plugin.getModerationConfig();
+        } catch (Exception ignored) {
+        }
+        long seconds = 30;
+        if (cfg != null) {
+            try {
+                seconds = cfg.getLong("storage.refresh-interval-seconds", 30);
+            } catch (Exception e) {
+                plugin.getLogger().warning("Invalid storage.refresh-interval-seconds, using 30s: " + e.getMessage());
+            }
+        }
+        seconds = Math.max(5, seconds);
+        try {
+            refreshTask = Bukkit.getAsyncScheduler().runAtFixedRate(plugin, task -> refreshCacheBlocking(), seconds, seconds, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Could not schedule moderation cache refresh: " + e.getMessage());
+            refreshTask = null;
+        }
     }
 
     /**
      * Blocking DB read — only call from an async context (the initial fill and
      * the periodic task both run on Bukkit.getAsyncScheduler()).
      * <p>
-     * Full-table loads are unbounded by nature (history is never deleted), so
-     * they must never run on the calling thread at startup — see constructor.
+     * History tables are unbounded (rows are never deleted), so the loads are
+     * windowed to active-or-recent rows (see ModerationDatabase) and must
+     * never run on the calling thread at startup — see constructor.
      * A genuine SQLException keeps the previous snapshot (fail-open); a single
      * corrupt row is skipped loudly without discarding the rest.
      */
@@ -258,187 +290,285 @@ public class BanManager {
 
     // ---- Async mutations — always call back via the global region scheduler ----
 
-    public void tryBanAsync(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long durationMillis, Consumer<Optional<BanRecord>> callback) {
+    /**
+     * Answers {@code (result, dbError)}: {@code dbError=true} means the
+     * database itself failed (caller shows "db-error"), an empty result with
+     * {@code dbError=false} means already banned. Never masks one as the other.
+     */
+    public void tryBanAsync(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long durationMillis, BiConsumer<Optional<BanRecord>, Boolean> callback) {
+        // isEnabled guard BEFORE scheduling: runNow on a disabled plugin
+        // throws, and the pool is already closed — answer DB_ERROR directly
+        // on the caller's (region) thread instead of throwing into the command.
+        if (!plugin.isEnabled()) {
+            callback.accept(Optional.empty(), true);
+            return;
+        }
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            Optional<BanRecord> result;
-            synchronized (mutationLock) {
-                // Authoritative live check instead of cache-only: two racing
-                // /ban calls (or a ban from another server on shared MySQL)
-                // must not both pass the "not already banned" test.
-                // On DB failure fall back to the cache so a hiccup can't
-                // produce duplicate rows.
-                BanRecord live = null;
-                boolean liveOk = false;
-                try {
-                    live = db.findActiveBan(uuid, System.currentTimeMillis());
-                    liveOk = true;
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().warning("Could not live-check ban for " + name + ", falling back to cache: " + e.getMessage());
+            // Blocking JDBC stays OUTSIDE mutationLock: the lock only guards
+            // the short in-memory cache add below, never the I/O. The lost
+            // check-then-act atomicity is recovered via re-check on insert
+            // failure (SQLite's partial-unique index rejects the loser of a
+            // genuine race; a simultaneous cross-server race on shared MySQL
+            // stays documented last-write-wins).
+            BanRecord live = null;
+            boolean liveOk = false;
+            try {
+                live = db.findActiveBan(uuid, System.currentTimeMillis());
+                liveOk = true;
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().warning("Could not live-check ban for " + name + ", falling back to cache: " + e.getMessage());
+            }
+            if (live != null) {
+                BanRecord seen = live;
+                synchronized (mutationLock) {
+                    cacheLiveBan(seen);
                 }
-                BanRecord effective = live != null ? live : (liveOk ? null : getActiveBan(uuid).orElse(null));
-                if (effective != null) {
-                    if (live != null) cacheLiveBan(live);
-                    result = Optional.empty();
+                complete(() -> callback.accept(Optional.empty(), false));
+                return;
+            }
+            if (!liveOk && getActiveBan(uuid).isPresent()) {
+                complete(() -> callback.accept(Optional.empty(), false));
+                return;
+            }
+            BanRecord record;
+            try {
+                record = db.insertBan(uuid, name, reason, staffUuid, staffName, durationMillis);
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().severe("Could not insert ban for " + name + ": " + e.getMessage());
+                // Lost race: someone else may have banned concurrently while
+                // this insert was in flight — re-check before reporting a
+                // database error, so a race reports "already banned".
+                BanRecord raced = null;
+                try {
+                    raced = db.findActiveBan(uuid, System.currentTimeMillis());
+                } catch (SQLException | RuntimeException ignored) {
+                }
+                if (raced != null) {
+                    BanRecord seen = raced;
+                    synchronized (mutationLock) {
+                        cacheLiveBan(seen);
+                    }
+                    complete(() -> callback.accept(Optional.empty(), false));
                 } else {
-                    try {
-                        BanRecord record = db.insertBan(uuid, name, reason, staffUuid, staffName, durationMillis);
-                        bansCache.add(record);
-                        bansByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
-                        result = Optional.of(record);
-                    } catch (SQLException | RuntimeException e) {
-                        plugin.getLogger().severe("Could not insert ban for " + name + ": " + e.getMessage());
-                        result = Optional.empty();
-                    }
+                    complete(() -> callback.accept(Optional.empty(), true));
                 }
+                return;
             }
-            Optional<BanRecord> finalResult = result;
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalResult));
-        });
-    }
-
-    public void unbanPlayerAsync(UUID uuid, UUID staffUuid, String staffName, Consumer<Boolean> callback) {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            boolean success;
+            BanRecord inserted = record;
             synchronized (mutationLock) {
-                long now = System.currentTimeMillis();
-                try {
-                    // Only an ACTIVE ban can be unbanned: revokeBan() matches
-                    // every unrevoked row (revoked = 0) regardless of expiry, so
-                    // without this guard an already-expired tempban would still
-                    // revoke rows and report "unbanned". No active ban means the
-                    // caller reports "not banned" (covers expired and absent).
-                    if (!hasActiveBanNow(uuid, now)) {
-                        success = false;
-                    } else {
-                        // Revoke-by-key revokes ALL unrevoked rows for this uuid;
-                        // success is decided on the row count (0 = nothing to unban).
-                        int revoked = db.revokeBan(uuid, staffUuid, staffName, now);
-                        if (revoked > 0) {
-                            revokeAllBansInCache(uuid, staffUuid, staffName, now);
-                            success = true;
-                        } else {
-                            success = false;
-                        }
-                    }
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().severe("Could not revoke ban for " + uuid + ": " + e.getMessage());
-                    success = false;
-                }
+                bansCache.add(inserted);
+                bansByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(inserted);
             }
-            boolean finalSuccess = success;
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalSuccess));
-        });
-    }
-
-    public void recordKickAsync(UUID uuid, String name, String reason, UUID staffUuid, String staffName, Runnable onDone) {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            // Same mutationLock as every other mutation and the snapshot swap
-            // in refreshCacheBlocking: without this, a periodic refresh racing
-            // this add could swap in a snapshot taken before the insert and
-            // lose the kick from the cache until the next refresh.
-            // Note: banlist/baninfo read the cache and can therefore stay stale
-            // until the next refresh; the DB is the source of truth (the login
-            // path uses live queries, never the cache).
-            synchronized (mutationLock) {
-                try {
-                    KickRecord record = db.insertKick(uuid, name, reason, staffUuid, staffName);
-                    kicksCache.add(record);
-                    kicksByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().severe("Could not record kick for " + name + ": " + e.getMessage());
-                }
-            }
-            if (onDone != null) Bukkit.getGlobalRegionScheduler().run(plugin, t -> onDone.run());
-        });
-    }
-
-    public void tryBanIpAsync(String ip, String reason, UUID staffUuid, String staffName, long durationMillis, Consumer<Optional<IpBanRecord>> callback) {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            Optional<IpBanRecord> result;
-            synchronized (mutationLock) {
-                // Live check first (same reasoning as tryBanAsync); cache is
-                // only the fallback when the DB itself is unreachable.
-                long now = System.currentTimeMillis();
-                IpBanRecord live = null;
-                boolean liveOk = false;
-                try {
-                    live = db.findActiveIpBan(ip, now);
-                    liveOk = true;
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
-                }
-                boolean alreadyBanned = live != null
-                        || (!liveOk && ipBansCache.stream().anyMatch(r -> r.ip().equals(ip) && r.isActive(now)));
-                if (alreadyBanned) {
-                    if (live != null) cacheLiveIpBan(live);
-                    result = Optional.empty();
-                } else {
-                    try {
-                        IpBanRecord record = db.insertIpBan(ip, reason, staffUuid, staffName, durationMillis);
-                        ipBansCache.add(record);
-                        result = Optional.of(record);
-                    } catch (SQLException | RuntimeException e) {
-                        plugin.getLogger().severe("Could not insert IP ban for " + ip + ": " + e.getMessage());
-                        result = Optional.empty();
-                    }
-                }
-            }
-            Optional<IpBanRecord> finalResult = result;
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalResult));
-        });
-    }
-
-    public void unbanIpAsync(String ip, UUID staffUuid, String staffName, Consumer<Boolean> callback) {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            boolean success;
-            synchronized (mutationLock) {
-                long now = System.currentTimeMillis();
-                try {
-                    // Same active-only guard as unbanPlayerAsync: an expired
-                    // temp-IP-ban must report "not banned", not "unbanned".
-                    if (!hasActiveIpBanNow(ip, now)) {
-                        success = false;
-                    } else {
-                        // Same revoke-by-key pattern as unbanPlayerAsync: all
-                        // unrevoked rows for this IP, row count decides success.
-                        int revoked = db.revokeIpBan(ip, staffUuid, staffName, now);
-                        if (revoked > 0) {
-                            revokeAllIpBansInCache(ip, staffUuid, staffName, now);
-                            success = true;
-                        } else {
-                            success = false;
-                        }
-                    }
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
-                    success = false;
-                }
-            }
-            boolean finalSuccess = success;
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalSuccess));
+            complete(() -> callback.accept(Optional.of(inserted), false));
         });
     }
 
     /**
-     * Live active check with cache fallback for the unban guards: on a DB
-     * failure the (possibly stale) cache decides instead of a hiccup silently
-     * reporting "not banned" or revoking blindly.
+     * Answers {@code (unbanned, dbError)}: {@code dbError=true} means the
+     * database itself failed (caller shows "db-error"), {@code (false, false)}
+     * means genuinely not banned.
      */
-    private boolean hasActiveBanNow(UUID uuid, long now) {
-        try {
-            return db.findActiveBan(uuid, now) != null;
-        } catch (SQLException | RuntimeException e) {
-            plugin.getLogger().warning("Could not live-check ban for " + uuid + ", falling back to cache: " + e.getMessage());
-            return getActiveBan(uuid).isPresent();
+    public void unbanPlayerAsync(UUID uuid, UUID staffUuid, String staffName, BiConsumer<Boolean, Boolean> callback) {
+        if (!plugin.isEnabled()) {
+            callback.accept(false, true);
+            return;
         }
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            long now = System.currentTimeMillis();
+            // Only an ACTIVE ban can be unbanned: revokeBan() matches every
+            // unrevoked row (revoked = 0) regardless of expiry, so without
+            // this guard an already-expired tempban would still revoke rows
+            // and report "unbanned". No active ban means "not banned" (covers
+            // expired and absent). Live check, outside the lock.
+            boolean active;
+            boolean guardFailed = false;
+            try {
+                active = db.findActiveBan(uuid, now) != null;
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().warning("Could not live-check ban for " + uuid + ", falling back to cache: " + e.getMessage());
+                guardFailed = true;
+                active = getActiveBan(uuid).isPresent();
+            }
+            if (!active) {
+                // A failed guard with an empty (possibly stale) cache cannot
+                // tell "not banned" from "DB down" — report a database error
+                // instead of a misleading "not banned".
+                boolean dbError = guardFailed;
+                complete(() -> callback.accept(false, dbError));
+                return;
+            }
+            // Revoke-by-key revokes ALL unrevoked rows for this uuid;
+            // success is decided on the row count (0 = nothing to unban).
+            int revoked;
+            try {
+                revoked = db.revokeBan(uuid, staffUuid, staffName, now);
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().severe("Could not revoke ban for " + uuid + ": " + e.getMessage());
+                complete(() -> callback.accept(false, true));
+                return;
+            }
+            if (revoked > 0) {
+                synchronized (mutationLock) {
+                    revokeAllBansInCache(uuid, staffUuid, staffName, now);
+                }
+                complete(() -> callback.accept(true, false));
+            } else {
+                complete(() -> callback.accept(false, false));
+            }
+        });
     }
 
-    private boolean hasActiveIpBanNow(String ip, long now) {
+    public void recordKickAsync(UUID uuid, String name, String reason, UUID staffUuid, String staffName, Runnable onDone) {
+        if (!plugin.isEnabled()) return;
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            // Blocking insert outside the lock; only the cache add below is
+            // guarded (same pattern as tryBanAsync — see there).
+            // Note: banlist/baninfo read the cache and can therefore stay stale
+            // until the next refresh; the DB is the source of truth (the login
+            // path uses live queries, never the cache).
+            KickRecord inserted = null;
+            try {
+                inserted = db.insertKick(uuid, name, reason, staffUuid, staffName);
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().severe("Could not record kick for " + name + ": " + e.getMessage());
+            }
+            if (inserted != null) {
+                KickRecord record = inserted;
+                synchronized (mutationLock) {
+                    kicksCache.add(record);
+                    kicksByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
+                }
+            }
+            if (onDone != null) complete(onDone);
+        });
+    }
+
+    /**
+     * Answers {@code (result, dbError)} — same contract as
+     * {@link #tryBanAsync}.
+     */
+    public void tryBanIpAsync(String ip, String reason, UUID staffUuid, String staffName, long durationMillis, BiConsumer<Optional<IpBanRecord>, Boolean> callback) {
+        if (!plugin.isEnabled()) {
+            callback.accept(Optional.empty(), true);
+            return;
+        }
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            // Live check first (same reasoning as tryBanAsync); cache is
+            // only the fallback when the DB itself is unreachable. Blocking
+            // JDBC outside the lock, cache add inside (see tryBanAsync).
+            long now = System.currentTimeMillis();
+            IpBanRecord live = null;
+            boolean liveOk = false;
+            try {
+                live = db.findActiveIpBan(ip, now);
+                liveOk = true;
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
+            }
+            if (live != null) {
+                IpBanRecord seen = live;
+                synchronized (mutationLock) {
+                    cacheLiveIpBan(seen);
+                }
+                complete(() -> callback.accept(Optional.empty(), false));
+                return;
+            }
+            if (!liveOk && ipBansCache.stream().anyMatch(r -> r.ip().equals(ip) && r.isActive(now))) {
+                complete(() -> callback.accept(Optional.empty(), false));
+                return;
+            }
+            IpBanRecord record;
+            try {
+                record = db.insertIpBan(ip, reason, staffUuid, staffName, durationMillis);
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().severe("Could not insert IP ban for " + ip + ": " + e.getMessage());
+                // Lost race (see tryBanAsync): re-check before crying DB error.
+                IpBanRecord raced = null;
+                try {
+                    raced = db.findActiveIpBan(ip, System.currentTimeMillis());
+                } catch (SQLException | RuntimeException ignored) {
+                }
+                if (raced != null) {
+                    IpBanRecord seen = raced;
+                    synchronized (mutationLock) {
+                        cacheLiveIpBan(seen);
+                    }
+                    complete(() -> callback.accept(Optional.empty(), false));
+                } else {
+                    complete(() -> callback.accept(Optional.empty(), true));
+                }
+                return;
+            }
+            IpBanRecord inserted = record;
+            synchronized (mutationLock) {
+                ipBansCache.add(inserted);
+            }
+            complete(() -> callback.accept(Optional.of(inserted), false));
+        });
+    }
+
+    /**
+     * Answers {@code (unbanned, dbError)} — same contract as
+     * {@link #unbanPlayerAsync}.
+     */
+    public void unbanIpAsync(String ip, UUID staffUuid, String staffName, BiConsumer<Boolean, Boolean> callback) {
+        if (!plugin.isEnabled()) {
+            callback.accept(false, true);
+            return;
+        }
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            long now = System.currentTimeMillis();
+            // Same active-only guard as unbanPlayerAsync: an expired
+            // temp-IP-ban must report "not banned", not "unbanned".
+            boolean active;
+            boolean guardFailed = false;
+            try {
+                active = db.findActiveIpBan(ip, now) != null;
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
+                guardFailed = true;
+                active = getActiveIpBans().stream().anyMatch(r -> r.ip() != null && r.ip().equals(ip) && r.isActive(now));
+            }
+            if (!active) {
+                boolean dbError = guardFailed;
+                complete(() -> callback.accept(false, dbError));
+                return;
+            }
+            // Same revoke-by-key pattern as unbanPlayerAsync: all
+            // unrevoked rows for this IP, row count decides success.
+            int revoked;
+            try {
+                revoked = db.revokeIpBan(ip, staffUuid, staffName, now);
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
+                complete(() -> callback.accept(false, true));
+                return;
+            }
+            if (revoked > 0) {
+                synchronized (mutationLock) {
+                    revokeAllIpBansInCache(ip, staffUuid, staffName, now);
+                }
+                complete(() -> callback.accept(true, false));
+            } else {
+                complete(() -> callback.accept(false, false));
+            }
+        });
+    }
+
+    /**
+     * Hops the answer back onto the global region thread (same
+     * async-then-region pattern as before). If the scheduler is gone
+     * (shutdown race despite the isEnabled guards), runs the answer directly
+     * instead of throwing and hanging the caller silently.
+     */
+    private void complete(Runnable answer) {
         try {
-            return db.findActiveIpBan(ip, now) != null;
-        } catch (SQLException | RuntimeException e) {
-            plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
-            return getActiveIpBans().stream().anyMatch(r -> r.ip() != null && r.ip().equals(ip) && r.isActive(now));
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> answer.run());
+        } catch (RuntimeException e) {
+            try {
+                answer.run();
+            } catch (RuntimeException ignored) {
+            }
         }
     }
 

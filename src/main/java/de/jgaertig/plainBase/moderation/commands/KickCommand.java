@@ -65,14 +65,24 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
             return;
         }
 
-        String reason = args.length > 1
+        String reason = defaultReason(args.length > 1
                 ? String.join(" ", Arrays.copyOfRange(args, 1, args.length))
-                : message("default-reason", "No reason specified.");
+                : null);
 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
         String targetName = target.getName();
         UUID targetUuid = target.getUniqueId();
+
+        // Online check BEFORE the insert: a kick that can never land (target
+        // already gone) must not be recorded as history either. The re-check
+        // after the async write below stays — the target can still leave
+        // during the DB hop.
+        if (Bukkit.getPlayer(targetUuid) == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(targetName))));
+            return;
+        }
 
         banManager.recordKickAsync(targetUuid, targetName, reason, staffUuid, staffName, () -> {
             // Re-check AFTER the DB write: the target may have logged off

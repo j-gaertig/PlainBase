@@ -159,6 +159,17 @@ public class VanishListener implements Listener {
 
         if (plugin.getVanishManager().isVanished(player)) {
             event.setCancelled(true);
+            return;
+        }
+        // A vanished shooter's projectile must not hit either (outgoing
+        // protection, mirror of onDamage's attacker guard).
+        try {
+            Player shooter = resolveCausalPlayer(event.getEntity());
+            if (shooter != null && plugin.getVanishManager().isVanished(shooter)) {
+                event.setCancelled(true);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check vanish shooter state: " + e.getMessage());
         }
     }
 

@@ -39,7 +39,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
         if (cached == null) return false;
         try {
             return cached.unregister();
-        } catch (Exception e) {
+        } catch (Throwable t) {
             return false;
         }
     }

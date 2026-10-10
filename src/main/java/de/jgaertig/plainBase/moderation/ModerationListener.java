@@ -3,6 +3,7 @@ package de.jgaertig.plainBase.moderation;
 import de.jgaertig.plainBase.PlainBase;
 import de.jgaertig.plainBase.moderation.commands.ModerationCommandBase;
 import net.kyori.adventure.text.Component;
+import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -12,6 +13,7 @@ import org.bukkit.event.player.PlayerJoinEvent;
 
 import java.sql.SQLException;
 import java.util.Objects;
+import java.util.UUID;
 
 /**
  * Blocks logins for banned players/IPs. This event runs OFF the main thread
@@ -80,23 +82,45 @@ public class ModerationListener implements Listener {
             }
         }
 
-        if (!modConfig.getBoolean("ban.enabled", true)) return;
+        // Snapshot every config value this check needs up front: a reload can
+        // mutate the config mid-check (this event runs async), so locals keep
+        // one consistent decision instead of half-old/half-new behavior.
+        // Separate guards: an IP ban must still be enforced when the UUID ban
+        // is disabled (and vice versa) — never return early on one flag.
+        boolean banEnabled = modConfig.getBoolean("ban.enabled", true);
+        boolean ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
+        if (!banEnabled && !ipBanEnabled) return;
 
         try {
-            BanRecord ban = manager.queryActiveBanNow(event.getUniqueId());
-            if (ban != null) {
-                disallowForBan(event, ban);
-                return;
+            if (banEnabled) {
+                BanRecord ban = manager.queryActiveBanNow(event.getUniqueId());
+                if (ban != null) {
+                    // Fail-closed: disallow FIRST with a plain fallback, then try
+                    // the configured screen. If message building throws, the deny
+                    // stays — a builder bug can never let a banned player in.
+                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, Component.text("You are banned."));
+                    try {
+                        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, banKickMessage(ban, modConfig));
+                    } catch (RuntimeException e) {
+                        plugin.getLogger().warning("Could not build ban screen, keeping fallback: " + e.getMessage());
+                    }
+                    return;
+                }
             }
 
-            if (ip != null && modConfig.getBoolean("ip-ban.enabled", true)) {
+            if (ipBanEnabled && ip != null) {
                 IpBanRecord ipBan = manager.queryActiveIpBanNow(ip);
                 if (ipBan != null) {
-                    disallowForIpBan(event, ipBan);
+                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, Component.text("Your IP address is banned."));
+                    try {
+                        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, ipBanKickMessage(ipBan, modConfig));
+                    } catch (RuntimeException e) {
+                        plugin.getLogger().warning("Could not build IP-ban screen, keeping fallback: " + e.getMessage());
+                    }
                 }
             }
         } catch (SQLException | RuntimeException e) {
-            plugin.getLogger().severe("Could not check ban status for " + Objects.toString(event.getName(), "?") + ": " + e.getMessage());
+            plugin.getLogger().warning("Could not check ban status for " + Objects.toString(event.getName(), "?") + ": " + e.getMessage());
             // Fail open: a DB hiccup must never lock every player out of the server.
             // (NPEs can no longer bypass bans: all nullable ban/template fields
             // are handled via Objects.toString below, so this path only triggers
@@ -108,10 +132,10 @@ public class ModerationListener implements Listener {
      * Post-login safety net for the ban-during-prelogin race: tryBanAsync()
      * writes the row asynchronously while this player's AsyncPlayerPreLoginEvent
      * may already have passed (offlinePlayer.getPlayer() is still null then, so
-     * the command callback cannot kick). The fresh row is already in
-     * BanManager's cache by join time, so a cheap CACHED re-check here — no
-     * blocking I/O on the join thread — catches exactly that window and kicks.
-     * The next login is additionally covered by the pre-login live DB check.
+     * the command callback cannot kick). A cheap LIVE re-check here — off the
+     * join thread, never a full cache scan per join — catches exactly that
+     * window and kicks. The next login is additionally covered by the pre-login
+     * live DB check.
      */
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
@@ -122,33 +146,74 @@ public class ModerationListener implements Listener {
 
         FileConfiguration modConfig = plugin.getModerationConfig();
         if (modConfig == null) return;
-        if (!modConfig.getBoolean("ban.enabled", true)) return;
+        // Config snapshot on the MAIN/join thread BEFORE hopping async: the
+        // reload-mutable config object is never touched off-thread — every
+        // boolean/string this check needs is copied into locals here.
+        // Separate guards (see onPreLogin): either check can run while the
+        // other is disabled.
+        boolean banEnabled = modConfig.getBoolean("ban.enabled", true);
+        boolean ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
+        if (!banEnabled && !ipBanEnabled) return;
+        final boolean banEnabledAsync = banEnabled;
+        final boolean ipBanEnabledAsync = ipBanEnabled;
+        String banTemplate = Objects.toString(
+                modConfig.getString("messages.ban-screen", "<red>You are banned."), "<red>You are banned.");
+        String tempbanTemplate = Objects.toString(
+                modConfig.getString("messages.tempban-screen", "<red>You are banned."), "<red>You are banned.");
+        String ipbanTemplate = Objects.toString(
+                modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
+                "<red>Your IP address is banned.");
 
         Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        String rawIp = player.getAddress() == null ? null : player.getAddress().getAddress() == null
+                ? null : player.getAddress().getAddress().getHostAddress();
+        String ip = ModerationCommandBase.normalizeIp(rawIp);
+        // Name/IP captured sync into locals: player.getName() must never run
+        // off-thread (the async task below) on Folia.
+        final String playerName = player.getName();
+        final String ipAsync = ip;
 
-        BanRecord ban = manager.getActiveBan(player.getUniqueId()).orElse(null);
-        if (ban != null) {
-            kickSafely(player, banKickMessage(ban, modConfig));
-            return;
-        }
-
-        if (modConfig.getBoolean("ip-ban.enabled", true)) {
-            String rawIp = player.getAddress() == null ? null : player.getAddress().getAddress() == null
-                    ? null : player.getAddress().getAddress().getHostAddress();
-            String ip = ModerationCommandBase.normalizeIp(rawIp);
-            if (ip != null) {
-                long now = System.currentTimeMillis();
-                IpBanRecord match = null;
-                for (IpBanRecord record : manager.getActiveIpBans()) {
-                    if (record == null || record.ip() == null || !record.isActive(now)) continue;
-                    if (ip.equals(ModerationCommandBase.normalizeIp(record.ip()))) {
-                        match = record;
-                        break;
-                    }
+        // Live re-check off the join thread (blocking JDBC must never run on
+        // it, and no full cache scan per join). Pre-login already covered the
+        // normal case, so a DB failure here fails open with a warning — except
+        // the UUID check, which cheaply falls back to the cache.
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            BanRecord ban = null;
+            if (banEnabledAsync) {
+                try {
+                    ban = manager.queryActiveBanNow(uuid);
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not re-check ban status on join for "
+                            + Objects.toString(playerName, "?") + ": " + e.getMessage());
+                    ban = manager.getActiveBan(uuid).orElse(null);
                 }
-                if (match != null) kickSafely(player, ipBanKickMessage(match, modConfig));
             }
-        }
+
+            IpBanRecord ipBan = null;
+            if (ban == null && ipBanEnabledAsync && ipAsync != null) {
+                try {
+                    ipBan = manager.queryActiveIpBanNow(ipAsync);
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not re-check IP ban status on join for "
+                            + Objects.toString(playerName, "?") + ": " + e.getMessage());
+                }
+            }
+            if (ban == null && ipBan == null) return;
+
+            // Message building in its own try/catch, fail-closed: a broken
+            // template must still kick, just with a plain fallback screen.
+            Component screen;
+            try {
+                screen = ban != null
+                        ? renderBanScreen(ban, ban.isPermanent() ? banTemplate : tempbanTemplate)
+                        : renderIpBanScreen(ipBan, ipbanTemplate);
+            } catch (RuntimeException e) {
+                plugin.getLogger().warning("Could not build join kick screen, using fallback: " + e.getMessage());
+                screen = Component.text("You are banned.");
+            }
+            kickSafely(player, screen);
+        });
     }
 
     /**
@@ -162,18 +227,7 @@ public class ModerationListener implements Listener {
         }, null);
     }
 
-    private void disallowForBan(AsyncPlayerPreLoginEvent event, BanRecord ban) {
-        FileConfiguration modConfig = plugin.getModerationConfig();
-        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, banKickMessage(ban, modConfig));
-    }
-
-    private void disallowForIpBan(AsyncPlayerPreLoginEvent event, IpBanRecord ban) {
-        FileConfiguration modConfig = plugin.getModerationConfig();
-        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, ipBanKickMessage(ban, modConfig));
-    }
-
     private Component banKickMessage(BanRecord ban, FileConfiguration modConfig) {
-        long now = System.currentTimeMillis();
         // The config is passed in (it was already null-checked by the caller);
         // a /plainbase reload racing the async pre-login event can still null
         // it between check and use, so a null here falls back to a plain
@@ -185,12 +239,22 @@ public class ModerationListener implements Listener {
                         ban.isPermanent() ? "messages.ban-screen" : "messages.tempban-screen",
                         "<red>You are banned."),
                 "<red>You are banned.");
+        return renderBanScreen(ban, template);
+    }
+
+    /**
+     * Builds the ban screen from an already-snapshotted template (see onJoin):
+     * touches no config, so it is safe to call off-thread.
+     */
+    private Component renderBanScreen(BanRecord ban, String template) {
+        long now = System.currentTimeMillis();
+        String safeTemplate = Objects.toString(template, "<red>You are banned.");
 
         // Escape user-controlled values BEFORE substitution so a reason like
         // "<click:run_command:...>" can never inject MiniMessage tags.
         String reason = plugin.getMiniMessage().escapeTags(Objects.toString(ban.reason(), ""));
         String staff = plugin.getMiniMessage().escapeTags(Objects.toString(ban.staffName(), ""));
-        String text = template
+        String text = safeTemplate
                 .replace("%reason%", reason)
                 .replace("%staff%", staff)
                 .replace("%remaining%", DurationParser.format(ban.remainingMillis(now)));
@@ -199,14 +263,23 @@ public class ModerationListener implements Listener {
     }
 
     private Component ipBanKickMessage(IpBanRecord ban, FileConfiguration modConfig) {
-        long now = System.currentTimeMillis();
         String template = modConfig == null ? "<red>Your IP address is banned." : Objects.toString(
                 modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
                 "<red>Your IP address is banned.");
+        return renderIpBanScreen(ban, template);
+    }
+
+    /**
+     * Builds the IP-ban screen from an already-snapshotted template (see
+     * onJoin): touches no config, so it is safe to call off-thread.
+     */
+    private Component renderIpBanScreen(IpBanRecord ban, String template) {
+        long now = System.currentTimeMillis();
+        String safeTemplate = Objects.toString(template, "<red>Your IP address is banned.");
 
         String reason = plugin.getMiniMessage().escapeTags(Objects.toString(ban.reason(), ""));
         String staff = plugin.getMiniMessage().escapeTags(Objects.toString(ban.staffName(), ""));
-        String text = template
+        String text = safeTemplate
                 .replace("%reason%", reason)
                 .replace("%staff%", staff)
                 .replace("%remaining%", DurationParser.format(ban.remainingMillis(now)));

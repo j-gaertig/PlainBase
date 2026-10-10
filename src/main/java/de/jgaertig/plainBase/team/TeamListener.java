@@ -4,6 +4,7 @@ import de.jgaertig.plainBase.PlainBase;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 
 public class TeamListener implements Listener {
 
@@ -17,5 +18,15 @@ public class TeamListener implements Listener {
     public void onJoin(PlayerJoinEvent event) {
         if (plugin.getTeamManager() == null) return;
         plugin.getTeamManager().handleJoin(event.getPlayer());
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        if (plugin.getTeamManager() == null) return;
+        try {
+            plugin.getTeamManager().handleQuit(event.getPlayer());
+        } catch (Exception e) {
+            plugin.getLogger().fine("Team quit cleanup failed: " + e.getMessage());
+        }
     }
 }

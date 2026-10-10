@@ -59,6 +59,8 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             }
 
             String name = displayName(offlinePlayer, targetName);
+            // Counts come from the windowed cache (last 90 days, see
+            // ModerationDatabase) — the labels below say so explicitly.
             int bans = manager.getBanCount(offlinePlayer.getUniqueId());
             int kicks = manager.getKickCount(offlinePlayer.getUniqueId());
 
@@ -86,9 +88,9 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             }
 
             sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("baninfo-total-bans", "<gray>Total bans: <yellow>%bans%").replace("%bans%", String.valueOf(bans))));
+                    message("baninfo-total-bans", "<gray>Total bans (last 90 days): <yellow>%bans%").replace("%bans%", String.valueOf(bans))));
             sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("baninfo-total-kicks", "<gray>Total kicks: <yellow>%kicks%").replace("%kicks%", String.valueOf(kicks))));
+                    message("baninfo-total-kicks", "<gray>Total kicks (last 90 days): <yellow>%kicks%").replace("%kicks%", String.valueOf(kicks))));
 
             manager.getLastBan(offlinePlayer.getUniqueId()).ifPresent(last ->
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
@@ -96,11 +98,12 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                                     .replace("%reason%", esc(last.reason()))
                                     .replace("%staff%", esc(last.staffName())))));
 
-            // findLastIpByNameStrict() does blocking JDBC I/O — never call it
-            // directly on this main/region thread. Hop to the async scheduler,
-            // then back. Uses the strict variant so a DB failure reports a
-            // database error (like IpBanCommand) instead of silently looking
-            // like "no IP, nothing to show".
+            // findLastIpByNameStrict() and queryActiveIpBanNow() do blocking
+            // JDBC I/O — never call them on the main/region thread. Both run
+            // on the async scheduler here; only the final sendMessage hops
+            // back to the region thread. Uses the strict variant so a DB
+            // failure reports a database error (like IpBanCommand) instead of
+            // silently looking like "no IP, nothing to show".
             org.bukkit.Bukkit.getAsyncScheduler().runNow(plugin, task -> {
                 String lastIp = null;
                 boolean dbError = false;
@@ -110,29 +113,38 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                     plugin.getLogger().warning("Could not look up last IP for " + name + ": " + e.getMessage());
                     dbError = true;
                 }
-                String resolvedIp = lastIp;
-                boolean failed = dbError;
-                org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
-                    if (isGone(sender)) return;
-                    if (failed) {
+                if (dbError) {
+                    org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                        if (isGone(sender)) return;
                         sender.sendMessage(render(
                                 message("db-error", "<red>Database error, please try again later.")));
-                        return;
-                    }
-                    if (resolvedIp == null) return;
-
-                    // Compare canonical forms (stored rows may use legacy
-                    // spellings like ::ffff:1.2.3.4); null-guarded on both sides.
-                    String normLast = normalizeIp(resolvedIp);
-                    if (normLast == null) return;
-                    long now = System.currentTimeMillis();
-                    boolean ipBanned = manager.getActiveIpBans().stream().anyMatch(r -> {
-                        if (r == null || r.ip() == null) return false;
-                        String normRow = normalizeIp(r.ip());
-                        return normRow != null && normRow.equals(normLast) && r.isActive(now);
                     });
-                    if (!ipBanned) return;
+                    return;
+                }
+                if (lastIp == null) return;
 
+                // Compare canonical forms (stored rows may use legacy
+                // spellings like ::ffff:1.2.3.4); null-guarded on both sides.
+                String normLast = normalizeIp(lastIp);
+                if (normLast == null) return;
+                // Authoritative live check instead of the (possibly stale)
+                // local cache: an IP ban issued elsewhere must show here.
+                // Still on the async thread — never blocking on the region.
+                boolean ipBanned;
+                try {
+                    ipBanned = manager.queryActiveIpBanNow(normLast) != null;
+                } catch (SQLException | RuntimeException e) {
+                    plugin.getLogger().warning("Could not check IP ban for " + name + ": " + e.getMessage());
+                    org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                        if (isGone(sender)) return;
+                        sender.sendMessage(render(
+                                message("db-error", "<red>Database error, please try again later.")));
+                    });
+                    return;
+                }
+                if (!ipBanned) return;
+
+                org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                     if (isGone(sender)) return;
                     sender.sendMessage(render(
                             message("baninfo-ip-banned", "<gray>Note: their last known IP address is currently banned too.")));

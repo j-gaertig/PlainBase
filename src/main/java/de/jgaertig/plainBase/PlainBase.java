@@ -39,11 +39,18 @@ import org.bukkit.plugin.java.JavaPlugin;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import org.jetbrains.annotations.Nullable;
 
 public final class PlainBase extends JavaPlugin {
 
@@ -60,6 +67,21 @@ public final class PlainBase extends JavaPlugin {
     // Values are Strings (not Doubles) so "1.10" stays distinct from "1.1":
     // a double would collapse both to 1.1 before the segment-wise compare.
     private final Map<String, String> latestVersions = new ConcurrentHashMap<>();
+    /**
+     * Central config lock: replaces all {@code synchronized(rootCfg)} /
+     * {@code synchronized(config)} monitors for the root config read-modify
+     * paths (toggle, suggest, GlobalListener, checkAllConfigVersions).
+     * Synchronizing on the config instance itself is fragile (instance can be
+     * swapped by reloadConfig()), a dedicated final monitor stays stable.
+     */
+    private final Object configLock = new Object();
+    /** Per-file sequence counter to drop stale async writes (lost-update guard). */
+    private final Map<String, AtomicLong> configSeq = new ConcurrentHashMap<>();
+    /** Per-file write locks so sync + async writers of the same file serialize. */
+    private final Map<String, Object> fileLocks = new ConcurrentHashMap<>();
+    /** Pending async config writes, awaited with timeout in stopModules(). */
+    private final List<CompletableFuture<Void>> pendingSaves =
+            Collections.synchronizedList(new ArrayList<>());
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     // Volatile: read off-thread (VanishManager/TeamManager scheduler hops,
     // PlaceholderAPI expansion, Brigadier suggestions) while reloadModules()
@@ -73,6 +95,10 @@ public final class PlainBase extends JavaPlugin {
     private volatile TeamManager teamManager;
     private boolean placeholdersRegistered = false;
     private GlobalListener globalListener;
+    // Kept so stopModules() can unregister the MenuListener explicitly LAST,
+    // after all menus are confirmed closed (HandlerList.unregisterAll would
+    // otherwise drop it together with every other listener).
+    private MenuListener menuListener;
 
     private boolean commandsRegistered = false;
 
@@ -84,6 +110,18 @@ public final class PlainBase extends JavaPlugin {
      * onDisable.
      */
     private final Set<String> ownedPermissions = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Central monitor for all root-config read-modify paths. Use this instead
+     * of synchronizing on the config instance.
+     */
+    public Object getConfigLock() {
+        return configLock;
+    }
+
+    private Object getFileLock(String fileName) {
+        return fileLocks.computeIfAbsent(fileName, k -> new Object());
+    }
 
     @Override
     public void onEnable() {
@@ -172,7 +210,7 @@ public final class PlainBase extends JavaPlugin {
 
         if (placeholdersRegistered) {
             try {
-                new PlainBaseExpansion(this).unregister();
+                PlainBaseExpansion.unregisterCached();
             } catch (Exception e) {
                 getLogger().fine("Failed to unregister PlaceholderAPI expansion: " + e.getMessage());
             }
@@ -481,11 +519,40 @@ public final class PlainBase extends JavaPlugin {
     }
 
     /**
+     * Thread-guard: these lifecycle/config paths must run on the global region
+     * (or primary) thread. Off-thread callers are warned and rescheduled
+     * instead of touching Bukkit state. Build-neutral via
+     * {@link org.bukkit.Bukkit#isPrimaryThread()}.
+     */
+    private boolean ensureGlobalThread(String what, Runnable reschedule) {
+        try {
+            if (Bukkit.isPrimaryThread()) return true;
+        } catch (Exception ignored) {
+            return true;
+        }
+        getLogger().warning(what + " called off-thread, rescheduling on the global region thread.");
+        try {
+            Bukkit.getGlobalRegionScheduler().run(this, t -> {
+                if (!isEnabled()) return;
+                try {
+                    reschedule.run();
+                } catch (Exception e) {
+                    getLogger().warning("Rescheduled " + what + " failed: " + e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            getLogger().warning("Could not reschedule " + what + ": " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
      * Must run on the global region thread: unregisters listeners, touches
      * Bukkit state and does config disk I/O. Command call sites hop via
      * Bukkit.getGlobalRegionScheduler() before calling this.
      */
     public void reloadModules() {
+        if (!ensureGlobalThread("reloadModules", this::reloadModules)) return;
         // F1: reload the main config FIRST so stopModules() below decides on
         // the NEW module flags (toggle-off must reveal vanished players even
         // though the old in-memory config still said enabled). Module configs
@@ -509,6 +576,15 @@ public final class PlainBase extends JavaPlugin {
         if (isModuleEnabled("team")) runModuleSetup("team", this::setupTeam);
 
         ensureGlobalListenerSafe();
+
+        // PlaceholderAPI may have loaded after our onEnable (soft dependency):
+        // re-register here so /plainbase reload picks it up without a restart.
+        // Idempotent (no-op when already registered or PAPI still absent).
+        try {
+            registerPlaceholderExpansion();
+        } catch (Exception e) {
+            getLogger().fine("Failed to register PlaceholderAPI expansion on reload: " + e.getMessage());
+        }
 
         // Warning-only version check, also on every /plainbase reload/toggle:
         // an outdated module config after an update must be noticed even when
@@ -579,7 +655,79 @@ public final class PlainBase extends JavaPlugin {
         }
     }
 
+    /**
+     * Tracks an async persistence future so {@link #awaitPendingSaves()} can
+     * await it during reload/disable. Used by VanishManager/TPAManager
+     * per-player saves (which historically ran untracked and could be lost to
+     * a cancelled async task on shutdown). Never throws.
+     */
+    public void trackPendingSave(CompletableFuture<Void> future) {
+        if (future == null) return;
+        try {
+            synchronized (pendingSaves) {
+                pendingSaves.removeIf(CompletableFuture::isDone);
+                pendingSaves.add(future);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * Waits (bounded, 5s) for pending async config writes tracked in
+     * {@link #pendingSaves}. Minimal flush barrier for reload/disable —
+     * completed futures are removed. On timeout the snapshot entries are
+     * abandoned (removeAll) so they can never leak across reloads, and the
+     * abandon is logged. Never throws.
+     */
+    private void awaitPendingSaves() {
+        CompletableFuture<?>[] snapshot;
+        synchronized (pendingSaves) {
+            pendingSaves.removeIf(CompletableFuture::isDone);
+            if (pendingSaves.isEmpty()) return;
+            snapshot = pendingSaves.toArray(new CompletableFuture[0]);
+        }
+        try {
+            CompletableFuture.allOf(snapshot).get(5, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            getLogger().warning("Timed out waiting for " + snapshot.length
+                    + " async config writes, abandoning them: " + e.getMessage());
+            synchronized (pendingSaves) {
+                pendingSaves.removeAll(java.util.Arrays.asList(snapshot));
+            }
+        } catch (Exception e) {
+            getLogger().fine("Pending async config writes did not finish in time: " + e.getMessage());
+        } finally {
+            synchronized (pendingSaves) {
+                pendingSaves.removeIf(CompletableFuture::isDone);
+            }
+        }
+    }
+
     public void stopModules() {
+        // Thread-guard (warn-only by design): onDisable() must run
+        // synchronously even when called during shutdown where rescheduling
+        // would silently drop the whole shutdown path. Reload callers already
+        // arrive via the global region thread (see reloadModules()).
+        try {
+            if (!Bukkit.isPrimaryThread()) {
+                getLogger().warning("stopModules called off-thread, continuing synchronously.");
+            }
+        } catch (Exception ignored) {
+        }
+        // Flush pending async writes first (bounded wait): async tasks may be
+        // cancelled on disable/reload and their changes would be lost.
+        awaitPendingSaves();
+        // Synchronous vanish flush: per-player vanish/tpauto saves run async
+        // and may have been cancelled above — rewrite the authoritative
+        // in-memory vanish state directly so a kill right after /vanish (or a
+        // reload) cannot lose it. Runs before the resetAll handling below.
+        if (vanishManager != null) {
+            try {
+                vanishManager.flushSync();
+            } catch (Exception e) {
+                getLogger().fine("Failed to flush vanish state on shutdown: " + e.getMessage());
+            }
+        }
         // Synchronously flush pending async config writes first: async tasks
         // may be cancelled on disable/reload and their changes would be lost.
         // Only spawn.yml and menu.yml are flushed here by design — everything
@@ -640,20 +788,20 @@ public final class PlainBase extends JavaPlugin {
         // Close any open menu inventories before the listeners are
         // unregistered: an open menu whose clicks are no longer cancelled
         // would let players take items out of the GUI (duplication/exploit).
-        // Sync best-effort first so menus are confirmed closed before
-        // HandlerList.unregisterAll below; the deferred closeAllMenus() is
-        // only the backup for Folia entity-thread failures.
+        // Ordered close with a bounded wait, so the deferred entity-thread
+        // closes are confirmed finished before the MenuListener is gone; the
+        // MenuListener itself is unregistered explicitly LAST below.
         // Each step is isolated: a throwing manager must never abort the rest.
         if (menuManager != null) {
+            try {
+                menuManager.closeAllMenusSyncAwait(3000);
+            } catch (Exception e) {
+                getLogger().fine("Failed to close menus: " + e.getMessage());
+            }
             try {
                 menuManager.closeAllMenusSyncBestEffort();
             } catch (Exception e) {
                 getLogger().fine("Failed to close menus (sync): " + e.getMessage());
-            }
-            try {
-                menuManager.closeAllMenus();
-            } catch (Exception e) {
-                getLogger().fine("Failed to close menus: " + e.getMessage());
             }
         }
         menuManager = null;
@@ -717,6 +865,18 @@ public final class PlainBase extends JavaPlugin {
         } catch (Exception e) {
             getLogger().fine("Failed to unregister listeners: " + e.getMessage());
         }
+        // MenuListener explicitly LAST: unregisterAll above already dropped it
+        // together with the rest, but a concurrently re-registered instance
+        // (menu recreated between close and unregister) must not survive with
+        // an open-GUI exploit window — this second pass is a no-op otherwise.
+        if (menuListener != null) {
+            try {
+                org.bukkit.event.HandlerList.unregisterAll(menuListener);
+            } catch (Exception e) {
+                getLogger().fine("Failed to unregister menu listener: " + e.getMessage());
+            }
+            menuListener = null;
+        }
         // ConcurrentHashMap: clear() is safe against concurrent off-thread
         // reads (BanManager refresh, scheduler callbacks). Iterate a snapshot
         // copy anywhere we traverse the map so a concurrent clear()/put()
@@ -731,7 +891,7 @@ public final class PlainBase extends JavaPlugin {
         globalListener = null;
     }
 
-    public FileConfiguration loadModuleConfig(String fileName) {
+    public @Nullable FileConfiguration loadModuleConfig(String fileName) {
         File file = new File(getDataFolder(), "modules/" + fileName);
         if (!file.exists()) {
             File parent = file.getParentFile();
@@ -754,6 +914,7 @@ public final class PlainBase extends JavaPlugin {
         // disables only its own module (callers already handle null).
         try (InputStreamReader reader = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
             FileConfiguration config = YamlConfiguration.loadConfiguration(reader);
+            mergeMissingDefaults(config, fileName);
             configs.put(fileName, config);
             return config;
         } catch (Exception e) {
@@ -762,44 +923,77 @@ public final class PlainBase extends JavaPlugin {
         }
     }
 
+    /**
+     * Merges jar defaults into the loaded config, missing keys only: existing
+     * user values are never overwritten. Uses setDefaults() as fallback for
+     * getters plus an explicit copy of absent keys so the next save persists
+     * them. Never throws.
+     */
+    private void mergeMissingDefaults(FileConfiguration config, String fileName) {
+        try (InputStream in = getResource("modules/" + fileName)) {
+            if (in == null) return;
+            try (InputStreamReader reader = new InputStreamReader(in, StandardCharsets.UTF_8)) {
+                FileConfiguration defaults = YamlConfiguration.loadConfiguration(reader);
+                config.setDefaults(defaults);
+                for (String key : defaults.getKeys(true)) {
+                    if (!config.contains(key)) {
+                        config.set(key, defaults.get(key));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            getLogger().fine("Could not merge defaults for " + fileName + ": " + e.getMessage());
+        }
+    }
+
     public Map<String, FileConfiguration> getConfigs() {
-        return configs;
+        return Collections.unmodifiableMap(new HashMap<>(configs));
     }
 
     public Map<String, String> getLatestVersions() {
-        return latestVersions;
+        return Collections.unmodifiableMap(new HashMap<>(latestVersions));
     }
 
-    public FileConfiguration getSpawnConfig() {
+    public @Nullable FileConfiguration getSpawnConfig() {
         return configs.get("spawn.yml");
     }
 
-    public FileConfiguration getJoinItemsConfig() {
+    public @Nullable FileConfiguration getJoinItemsConfig() {
         return configs.get("joinitems.yml");
     }
 
-    public FileConfiguration getMessagesConfig() {
+    public @Nullable FileConfiguration getMessagesConfig() {
         return configs.get("messages.yml");
     }
 
-    public FileConfiguration getTeleportConfig() {
+    public @Nullable FileConfiguration getTeleportConfig() {
         return configs.get("teleport.yml");
     }
 
     private void checkAllConfigVersions() {
-        String configLatest = versionToString(latestVersions.get("config.yml"));
-        if (configLatest != null) {
-            checkVersion("config.yml", readVersionString(getConfig()), configLatest);
-        }
-
-        // Snapshot copy: a concurrent stopModules() -> clear() on another
-        // thread must never break this traversal.
-        new HashMap<>(configs).forEach((name, config) -> {
-            String latest = versionToString(latestVersions.get(name));
-            if (latest != null && config != null) {
-                checkVersion("modules/" + name, readVersionString(config), latest);
+        // Central lock guards the ROOT config only (toggle/suggest mutate it
+        // while this reads). Module configs are guarded per-instance via
+        // synchronized(config): their snapshots/mutations use the same monitor
+        // (see saveModuleConfigAsync), YamlConfiguration is not thread-safe.
+        synchronized (configLock) {
+            String configLatest = versionToString(latestVersions.get("config.yml"));
+            if (configLatest != null) {
+                checkVersion("config.yml", readVersionString(getConfig()), configLatest);
             }
-        });
+
+            // Snapshot copy: a concurrent stopModules() -> clear() on another
+            // thread must never break this traversal.
+            new HashMap<>(configs).forEach((name, config) -> {
+                String latest = versionToString(latestVersions.get(name));
+                if (latest != null && config != null) {
+                    String current;
+                    synchronized (config) {
+                        current = readVersionString(config);
+                    }
+                    checkVersion("modules/" + name, current, latest);
+                }
+            });
+        }
     }
 
     /**
@@ -875,11 +1069,17 @@ public final class PlainBase extends JavaPlugin {
     public void saveSpawnConfig() {
         FileConfiguration config = getSpawnConfig();
         if (config == null) return;
-        synchronized (config) {
-            try {
-                config.save(new File(getDataFolder(), "modules/spawn.yml"));
-            } catch (IOException e) {
-                getLogger().severe("Could not save spawn.yml!");
+        // Per-file lock: serializes with the async writer of the same file.
+        synchronized (getFileLock("spawn.yml")) {
+            // Bump the sequence so older async snapshots (taken before this
+            // sync flush) are treated as stale and dropped by the async writer.
+            configSeq.computeIfAbsent("spawn.yml", k -> new AtomicLong()).incrementAndGet();
+            synchronized (config) {
+                try {
+                    config.save(new File(getDataFolder(), "modules/spawn.yml"));
+                } catch (IOException e) {
+                    getLogger().severe("Could not save spawn.yml!");
+                }
             }
         }
     }
@@ -930,6 +1130,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupVanish() {
+        if (!ensureGlobalThread("setupVanish", this::setupVanish)) return;
         // Carry over the old in-memory vanish set across reloads: stopModules()
         // keeps vanished players hidden when persist-on-rejoin is enabled, so
         // the fresh manager must know them again (no vanish leak window until
@@ -943,6 +1144,17 @@ public final class PlainBase extends JavaPlugin {
         FileConfiguration vanishCfg = loadModuleConfig("vanish.yml");
         if (vanishCfg == null) {
             getLogger().severe("Could not load vanish.yml! The vanish module stays disabled until this is fixed.");
+            // Error path must not leave a stale manager with hidden players
+            // behind: reveal everyone and drop the reference so no vanished
+            // state survives without a backing config.
+            if (vanishManager != null) {
+                try {
+                    vanishManager.resetAll();
+                } catch (Exception e) {
+                    getLogger().fine("Failed to reset vanish state: " + e.getMessage());
+                }
+                vanishManager = null;
+            }
             return;
         }
 
@@ -988,7 +1200,8 @@ public final class PlainBase extends JavaPlugin {
         menuManager = new MenuManager(this);
         menuManager.reloadMenus();
 
-        getServer().getPluginManager().registerEvents(new MenuListener(this), this);
+        menuListener = new MenuListener(this);
+        getServer().getPluginManager().registerEvents(menuListener, this);
     }
 
     public void setupModeration() {
@@ -1014,6 +1227,7 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupTeam() {
+        if (!ensureGlobalThread("setupTeam", this::setupTeam)) return;
         FileConfiguration teamCfg = loadModuleConfig("team.yml");
         if (teamCfg == null) {
             getLogger().severe("Could not load team.yml! The team module stays disabled until this is fixed.");
@@ -1046,43 +1260,43 @@ public final class PlainBase extends JavaPlugin {
         }
     }
 
-    public TPAManager getTPAManager() {
+    public @Nullable TPAManager getTPAManager() {
         return tpaManager;
     }
 
-    public RTPManager getRTPManager() {
+    public @Nullable RTPManager getRTPManager() {
         return rtpManager;
     }
 
-    public VanishManager getVanishManager() {
+    public @Nullable VanishManager getVanishManager() {
         return vanishManager;
     }
 
-    public FileConfiguration getVanishConfig() {
+    public @Nullable FileConfiguration getVanishConfig() {
         return configs.get("vanish.yml");
     }
 
-    public MenuManager getMenuManager() {
+    public @Nullable MenuManager getMenuManager() {
         return menuManager;
     }
 
-    public FileConfiguration getMenuConfig() {
+    public @Nullable FileConfiguration getMenuConfig() {
         return configs.get("menu.yml");
     }
 
-    public BanManager getBanManager() {
+    public @Nullable BanManager getBanManager() {
         return banManager;
     }
 
-    public FileConfiguration getModerationConfig() {
+    public @Nullable FileConfiguration getModerationConfig() {
         return configs.get("moderation.yml");
     }
 
-    public TeamManager getTeamManager() {
+    public @Nullable TeamManager getTeamManager() {
         return teamManager;
     }
 
-    public FileConfiguration getTeamConfig() {
+    public @Nullable FileConfiguration getTeamConfig() {
         return configs.get("team.yml");
     }
 
@@ -1094,11 +1308,17 @@ public final class PlainBase extends JavaPlugin {
     public void saveMenuConfig() {
         FileConfiguration config = getMenuConfig();
         if (config == null) return;
-        synchronized (config) {
-            try {
-                config.save(new File(getDataFolder(), "modules/menu.yml"));
-            } catch (IOException e) {
-                getLogger().severe("Could not save menu.yml!");
+        // Per-file lock: serializes with the async writer of the same file.
+        synchronized (getFileLock("menu.yml")) {
+            // Bump the sequence so older async snapshots (taken before this
+            // sync flush) are treated as stale and dropped by the async writer.
+            configSeq.computeIfAbsent("menu.yml", k -> new AtomicLong()).incrementAndGet();
+            synchronized (config) {
+                try {
+                    config.save(new File(getDataFolder(), "modules/menu.yml"));
+                } catch (IOException e) {
+                    getLogger().severe("Could not save menu.yml!");
+                }
             }
         }
     }
@@ -1137,17 +1357,47 @@ public final class PlainBase extends JavaPlugin {
                 return;
             }
         }
+        // Lost-update guard: each snapshot gets a sequence number, stale
+        // writers (an older snapshot finishing after a newer one) are dropped.
+        final long mySeq = configSeq.computeIfAbsent(fileName, k -> new AtomicLong()).incrementAndGet();
         final File target = new File(getDataFolder(), "modules/" + fileName);
+        final Object fileLock = getFileLock(fileName);
+        final CompletableFuture<Void> future = new CompletableFuture<>();
+        synchronized (pendingSaves) {
+            pendingSaves.removeIf(CompletableFuture::isDone);
+            pendingSaves.add(future);
+        }
         Runnable write = () -> {
             try {
-                File parent = target.getParentFile();
-                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
-                    getLogger().warning("Could not create directory: " + parent);
+                AtomicLong seq = configSeq.get(fileName);
+                if (seq != null && seq.get() != mySeq) {
                     return;
                 }
-                Files.writeString(target.toPath(), data, StandardCharsets.UTF_8);
+                // Same per-file monitor as the sync writers above.
+                synchronized (fileLock) {
+                    if (seq != null && seq.get() != mySeq) {
+                        return;
+                    }
+                    File parent = target.getParentFile();
+                    if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                        getLogger().warning("Could not create directory: " + parent);
+                        return;
+                    }
+                    // Atomic publish via temp file: readers never see a
+                    // half-written config, even on crash mid-write.
+                    java.nio.file.Path tmp = target.toPath().resolveSibling(target.getName() + ".tmp");
+                    Files.writeString(tmp, data, StandardCharsets.UTF_8);
+                    try {
+                        Files.move(tmp, target.toPath(),
+                                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                        Files.move(tmp, target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
             } catch (Exception e) {
                 getLogger().severe("Could not save " + fileName + "!");
+            } finally {
+                future.complete(null);
             }
         };
         try {
@@ -1160,6 +1410,7 @@ public final class PlainBase extends JavaPlugin {
             // stopModules(), so warning is enough. Never throws.
             getLogger().warning("Could not schedule async save of " + fileName
                     + ", changes will be flushed on shutdown: " + e.getMessage());
+            future.complete(null);
         }
     }
 

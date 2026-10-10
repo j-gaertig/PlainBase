@@ -51,9 +51,9 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
         }
 
         String targetName = args[0];
-        String reason = args.length > 1
+        String reason = defaultReason(args.length > 1
                 ? String.join(" ", Arrays.copyOfRange(args, 1, args.length))
-                : message("default-reason", "No reason specified.");
+                : null);
 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
@@ -93,8 +93,13 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
                 return;
             }
 
-            manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, -1L, result -> {
+            manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, -1L, (result, dbError) -> {
                 if (isGone(sender)) return;
+                if (dbError) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("db-error", "<red>Database error, please try again later.")));
+                    return;
+                }
                 if (result.isEmpty()) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("already-banned", "<red>%player% is already banned.").replace("%player%", esc(name))));

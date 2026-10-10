@@ -13,6 +13,173 @@ website: https://github.com/j-gaertig/
 
 folia-supported: true
 
+# Reference mirror of the nodes registered in code (PlainBase#setupPermissions).
+# Documentation only: defaults here MUST stay identical to the code registration
+# (which wins at runtime via addPermissionIfMissing). No children anywhere —
+# plainbase.admin etc. act as bypasses checked explicitly in code, never via
+# Bukkit child inheritance. Do NOT change any default here without changing
+# the code default too (would be breaking for existing servers).
+permissions:
+  plainbase.admin:
+    description: "PlainBase: Allows access to all permissions"
+    default: op
+  plainbase.spawn.admin:
+    description: "PlainBase: Allows access to all permissions of the spawn module"
+    default: op
+  plainbase.spawn.spawn:
+    description: "PlainBase: Allows access to /spawn"
+    default: true
+  plainbase.spawn.setspawn:
+    description: "PlainBase: Allows access to /setspawn"
+    default: op
+  plainbase.spawn.disablespawn:
+    description: "PlainBase: Allows access to /disablespawn"
+    default: op
+  plainbase.spawn.setfirstspawn:
+    description: "PlainBase: Allows access to /setfirstspawn"
+    default: op
+  plainbase.spawn.disablefirstspawn:
+    description: "PlainBase: Allows access to /disablefirstspawn"
+    default: op
+  plainbase.teleport.admin:
+    description: "PlainBase: Allows access to all permissions of the teleport module"
+    default: op
+  plainbase.teleport.rtp.admin:
+    description: "PlainBase: Allows access to all permissions of rtp of the teleport module"
+    default: op
+  plainbase.teleport.rtp.rtp:
+    description: "PlainBase: Allows access to /rtp"
+    default: true
+  plainbase.teleport.tpa.admin:
+    description: "PlainBase: Allows access to all permissions of tpa of the teleport module"
+    default: op
+  plainbase.teleport.tpa.tpa:
+    description: "PlainBase: Allows access to /tpa"
+    default: true
+  plainbase.teleport.tpa.tpaccept:
+    description: "PlainBase: Allows access to /tpaccept"
+    default: true
+  plainbase.teleport.tpa.tpdeny:
+    description: "PlainBase: Allows access to /tpdeny"
+    default: true
+  plainbase.teleport.tpa.tpacancel:
+    description: "PlainBase: Allows access to /tpacancel"
+    default: true
+  plainbase.teleport.tpa.tpahere:
+    description: "PlainBase: Allows access to /tpahere"
+    default: true
+  plainbase.teleport.tpa.tpauto:
+    description: "PlainBase: Allows access to /tpauto"
+    default: true
+  plainbase.vanish.admin:
+    description: "PlainBase: Allows access to all permissions of the vanish module"
+    default: op
+  plainbase.vanish.vanish:
+    description: "PlainBase: Allows access to /vanish"
+    default: op
+  plainbase.vanish.vanish.other:
+    description: "PlainBase: Allows access to /vanish <player>"
+    default: op
+  plainbase.vanish.world:
+    description: "PlainBase: Allows access to /vanish world"
+    default: op
+  plainbase.vanish.all:
+    description: "PlainBase: Allows access to /vanish all"
+    default: op
+  plainbase.vanish.see:
+    description: "PlainBase: Allows to see vanished players"
+    default: op
+  plainbase.menu.admin:
+    description: "PlainBase: Allows access to all permissions of the menu module"
+    default: op
+  plainbase.menu.new:
+    description: "PlainBase: Allows access to /menu new"
+    default: op
+  plainbase.menu.delete:
+    description: "PlainBase: Allows access to /menu delete"
+    default: op
+  plainbase.menu.open:
+    description: "PlainBase: Allows access to /menu open"
+    default: true
+  plainbase.menu.list:
+    description: "PlainBase: Allows access to /menu list"
+    default: true
+  plainbase.moderation.admin:
+    description: "PlainBase: Allows access to all permissions of the moderation module"
+    default: op
+  plainbase.moderation.ban:
+    description: "PlainBase: Allows access to /ban"
+    default: op
+  plainbase.moderation.tempban:
+    description: "PlainBase: Allows access to /tempban"
+    default: op
+  plainbase.moderation.unban:
+    description: "PlainBase: Allows access to /unban"
+    default: op
+  plainbase.moderation.kick:
+    description: "PlainBase: Allows access to /kick"
+    default: op
+  plainbase.moderation.banlist:
+    description: "PlainBase: Allows access to /banlist"
+    default: op
+  plainbase.moderation.baninfo:
+    description: "PlainBase: Allows access to /baninfo"
+    default: op
+  plainbase.moderation.notify:
+    description: "PlainBase: Allows seeing ban/kick broadcasts when broadcast.staff-only is enabled"
+    default: op
+  plainbase.moderation.exempt:
+    description: "PlainBase: Makes a player immune to /ban and /kick by non-admins"
+    default: false
+  plainbase.moderation.banip:
+    description: "PlainBase: Allows access to /banip"
+    default: op
+  plainbase.moderation.unbanip:
+    description: "PlainBase: Allows access to /unbanip"
+    default: op
+  plainbase.team.admin:
+    description: "PlainBase: Bypass — acts as team-admin on any team regardless of membership"
+    default: op
+  plainbase.team.invite:
+    description: "PlainBase: Allows access to /team <team> invite (team admins only)"
+    default: true
+  plainbase.team.add:
+    description: "PlainBase: Allows access to /team <team> add (team admins only)"
+    default: true
+  plainbase.team.kick:
+    description: "PlainBase: Allows access to /team <team> kick (team admins only)"
+    default: true
+  plainbase.team.setrole:
+    description: "PlainBase: Allows access to /team <team> setrole (team admins only)"
+    default: true
+  plainbase.team.request:
+    description: "PlainBase: Allows access to /team <team> request"
+    default: true
+  plainbase.team.accept:
+    description: "PlainBase: Allows access to /team accept"
+    default: true
+  plainbase.team.deny:
+    description: "PlainBase: Allows access to /team deny"
+    default: true
+  plainbase.team.reject:
+    description: "PlainBase: Allows access to /team reject (team admins only)"
+    default: true
+  plainbase.team.leave:
+    description: "PlainBase: Allows access to /team leave"
+    default: true
+  plainbase.team.list:
+    description: "PlainBase: Allows access to /team list"
+    default: true
+  plainbase.team.info:
+    description: "PlainBase: Allows access to /team info"
+    default: true
+  plainbase.team.invites:
+    description: "PlainBase: Allows access to /team invites (list your own pending invites)"
+    default: true
+  plainbase.team.requests:
+    description: "PlainBase: Allows access to /team requests (team admins only)"
+    default: true
+
 # Optional: PlaceholderAPI for %plainbase_*% placeholders
 dependencies:
   server:

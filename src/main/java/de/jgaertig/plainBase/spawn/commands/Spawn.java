@@ -133,6 +133,25 @@ public class Spawn implements BasicCommand {
             loc = new Location(world, rawX, rawY, rawZ, yaw, pitch);
         }
 
+        // Re-check enabled right before teleportAsync: the config may have been
+        // disabled/reloaded between the check above and now.
+        try {
+            FileConfiguration live = plugin.getSpawnConfig();
+            boolean stillEnabled = false;
+            if (live != null) {
+                synchronized (live) {
+                    stillEnabled = live.getBoolean("spawn.enabled", false);
+                }
+            }
+            if (!stillEnabled) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn position has been disabled."));
+                return;
+            }
+        } catch (Exception e) {
+            player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+            return;
+        }
+
         player.teleportAsync(loc).thenAccept(success -> {
             // thenAccept runs off the entity thread: hop back onto the
             // EntityScheduler for sendMessage (Folia scheduler retained).

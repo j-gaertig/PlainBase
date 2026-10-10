@@ -61,8 +61,32 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
             return;
         }
 
-        manager.unbanIpAsync(finalIp, staffUuid, staffName, unbanned -> {
+        // R3 admin shield: an IP ban issued from console/by admin staff, or
+        // covering a currently-online protected (exempt/admin) player, may only
+        // be lifted by an admin (checked against the stored IpBanRecord via
+        // BanManager). Same "exempt" message as the ban side — no oracle.
+        if (!isAdmin(sender)) {
+            try {
+                java.util.Optional<de.jgaertig.plainBase.moderation.IpBanRecord> active = manager.getActiveIpBans().stream()
+                        .filter(r -> r != null && finalIp.equals(r.ip()))
+                        .findFirst();
+                if (active.isPresent() && isProtectedIpBan(active.get(), finalIp)) {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                            message("exempt", "<red>You cannot punish this player.")));
+                    return;
+                }
+            } catch (RuntimeException e) {
+                plugin.getLogger().fine("Failed unbanip shield check for '" + finalIp + "': " + e.getMessage());
+            }
+        }
+
+        manager.unbanIpAsync(finalIp, staffUuid, staffName, (unbanned, dbError) -> {
             if (isGone(sender)) return;
+            if (dbError) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("db-error", "<red>Database error, please try again later.")));
+                return;
+            }
             if (!unbanned) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("ip-not-banned", "<red>%ip% is not currently banned.").replace("%ip%", esc(finalIp))));
@@ -76,6 +100,12 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         });
     }
 
+    /**
+     * Deliberately no tab-completion for the IP argument: suggesting stored
+     * ban IPs/addresses would leak them to any sender with tab-complete
+     * access (including non-admins who may run the command path up to the
+     * shield check). The caller types the full IP instead.
+     */
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         return List.of();

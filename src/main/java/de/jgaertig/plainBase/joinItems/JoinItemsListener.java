@@ -33,6 +33,10 @@ public class JoinItemsListener implements Listener {
 
     private final PlainBase plugin;
     private final NamespacedKey joinItemKey;
+    // Interact cooldown (1.5s per player and item): rapid right-clicks must
+    // not spam the configured commands. Key is uuid:configKey so two
+    // different items never suppress each other.
+    private final java.util.Map<String, Long> lastInteract = new java.util.concurrent.ConcurrentHashMap<>();
 
     public JoinItemsListener(PlainBase plugin) {
         this.plugin = plugin;
@@ -88,6 +92,12 @@ public class JoinItemsListener implements Listener {
                 if (!flags.contains(requiredFlag)) continue;
             }
 
+            // Explicit slot presence check: a missing slot key must never
+            // default to 0 and overwrite slot 0 — skip with a warning.
+            if (!itemsSection.contains(key + ".slot")) {
+                plugin.getLogger().warning("Missing slot for join item '" + key + "', skipping.");
+                continue;
+            }
             int slot = itemsSection.getInt(key + ".slot");
             // Slot validation: player inventory slots are 0-35. An invalid
             // slot must never throw or write elsewhere — skip with a warning.
@@ -163,19 +173,55 @@ public class JoinItemsListener implements Listener {
         event.setCancelled(true);
 
         String configKey = item.getItemMeta().getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
-        if (configKey != null) {
-            org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
-            if (cfg == null) return;
-            List<String> commands = cfg.getStringList("items." + configKey + ".commands");
-            for (String cmd : commands) {
-                if (cmd == null || cmd.trim().isEmpty()) continue;
+        if (configKey == null) return;
 
-                String finalCmd = cmd.replace("%player%", event.getPlayer().getName());
-                if (finalCmd.startsWith("/")) {
-                    finalCmd = finalCmd.substring(1);
-                }
+        // Cooldown 1.5s per player and item (see field): prevents command spam
+        // from rapid clicks or client resends. The timestamp is stored only
+        // AFTER at least one command ran successfully — a failed/unknown
+        // command must not start the cooldown.
+        String cooldownKey = event.getPlayer().getUniqueId() + ":" + configKey;
+        long now = System.currentTimeMillis();
+        Long last = lastInteract.get(cooldownKey);
+        if (last != null && now - last < 1500) return;
 
-                event.getPlayer().performCommand(finalCmd);
+        org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
+        if (cfg == null) return;
+        List<String> commands = cfg.getStringList("items." + configKey + ".commands");
+        boolean executed = false;
+        for (String cmd : commands) {
+            if (cmd == null || cmd.trim().isEmpty()) continue;
+
+            // Player name is quoted/validated before performCommand (same
+            // pattern as MenuListener): a name with spaces or special
+            // chars must not split or inject extra commands. Control chars
+            // reject the line.
+            String preQuoted = cmd.replace("%player%", quotePlayerName(event.getPlayer().getName()));
+            String finalCmd = plugin.applyPlaceholders(event.getPlayer(), preQuoted);
+            if (finalCmd == null) continue;
+            if (finalCmd.contains("\n") || finalCmd.contains("\r") || finalCmd.contains("\u0000")) {
+                plugin.getLogger().warning("Rejected join item command with control chars for item '" + configKey + "'");
+                continue;
+            }
+            if (finalCmd.startsWith("/")) {
+                finalCmd = finalCmd.substring(1);
+            }
+            if (finalCmd.trim().isEmpty()) continue;
+
+            try {
+                if (event.getPlayer().performCommand(finalCmd)) executed = true;
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed join item command for " + event.getPlayer().getName() + ": " + e.getMessage());
+            }
+        }
+        if (executed) {
+            lastInteract.put(cooldownKey, now);
+            // Opportunistic purge so the map stays bounded (removeIf only,
+            // never clear(): a mass expiry must not lift all cooldowns).
+            if (lastInteract.size() > 1000) {
+                lastInteract.entrySet().removeIf(en -> {
+                    Long ts = en.getValue();
+                    return ts == null || now - ts > 1500;
+                });
             }
         }
     }
@@ -423,8 +469,11 @@ public class JoinItemsListener implements Listener {
         if (meta == null) return false;
         String configKey = meta.getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
         if (configKey == null) return false;
+        // Explicit null-guard: config may be gone after a reload — fail closed.
+        org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
+        if (cfg == null) return false;
         try {
-            return plugin.getJoinItemsConfig().getStringList("items." + configKey + ".flags")
+            return cfg.getStringList("items." + configKey + ".flags")
                     .contains(flag);
         } catch (Exception e) {
             return false;
@@ -434,6 +483,19 @@ public class JoinItemsListener implements Listener {
     private boolean isJoinItem(ItemStack item) {
         if (item == null || item.getType() == Material.AIR || !item.hasItemMeta()) return false;
         return item.getItemMeta().getPersistentDataContainer().has(joinItemKey, PersistentDataType.STRING);
+    }
+
+    /**
+     * Quotes/validates a player name for command use (same pattern as
+     * MenuListener): plain {@code [A-Za-z0-9_]} names pass through, anything
+     * else is double-quoted (with embedded quotes/backslashes stripped) so it
+     * stays one argument.
+     */
+    private static String quotePlayerName(String name) {
+        if (name == null) return "\"\"";
+        if (name.matches("[A-Za-z0-9_]+")) return name;
+        String sanitized = name.replace("\\", "").replace("\"", "");
+        return "\"" + sanitized + "\"";
     }
 
     /**

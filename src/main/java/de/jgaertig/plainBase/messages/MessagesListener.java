@@ -55,6 +55,12 @@ public class MessagesListener implements Listener {
         String firstJoinRaw = config.getString("messages.first-join", "");
         event.joinMessage(null);
         UUID uuid = player.getUniqueId();
+        // Joiner name captured sync: applyPlaceholdersSafe()/getName() must
+        // never run off-thread on Folia.
+        final String joinerName = player.getName();
+        // MOTD snapshot sync, delivery deferred below (never sync on join).
+        final boolean motdEnabled = config.getBoolean("motd.enabled", false);
+        final List<String> motdLines = motdEnabled ? List.copyOf(config.getStringList("motd.lines")) : List.of();
         try {
             Bukkit.getAsyncScheduler().runNow(plugin, task -> {
                 boolean played;
@@ -68,7 +74,10 @@ public class MessagesListener implements Listener {
                 String raw = played ? joinRaw : firstJoinRaw;
                 if (raw == null || raw.isBlank()) return;
                 try {
-                    player.getScheduler().run(plugin, t -> {
+                    // Global-scheduler fan-out (not the joiner's entity loop):
+                    // broadcasting to every online player must not run on the
+                    // joiner's entity thread on Folia.
+                    Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                         try {
                             if (!player.isOnline()) return;
                             Component msg;
@@ -77,22 +86,36 @@ public class MessagesListener implements Listener {
                                 // BEFORE PlaceholderAPI/deserialize (same pattern as
                                 // MenuManager#applyPlaceholdersSafe), so a name like "<red>"
                                 // can never inject formatting or click events.
-                                msg = plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, raw));
+                                // Uses the sync-captured joiner name, never the live
+                                // player off-thread (see applyPlaceholdersSafeOffThread).
+                                msg = plugin.getMiniMessage().deserialize(applyPlaceholdersSafeOffThread(joinerName, raw));
                             } catch (Exception e) {
                                 plugin.getLogger().warning("Failed to format join message: " + e.getMessage());
                                 return;
                             }
                             // Event is long finished — broadcast the same component
                             // to everyone (joinMessage semantics), plus console.
+                            // Per-recipient entity-scheduler dispatch (same pattern
+                            // as BroadcastManager): sending from the global
+                            // thread would throw for some recipients on Folia.
                             try {
+                                final Component broadcast = msg;
                                 for (Player online : Bukkit.getOnlinePlayers()) {
+                                    final Player recipient = online;
+                                    if (recipient == null) continue;
                                     try {
-                                        online.sendMessage(msg);
+                                        recipient.getScheduler().run(plugin, send -> {
+                                            try {
+                                                if (!recipient.isOnline()) return;
+                                                recipient.sendMessage(broadcast);
+                                            } catch (Exception ignored) {
+                                            }
+                                        }, null);
                                     } catch (Exception ignored) {
                                     }
                                 }
                                 try {
-                                    Bukkit.getConsoleSender().sendMessage(msg);
+                                    Bukkit.getConsoleSender().sendMessage(broadcast);
                                 } catch (Exception ignored) {
                                 }
                             } catch (Exception e) {
@@ -101,7 +124,7 @@ public class MessagesListener implements Listener {
                         } catch (Exception e) {
                             plugin.getLogger().fine("Failed to send delayed join message: " + e.getMessage());
                         }
-                    }, null);
+                    });
                 } catch (Exception e) {
                     plugin.getLogger().fine("Failed to schedule delayed join message: " + e.getMessage());
                 }
@@ -110,16 +133,26 @@ public class MessagesListener implements Listener {
             plugin.getLogger().warning("Failed to resolve join message: " + e.getMessage());
         }
 
-        // motd
-        if (config.getBoolean("motd.enabled", false)) {
-            List<String> motdLines = config.getStringList("motd.lines");
-
-            for (String line : motdLines) {
-                try {
-                    player.sendMessage(plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, line)));
-                } catch (Exception e) {
-                    plugin.getLogger().warning("Failed to format motd line: " + e.getMessage());
-                }
+        // MOTD in the deferred path: never send sync on the join thread —
+        // hop onto the player's entity scheduler so Folia thread rules hold.
+        if (motdEnabled && !motdLines.isEmpty()) {
+            try {
+                player.getScheduler().run(plugin, t -> {
+                    try {
+                        if (!player.isOnline()) return;
+                        for (String line : motdLines) {
+                            try {
+                                player.sendMessage(plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, line)));
+                            } catch (Exception e) {
+                                plugin.getLogger().warning("Failed to format motd line: " + e.getMessage());
+                            }
+                        }
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to send motd: " + e.getMessage());
+                    }
+                }, null);
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to schedule motd: " + e.getMessage());
             }
         }
     }
@@ -184,7 +217,8 @@ public class MessagesListener implements Listener {
      * viewer's own name is substituted escaped BEFORE PlaceholderAPI runs, so
      * a name containing MiniMessage tags can never inject formatting or click
      * events into join/quit/motd text. The admin-authored template itself
-     * stays raw on purpose (MiniMessage by design).
+     * stays raw on purpose (MiniMessage by design). Sync/entity-thread only:
+     * touches player.getName() and resolves PAPI with the live player.
      */
     private String applyPlaceholdersSafe(Player player, String template) {
         if (template == null) return null;
@@ -192,5 +226,23 @@ public class MessagesListener implements Listener {
                 ? template.replace("%player%", plugin.getMiniMessage().escapeTags(player.getName()))
                 : template;
         return plugin.applyPlaceholders(player, pre);
+    }
+
+    /**
+     * Off-thread variant for the async join path: works only with the
+     * sync-captured name, never with the live player object. PlaceholderBridge
+     * #apply(player, text) calls player.getName() and PAPI setPlaceholders
+     * with the live player — both must never run off-thread on Folia — so PAPI
+     * is deliberately skipped here via a null player (see PlaceholderBridge
+     * #apply): only the escaped %player% substitution plus non-PAPI text
+     * survive. MOTD/quit keep the live-player variant above on their own
+     * (entity/sync) threads.
+     */
+    private String applyPlaceholdersSafeOffThread(String capturedName, String template) {
+        if (template == null) return null;
+        String pre = capturedName != null
+                ? template.replace("%player%", plugin.getMiniMessage().escapeTags(capturedName))
+                : template;
+        return plugin.applyPlaceholders(null, pre);
     }
 }

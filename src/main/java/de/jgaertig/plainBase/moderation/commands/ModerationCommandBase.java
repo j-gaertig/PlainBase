@@ -78,6 +78,18 @@ public abstract class ModerationCommandBase {
     }
 
     /**
+     * Resolves the punishment reason: a missing or blank reason (omitted, only
+     * whitespace, or an emptied {@code messages.default-reason} config value)
+     * always falls back to the hardcoded default instead of storing/showing a
+     * blank reason.
+     */
+    protected String defaultReason(String raw) {
+        if (raw != null && !raw.isBlank()) return raw;
+        String configured = message("default-reason", "No reason specified.");
+        return configured == null || configured.isBlank() ? "No reason specified." : configured;
+    }
+
+    /**
      * MiniMessage with a plain-text fallback: a broken admin template must
      * never break an async result callback with an exception.
      */
@@ -409,6 +421,83 @@ public abstract class ModerationCommandBase {
         // player object (no permissions plugin lookup for pure OfflinePlayer) —
         // documented limitation, matches the rest of the module's offline-ban scope.
         return online != null && online.hasPermission("plainbase.moderation.exempt");
+    }
+
+    /**
+     * R3 unban shield: true when lifting this player ban requires an admin
+     * sender — i.e. the banned target is currently protected (exempt/admin,
+     * online-verifiable) or the ban itself was issued from the console or by
+     * admin staff. A currently-offline target counts as protected (fail
+     * closed): exempt status cannot be verified offline, mirroring the
+     * ban-side offline rule in BanCommand/TempBanCommand. The active record is
+     * read from the BanManager cache — locally issued bans are always cached
+     * (mutations update it synchronously); a cross-server row not yet synced
+     * is a documented staleness limitation, same as banlist/baninfo.
+     */
+    protected boolean isProtectedBan(de.jgaertig.plainBase.moderation.BanRecord record,
+                                     OfflinePlayer target, CommandSender sender) {
+        Player online = target.getPlayer();
+        if (online != null) {
+            if (isExempt(target, sender) || isProtectedTarget(online, sender)) return true;
+        } else {
+            return true;
+        }
+        if (record == null) return false;
+        // Console-issued bans (null staff) were admin-issued by definition.
+        if (record.staffUuid() == null) return true;
+        // Staff-issued: protected when the staffer currently holds admin perms
+        // (best-effort live check; offline staff cannot be verified).
+        try {
+            Player staff = Bukkit.getPlayer(record.staffUuid());
+            if (staff != null && (staff.hasPermission("plainbase.admin")
+                    || staff.hasPermission("plainbase.moderation.admin"))) return true;
+        } catch (RuntimeException ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * R3 unban shield for IP bans: true when lifting this IP ban requires an
+     * admin sender — console/admin-staff-issued, or a currently-online player
+     * on that exact IP is protected (exempt/admin). Unlike the ban side there
+     * is deliberately NO "must have a verifiable online owner" requirement:
+     * unbanning punishes nobody, so unverifiable owners fail open here while
+     * the admin-issued shield above stays the hard guard.
+     */
+    protected boolean isProtectedIpBan(de.jgaertig.plainBase.moderation.IpBanRecord record, String ip) {
+        if (record == null || ip == null) return false;
+        if (record.staffUuid() == null) return true;
+        try {
+            Player staff = Bukkit.getPlayer(record.staffUuid());
+            if (staff != null && (staff.hasPermission("plainbase.admin")
+                    || staff.hasPermission("plainbase.moderation.admin"))) return true;
+        } catch (RuntimeException ignored) {
+        }
+        try {
+            for (Player online : Bukkit.getOnlinePlayers()) {
+                String onlineIp = normalizeIp(addressIpOf(online));
+                if (ip.equals(onlineIp) && (online.hasPermission("plainbase.moderation.exempt")
+                        || online.hasPermission("plainbase.moderation.admin")
+                        || online.hasPermission("plainbase.admin"))) return true;
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * Null-safe extraction of a player's current IP for the shield checks
+     * above (same dereference guards as IpBanCommand's private helper, which
+     * cannot be reused from here).
+     */
+    private static String addressIpOf(Player player) {
+        if (player == null || player.getAddress() == null) return null;
+        try {
+            java.net.InetAddress inner = player.getAddress().getAddress();
+            return inner == null ? null : inner.getHostAddress();
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /**

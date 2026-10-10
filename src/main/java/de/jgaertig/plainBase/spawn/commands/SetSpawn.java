@@ -85,6 +85,17 @@ public class SetSpawn implements BasicCommand {
                 return;
             }
             try {
+                double y = loc.getY();
+                int min = loc.getWorld().getMinHeight();
+                int max = loc.getWorld().getMaxHeight();
+                if (!(y >= min && y < max)) {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Invalid coordinates! Y out of world bounds."));
+                    return;
+                }
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to check world height for /setspawn: " + e.getMessage());
+            }
+            try {
                 var border = loc.getWorld().getWorldBorder();
                 double centerX = border.getCenter().getX();
                 double centerZ = border.getCenter().getZ();

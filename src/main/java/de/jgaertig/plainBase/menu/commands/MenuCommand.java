@@ -134,6 +134,18 @@ public class MenuCommand implements BasicCommand {
     }
 
     private void sendUsage(Player player) {
+        // R3: the detailed subcommand list discloses admin-only commands —
+        // send it only to senders holding at least one menu permission, and a
+        // generic usage to everyone else. Perm-check first, details after.
+        if (!hasMenuPermission(player, "plainbase.menu.new")
+                && !hasMenuPermission(player, "plainbase.menu.delete")
+                && !hasMenuPermission(player, "plainbase.menu.open")
+                && !hasMenuPermission(player, "plainbase.menu.list")) {
+            player.sendMessage(plugin.getMiniMessage().deserialize(
+                    "<yellow>Usage: <gray>/menu"
+            ));
+            return;
+        }
         player.sendMessage(plugin.getMiniMessage().deserialize(
                 "<yellow>Usage: <gray>/menu <new|delete|open|list> [name]"
         ));

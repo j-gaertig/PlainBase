@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.vanish;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.PlayerDataLocks;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -10,14 +11,20 @@ import org.bukkit.entity.Player;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class VanishManager {
 
     private final PlainBase plugin;
     private final Set<UUID> vanishedPlayers = ConcurrentHashMap.newKeySet();
+    private record PrevSelfState(boolean collidable, boolean silent, boolean invisible) {}
+    private final Map<UUID, PrevSelfState> prevSelfStates = new ConcurrentHashMap<>();
 
     public VanishManager(PlainBase plugin) {
         this.plugin = plugin;
@@ -169,11 +176,23 @@ public class VanishManager {
 
         loadPlayerData(player);
 
-        // A new viewer must not see players who are already vanished
+        // A new viewer must not see players who are already vanished:
+        // hide immediately and keep the scheduled hideFrom as fallback
+        // (same pattern as vanish()/pre-hide above — closes the 1-tick window,
+        // covers cross-region viewers that reject a direct call).
         for (UUID uuid : vanishedPlayers) {
             Player vanishedPlayer = Bukkit.getPlayer(uuid);
             if (vanishedPlayer != null && !vanishedPlayer.equals(player)) {
-                hideFrom(player, vanishedPlayer);
+                try {
+                    if (!canSee(player, vanishedPlayer)) {
+                        player.hideEntity(plugin, vanishedPlayer);
+                    }
+                } catch (Exception ignored) {
+                }
+                try {
+                    hideFrom(player, vanishedPlayer);
+                } catch (Exception ignored) {
+                }
             }
         }
     }
@@ -193,9 +212,23 @@ public class VanishManager {
      */
     public boolean hasPersistedVanish(UUID uuid) {
         try {
-            File file = getPlayerDataFile(uuid);
-            if (!file.isFile()) return false;
-            return YamlConfiguration.loadConfiguration(file).getBoolean("vanished", false);
+            if (uuid == null) return false;
+            // Shared per-UUID lock with TPAManager (same physical file): a
+            // concurrent tpauto save must never interleave with this read.
+            synchronized (PlayerDataLocks.lockFor(uuid)) {
+                File file = getPlayerDataFile(uuid);
+                if (!file.isFile()) return false;
+                YamlConfiguration config = new YamlConfiguration();
+                try {
+                    config.load(file);
+                } catch (org.bukkit.configuration.InvalidConfigurationException corrupt) {
+                    backupCorrupt(file);
+                    plugin.getLogger().warning("Corrupt persisted vanish state for " + uuid
+                            + " moved aside, assuming not vanished: " + corrupt.getMessage());
+                    return false;
+                }
+                return config.getBoolean("vanished", false);
+            }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to read persisted vanish state for " + uuid + ": " + e.getMessage());
             return false;
@@ -203,6 +236,13 @@ public class VanishManager {
     }
 
     public void loadPlayerData(Player player) {
+        if (player == null) return;
+        UUID uuid;
+        try {
+            uuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
         FileConfiguration vanishConfig = plugin.getVanishConfig();
         if (vanishConfig == null) return;
         if (!vanishConfig.getBoolean("vanish.persist-on-rejoin", true)) return;
@@ -212,16 +252,25 @@ public class VanishManager {
             // the persisted flag was true. This async step only confirms and
             // applies state — it must not drop a freshly vanished player whose
             // save has not hit disk yet, so a pre-hidden entry counts as proof.
-            if (!vanishedPlayers.contains(player.getUniqueId())
-                    && !hasPersistedVanish(player.getUniqueId())) return;
+            if (!vanishedPlayers.contains(uuid)
+                    && !hasPersistedVanish(uuid)) return;
 
             player.getScheduler().run(plugin, (t) -> {
                 if (!player.isOnline()) {
-                    vanishedPlayers.remove(player.getUniqueId());
+                    // Stale-race: the player may have quit and rejoined between
+                    // scheduling and execution — the new session owns the UUID
+                    // now. Only remove when the currently online player is still
+                    // this exact instance.
+                    try {
+                        if (Bukkit.getPlayer(uuid) == player) {
+                            vanishedPlayers.remove(uuid);
+                        }
+                    } catch (Exception ignored) {
+                    }
                     return;
                 }
 
-                vanishedPlayers.add(player.getUniqueId());
+                vanishedPlayers.add(uuid);
                 applySelfState(player);
 
                 for (Player viewer : Bukkit.getOnlinePlayers()) {
@@ -242,32 +291,123 @@ public class VanishManager {
         if (vanishConfig == null) return;
         boolean persist = vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
 
+        // Tracked so stopModules() can await it (a kill right after /vanish
+        // must not lose the state to a cancelled async task — see flushSync).
+        CompletableFuture<Void> pending = new CompletableFuture<>();
+        plugin.trackPendingSave(pending);
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
-            File file = getPlayerDataFile(uuid);
-
-            if (!persist) {
-                // Never leave stale vanished:true files around when persistence is
-                // disabled — they would re-vanish the player if persistence is
-                // enabled later.
-                if (file.exists()) file.delete();
-                return;
-            }
-
-            FileConfiguration config = YamlConfiguration.loadConfiguration(file);
-
-            config.set("vanished", vanished);
-
             try {
-                config.save(file);
-            } catch (IOException e) {
-                plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
+                // Shared per-UUID lock with TPAManager: load-merge-save must
+                // never interleave with a concurrent tpauto save of the same
+                // file (both keys would otherwise overwrite each other).
+                synchronized (PlayerDataLocks.lockFor(uuid)) {
+                    File file = getPlayerDataFileForWrite(uuid);
+
+                    if (!persist) {
+                        // Never leave stale vanished:true files around when persistence is
+                        // disabled — they would re-vanish the player if persistence is
+                        // enabled later.
+                        if (file.exists()) file.delete();
+                        return;
+                    }
+
+                    YamlConfiguration config = new YamlConfiguration();
+                    if (file.isFile()) {
+                        try {
+                            config.load(file);
+                        } catch (org.bukkit.configuration.InvalidConfigurationException corrupt) {
+                            backupCorrupt(file);
+                            plugin.getLogger().warning("Corrupt player data for " + uuid
+                                    + " moved aside, rewriting vanish state.");
+                        } catch (Exception e) {
+                            plugin.getLogger().warning("Could not read player data for " + uuid + ": " + e.getMessage());
+                        }
+                    }
+
+                    config.set("vanished", vanished);
+
+                    try {
+                        config.save(file);
+                    } catch (IOException e) {
+                        plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
+                    }
+                }
+            } finally {
+                pending.complete(null);
             }
         });
     }
 
+    /**
+     * Synchronous flush of the current in-memory vanish set, called from
+     * stopModules() after awaiting tracked async saves: async tasks may be
+     * cancelled on disable/reload and their changes would be lost, so the
+     * authoritative state is rewritten directly. Never throws.
+     */
+    public void flushSync() {
+        FileConfiguration vanishConfig;
+        try {
+            vanishConfig = plugin.getVanishConfig();
+        } catch (Exception e) {
+            return;
+        }
+        boolean persist = vanishConfig == null || vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
+        for (UUID uuid : new java.util.HashSet<>(vanishedPlayers)) {
+            if (uuid == null) continue;
+            try {
+                synchronized (PlayerDataLocks.lockFor(uuid)) {
+                    if (!persist) {
+                        try {
+                            File stale = getPlayerDataFile(uuid);
+                            if (stale.isFile()) stale.delete();
+                        } catch (Exception ignored) {
+                        }
+                        continue;
+                    }
+                    File file = getPlayerDataFileForWrite(uuid);
+                    YamlConfiguration config = new YamlConfiguration();
+                    if (file.isFile()) {
+                        try {
+                            config.load(file);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    config.set("vanished", true);
+                    try {
+                        config.save(file);
+                    } catch (IOException e) {
+                        plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to flush vanish state for " + uuid + ": " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Moves a corrupt playerdata file aside to {@code <uuid>.yml.corrupt-<ts>}
+     * instead of overwriting or deleting it. Never throws.
+     */
+    private void backupCorrupt(File file) {
+        try {
+            File backup = new File(file.getParentFile(), file.getName() + ".corrupt-" + System.currentTimeMillis());
+            Files.move(file.toPath(), backup.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception e) {
+            plugin.getLogger().fine("Could not back up corrupt player data " + file.getName() + ": " + e.getMessage());
+        }
+    }
+
     private File getPlayerDataFile(UUID uuid) {
+        // Read path: never creates directories as a side effect.
+        return new File(new File(plugin.getDataFolder(), "data/playerdata"), uuid.toString() + ".yml");
+    }
+
+    private File getPlayerDataFileForWrite(UUID uuid) {
         File folder = new File(plugin.getDataFolder(), "data/playerdata");
-        if (!folder.exists()) folder.mkdirs();
+        if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
+            plugin.getLogger().warning("Could not create directory: " + folder);
+        }
         return new File(folder, uuid.toString() + ".yml");
     }
 
@@ -368,6 +508,19 @@ public class VanishManager {
             FileConfiguration config = plugin.getVanishConfig();
             if (config == null) config = snapshot;
             if (config == null) return;
+            // Save the previous state once (putIfAbsent): a second vanish
+            // without unvanish must keep the original, and a rejoin with
+            // persist must keep the pre-vanish values (not the still-vanished
+            // state from before the quit).
+            try {
+                UUID uuid = player.getUniqueId();
+                try {
+                    prevSelfStates.putIfAbsent(uuid,
+                            new PrevSelfState(player.isCollidable(), player.isSilent(), player.isInvisible()));
+                } catch (Exception ignored) {
+                }
+            } catch (Exception ignored) {
+            }
             if (config.getBoolean("vanish.no-collision", true)) {
                 player.setCollidable(false);
             }
@@ -380,20 +533,84 @@ public class VanishManager {
 
     private void resetSelfState(Player player) {
         if (player == null || !player.isOnline()) return;
+        final FileConfiguration snapshot = plugin.getVanishConfig();
         player.getScheduler().run(plugin, (t) -> {
             if (!player.isOnline()) return;
+            UUID uuid;
+            try {
+                uuid = player.getUniqueId();
+            } catch (Exception e) {
+                return;
+            }
+            // Restore the previously saved state when available — never
+            // hardcode over third-party changes.
+            PrevSelfState prev = prevSelfStates.remove(uuid);
+            if (prev != null) {
+                try {
+                    player.setInvisible(prev.invisible());
+                } catch (Exception ignored) {
+                }
+                try {
+                    player.setCollidable(prev.collidable());
+                } catch (Exception ignored) {
+                }
+                try {
+                    player.setSilent(prev.silent());
+                } catch (Exception ignored) {
+                }
+                return;
+            }
+            // Fallback when no stored state exists (e.g. vanished before this
+            // fix, or manager rebuilt): config-guarded defaults, no feature.
+            FileConfiguration config = plugin.getVanishConfig();
+            if (config == null) config = snapshot;
             player.setInvisible(false);
-            player.setCollidable(true);
-            player.setSilent(false);
+            boolean resetCollision = config == null || config.getBoolean("vanish.no-collision", true);
+            boolean resetSilent = config == null || config.getBoolean("vanish.no-step-sound", true);
+            if (resetCollision) {
+                try {
+                    player.setCollidable(true);
+                } catch (Exception ignored) {
+                }
+            }
+            if (resetSilent) {
+                try {
+                    player.setSilent(false);
+                } catch (Exception ignored) {
+                }
+            }
         }, null);
     }
 
     /**
      * Reveals all currently vanished players (used when the module is stopped/reloaded).
+     * <p>
+     * When persist-on-rejoin is disabled the persisted files are deleted
+     * synchronously per player: without this a stale {@code vanished:true}
+     * file would re-vanish the player as soon as persistence is enabled again.
      */
     public void resetAll() {
+        boolean persist;
+        try {
+            FileConfiguration cfg = plugin.getVanishConfig();
+            persist = cfg == null || cfg.getBoolean("vanish.persist-on-rejoin", true);
+        } catch (Exception e) {
+            persist = true;
+        }
         for (UUID uuid : new java.util.HashSet<>(vanishedPlayers)) {
             try {
+                if (!persist) {
+                    try {
+                        synchronized (PlayerDataLocks.lockFor(uuid)) {
+                            File file = getPlayerDataFile(uuid);
+                            if (file.isFile() && !file.delete()) {
+                                plugin.getLogger().fine("Could not delete stale vanish state for " + uuid);
+                            }
+                        }
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to clear persisted vanish state for " + uuid + ": " + e.getMessage());
+                    }
+                }
                 Player player = Bukkit.getPlayer(uuid);
                 if (player != null) {
                     vanishedPlayers.remove(uuid);
@@ -412,6 +629,7 @@ public class VanishManager {
                     }
                 } else {
                     vanishedPlayers.remove(uuid);
+                    prevSelfStates.remove(uuid);
                 }
             } catch (Exception e) {
                 plugin.getLogger().fine("Failed to reset vanished player " + uuid + ": " + e.getMessage());

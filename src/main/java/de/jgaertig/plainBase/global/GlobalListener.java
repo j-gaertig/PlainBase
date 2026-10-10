@@ -23,16 +23,38 @@ public class GlobalListener implements Listener {
         // before the compare. Versions are therefore read via get() and
         // toString() (tolerates numeric unquoted YAML and quoted strings),
         // and the latest map holds Strings (Map<String, String>).
-        String currentMain = readVersionString(plugin.getConfig().get("version"));
-        String latestMain = plugin.getLatestVersions().getOrDefault("config.yml", "0");
+        // Central configLock guards the ROOT config only (toggle/suggest may
+        // mutate it while this reads). Module configs are guarded per-instance
+        // via synchronized(config): their async snapshots use the same monitor
+        // (see PlainBase.saveModuleConfigAsync). Snapshot everything under the
+        // lock(s), send outside.
+        final String currentMain;
+        final String latestMain;
+        final java.util.Map<String, String> currentByFile = new java.util.HashMap<>();
+        final java.util.Map<String, String> latestByFile;
+        synchronized (plugin.getConfigLock()) {
+            currentMain = readVersionString(plugin.getConfig().get("version"));
+            latestMain = plugin.getLatestVersions().getOrDefault("config.yml", "0");
+            plugin.getConfigs().forEach((name, config) -> {
+                String current;
+                if (config == null) {
+                    current = "0";
+                } else {
+                    synchronized (config) {
+                        current = readVersionString(config.get("version"));
+                    }
+                }
+                currentByFile.put(name, current);
+            });
+            latestByFile = plugin.getLatestVersions();
+        }
 
         if (compareVersions(currentMain, latestMain) < 0) {
             sendWarning(event, "config.yml", currentMain, latestMain);
         }
 
-        plugin.getConfigs().forEach((name, config) -> {
-            String current = readVersionString(config == null ? null : config.get("version"));
-            String latest = plugin.getLatestVersions().getOrDefault(name, "0");
+        currentByFile.forEach((name, current) -> {
+            String latest = latestByFile.getOrDefault(name, "0");
 
             if (compareVersions(current, latest) < 0) {
                 sendWarning(event, "modules/" + name, current, latest);
@@ -41,9 +63,12 @@ public class GlobalListener implements Listener {
     }
 
     private void sendWarning(PlayerJoinEvent event, String name, String current, String latest) {
+        String safeName = plugin.getMiniMessage().escapeTags(name);
+        String safeCurrent = plugin.getMiniMessage().escapeTags(current);
+        String safeLatest = plugin.getMiniMessage().escapeTags(latest);
         event.getPlayer().sendMessage(plugin.getMiniMessage().deserialize(
-                "<red><bold>[PlainBase]</bold> Your <yellow>" + name + "</yellow> is outdated! " +
-                        "<gray>(v" + current + " < v" + latest + ")"
+                "<red><bold>[PlainBase]</bold> Your <yellow>" + safeName + "</yellow> is outdated! " +
+                        "<gray>(v" + safeCurrent + " < v" + safeLatest + ")"
         ));
     }
 

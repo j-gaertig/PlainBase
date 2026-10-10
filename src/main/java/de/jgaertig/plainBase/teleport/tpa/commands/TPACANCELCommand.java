@@ -54,11 +54,6 @@ public class TPACANCELCommand implements BasicCommand {
             return;
         }
 
-        if (tpaManager == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA is currently unavailable."));
-            return;
-        }
-
         if (args.length != 0) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/tpacancel"));
             return;

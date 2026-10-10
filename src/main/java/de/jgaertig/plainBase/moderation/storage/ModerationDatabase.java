@@ -155,6 +155,7 @@ public class ModerationDatabase {
                     }
                 }
                 createTables(conn);
+                migrateTextColumns(conn);
                 normalizeUuidCase(conn);
                 normalizeIpSpellings(conn);
             }
@@ -173,7 +174,15 @@ public class ModerationDatabase {
     }
 
     public void close() {
-        if (dataSource != null) dataSource.close();
+        HikariDataSource ds = dataSource;
+        dataSource = null;
+        if (ds != null) {
+            try {
+                ds.close();
+            } catch (Exception e) {
+                plugin.getLogger().fine("Could not close moderation pool: " + e.getMessage());
+            }
+        }
     }
 
     private String prefix() {
@@ -193,7 +202,16 @@ public class ModerationDatabase {
     private void createTables(Connection conn) throws SQLException {
         String p = prefix();
         String autoInc = mysql ? "INT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
-        String varchar = mysql ? "VARCHAR(255)" : "TEXT";
+        // Dialect-drift fix: free-text columns (names, reasons, staff names)
+        // are TEXT on both dialects. VARCHAR(255) on MySQL silently truncates
+        // (or rejects, depending on sql_mode) long reasons while SQLite TEXT
+        // never does — identical DDL removes that drift. Columns that carry an
+        // index or serve as exact-match lookup keys (ip, last_ip,
+        // player_ips.name) stay VARCHAR(255) on MySQL: MySQL cannot index a
+        // TEXT column without a prefix length, and player names (max 16 chars)
+        // plus literal IPs never come close to 255 chars anyway.
+        String textCol = "TEXT";
+        String keyCol = mysql ? "VARCHAR(255)" : "TEXT";
         // UUID columns: fixed CHAR(36) ascii_bin on fresh MySQL installs so
         // UUID lookups compare case-sensitively and stay index-friendly.
         // (CREATE TABLE IF NOT EXISTS never alters existing tables — no
@@ -204,15 +222,15 @@ public class ModerationDatabase {
             st.executeUpdate("CREATE TABLE IF NOT EXISTS " + p + "bans (" +
                     "id " + autoInc + ", " +
                     "uuid " + uuidCol + " NOT NULL, " +
-                    "name " + varchar + ", " +
-                    "reason " + varchar + ", " +
+                    "name " + textCol + ", " +
+                    "reason " + textCol + ", " +
                     "staff_uuid " + uuidCol + ", " +
-                    "staff_name " + varchar + ", " +
+                    "staff_name " + textCol + ", " +
                     "banned_at BIGINT NOT NULL, " +
                     "duration BIGINT NOT NULL, " +
                     "revoked BOOLEAN NOT NULL DEFAULT 0, " +
                     "unbanned_by_uuid " + uuidCol + ", " +
-                    "unbanned_by_name " + varchar + ", " +
+                    "unbanned_by_name " + textCol + ", " +
                     "unbanned_at BIGINT NOT NULL DEFAULT 0)");
             createIndexIfMissing(st, p + "bans_uuid_idx", p + "bans", "uuid");
             createIndexIfMissing(st, p + "bans_uuid_revoked_at_idx", p + "bans", "uuid, revoked, banned_at");
@@ -221,24 +239,24 @@ public class ModerationDatabase {
             st.executeUpdate("CREATE TABLE IF NOT EXISTS " + p + "kicks (" +
                     "id " + autoInc + ", " +
                     "uuid " + uuidCol + " NOT NULL, " +
-                    "name " + varchar + ", " +
-                    "reason " + varchar + ", " +
+                    "name " + textCol + ", " +
+                    "reason " + textCol + ", " +
                     "staff_uuid " + uuidCol + ", " +
-                    "staff_name " + varchar + ", " +
+                    "staff_name " + textCol + ", " +
                     "kicked_at BIGINT NOT NULL)");
             createIndexIfMissing(st, p + "kicks_uuid_idx", p + "kicks", "uuid");
 
             st.executeUpdate("CREATE TABLE IF NOT EXISTS " + p + "ip_bans (" +
                     "id " + autoInc + ", " +
-                    "ip " + varchar + " NOT NULL, " +
-                    "reason " + varchar + ", " +
+                    "ip " + keyCol + " NOT NULL, " +
+                    "reason " + textCol + ", " +
                     "staff_uuid " + uuidCol + ", " +
-                    "staff_name " + varchar + ", " +
+                    "staff_name " + textCol + ", " +
                     "banned_at BIGINT NOT NULL, " +
                     "duration BIGINT NOT NULL, " +
                     "revoked BOOLEAN NOT NULL DEFAULT 0, " +
                     "unbanned_by_uuid " + uuidCol + ", " +
-                    "unbanned_by_name " + varchar + ", " +
+                    "unbanned_by_name " + textCol + ", " +
                     "unbanned_at BIGINT NOT NULL DEFAULT 0)");
             createIndexIfMissing(st, p + "ip_bans_ip_idx", p + "ip_bans", "ip");
             createIndexIfMissing(st, p + "ip_bans_ip_revoked_at_idx", p + "ip_bans", "ip, revoked, banned_at");
@@ -246,12 +264,80 @@ public class ModerationDatabase {
 
             st.executeUpdate("CREATE TABLE IF NOT EXISTS " + p + "player_ips (" +
                     "uuid " + uuidCol + " NOT NULL, " +
-                    "name " + varchar + ", " +
-                    "last_ip " + varchar + ", " +
+                    "name " + keyCol + ", " +
+                    "last_ip " + keyCol + ", " +
                     "last_seen BIGINT NOT NULL, " +
                     "PRIMARY KEY (uuid))");
             createIndexIfMissing(st, p + "player_ips_name_idx", p + "player_ips", "name");
+            // findLastIpByName() filters on LOWER(name), which a plain index on
+            // name cannot serve. SQLite gets a matching expression index;
+            // MySQL has no portable functional-index syntax across the server
+            // versions this plugin supports, so there the lookup stays a scan
+            // over a tiny table (one row per player) — deliberately left
+            // as-is, documented here instead of a risky DDL change.
+            if (!mysql) {
+                try {
+                    st.executeUpdate("CREATE INDEX IF NOT EXISTS " + p + "player_ips_name_lower_idx ON " + p + "player_ips(LOWER(name))");
+                } catch (SQLException e) {
+                    plugin.getLogger().warning("Could not create index " + p + "player_ips_name_lower_idx: " + e.getMessage());
+                }
+            }
         }
+    }
+
+    /**
+     * Migrates pre-existing MySQL tables from VARCHAR(255) to TEXT for the
+     * free-text columns (CREATE TABLE IF NOT EXISTS never alters existing
+     * tables). Best-effort and idempotent: one ALTER TABLE per table with
+     * multiple MODIFY COLUMN clauses (3 statements total instead of one per
+     * column), failures are logged loudly but never break setup — a table
+     * that keeps VARCHAR(255) simply stays subject to the insert-time
+     * {@link #clip255} guard on key columns, while overlong TEXT values would
+     * fail loudly on that one legacy table instead of silently truncating.
+     */
+    private void migrateTextColumns(Connection conn) {
+        if (!mysql) return;
+        String p;
+        try {
+            p = prefix();
+        } catch (RuntimeException e) {
+            plugin.getLogger().warning("Could not migrate text columns: " + e.getMessage());
+            return;
+        }
+        // One ALTER per table, multiple MODIFYs each — fewer round-trips on
+        // the setup (main) thread than one ALTER per column.
+        String[][] tables = {
+                {p + "bans", "name", "reason", "staff_name", "unbanned_by_name"},
+                {p + "kicks", "name", "reason", "staff_name"},
+                {p + "ip_bans", "reason", "staff_name", "unbanned_by_name"},
+        };
+        for (String[] table : tables) {
+            StringBuilder sql = new StringBuilder("ALTER TABLE " + table[0]);
+            for (int i = 1; i < table.length; i++) {
+                sql.append(i == 1 ? " MODIFY COLUMN " : ", MODIFY COLUMN ").append(table[i]).append(" TEXT");
+            }
+            try (Statement st = conn.createStatement()) {
+                st.executeUpdate(sql.toString());
+            } catch (SQLException | RuntimeException e) {
+                plugin.getLogger().warning("Could not migrate " + table[0] + " text columns to TEXT: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Insert-time guard for the columns that deliberately stay VARCHAR(255)
+     * on MySQL (indexed lookup keys): clips with a loud warning instead of
+     * letting MySQL silently truncate (or reject, depending on sql_mode).
+     * Real values for these columns (player names, literal IPs) never come
+     * close to 255 chars, so a clip always indicates corrupt input.
+     */
+    private String clip255(String value, String field) {
+        if (value != null && value.length() > 255) {
+            plugin.getLogger().warning("Truncating overlong moderation " + field
+                    + " (" + value.length() + " chars) to 255 chars.");
+            return value.substring(0, 255);
+        }
+        return value;
     }
 
     /**
@@ -498,7 +584,7 @@ public class ModerationDatabase {
                 "VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, ip);
+            ps.setString(1, clip255(ip, "ip_ban.ip"));
             ps.setString(2, reason);
             ps.setString(3, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(4, staffName);
@@ -539,13 +625,15 @@ public class ModerationDatabase {
                 : "INSERT INTO " + tablePrefix + "player_ips (uuid, name, last_ip, last_seen) VALUES (?, ?, ?, ?) " +
                   "ON CONFLICT(uuid) DO UPDATE SET name = ?, last_ip = ?, last_seen = ?";
         long now = System.currentTimeMillis();
+        String clippedName = clip255(name, "player_ips.name");
+        String clippedIp = clip255(ip, "player_ips.last_ip");
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
-            ps.setString(2, name);
-            ps.setString(3, ip);
+            ps.setString(2, clippedName);
+            ps.setString(3, clippedIp);
             ps.setLong(4, now);
-            ps.setString(5, name);
-            ps.setString(6, ip);
+            ps.setString(5, clippedName);
+            ps.setString(6, clippedIp);
             ps.setLong(7, now);
             ps.executeUpdate();
         }
@@ -567,19 +655,39 @@ public class ModerationDatabase {
     // ---- Reads (used for the periodic local cache refresh AND for the
     // authoritative, always-fresh login check — see BanManager/ModerationListener) ----
 
+    /**
+     * Cache window for the history loads below: history tables are unbounded
+     * (rows are never deleted), so the periodic refresh only loads active or
+     * recent rows instead of the full history. There is no
+     * {@code expires_at}/{@code unbanned} column to filter on — the only
+     * state columns that exist are {@code revoked}, {@code banned_at},
+     * {@code duration} and {@code unbanned_at}, so the filter is built from
+     * those (matches the live findActive* queries' semantics). Ban/kick
+     * totals derived from the cache therefore cover this window; the database
+     * itself keeps every row forever.
+     */
+    private static final long HISTORY_WINDOW_MILLIS = 90L * 24 * 60 * 60 * 1000;
+
     public List<BanRecord> loadAllBans() throws SQLException {
         List<BanRecord> result = new ArrayList<>();
         String tablePrefix = prefixChecked();
-        String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM " + tablePrefix + "bans";
-        try (Connection conn = dataSource.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            while (rs.next()) {
-                try {
-                    result.add(mapBan(rs));
-                } catch (RuntimeException e) {
-                    // A single corrupt row (bad UUID, unexpected null) must never
-                    // discard the whole refresh — skip it loudly, keep the rest.
-                    // Genuine SQLExceptions still propagate and keep the old cache.
-                    plugin.getLogger().warning("Skipping corrupt row in " + tablePrefix + "bans: " + e.getMessage());
+        long cutoff = System.currentTimeMillis() - HISTORY_WINDOW_MILLIS;
+        String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM "
+                + tablePrefix + "bans WHERE revoked = 0 OR banned_at > ? OR unbanned_at > ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, cutoff);
+            ps.setLong(2, cutoff);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    try {
+                        result.add(mapBan(rs));
+                    } catch (RuntimeException e) {
+                        // A single corrupt row (bad UUID, unexpected null) must never
+                        // discard the whole refresh — skip it loudly, keep the rest.
+                        // Genuine SQLExceptions still propagate and keep the old cache.
+                        plugin.getLogger().warning("Skipping corrupt row in " + tablePrefix + "bans: " + e.getMessage());
+                    }
                 }
             }
         }
@@ -589,14 +697,20 @@ public class ModerationDatabase {
     public List<KickRecord> loadAllKicks() throws SQLException {
         List<KickRecord> result = new ArrayList<>();
         String tablePrefix = prefixChecked();
-        String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, kicked_at FROM " + tablePrefix + "kicks";
-        try (Connection conn = dataSource.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            while (rs.next()) {
-                try {
-                    result.add(mapKick(rs));
-                } catch (RuntimeException e) {
-                    // Same row-skip policy as loadAllBans (see above).
-                    plugin.getLogger().warning("Skipping corrupt row in " + tablePrefix + "kicks: " + e.getMessage());
+        long cutoff = System.currentTimeMillis() - HISTORY_WINDOW_MILLIS;
+        String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, kicked_at FROM "
+                + tablePrefix + "kicks WHERE kicked_at > ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, cutoff);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    try {
+                        result.add(mapKick(rs));
+                    } catch (RuntimeException e) {
+                        // Same row-skip policy as loadAllBans (see above).
+                        plugin.getLogger().warning("Skipping corrupt row in " + tablePrefix + "kicks: " + e.getMessage());
+                    }
                 }
             }
         }
@@ -606,19 +720,26 @@ public class ModerationDatabase {
     public List<IpBanRecord> loadAllIpBans() throws SQLException {
         List<IpBanRecord> result = new ArrayList<>();
         String tablePrefix = prefixChecked();
-        String sql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM " + tablePrefix + "ip_bans";
-        try (Connection conn = dataSource.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            while (rs.next()) {
-                try {
-                    IpBanRecord record = mapIpBan(rs);
-                    if (record.ip() == null || record.ip().isBlank()) {
-                        plugin.getLogger().warning("Skipping " + tablePrefix + "ip_bans row with missing IP.");
-                        continue;
+        long cutoff = System.currentTimeMillis() - HISTORY_WINDOW_MILLIS;
+        String sql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM "
+                + tablePrefix + "ip_bans WHERE revoked = 0 OR banned_at > ? OR unbanned_at > ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, cutoff);
+            ps.setLong(2, cutoff);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    try {
+                        IpBanRecord record = mapIpBan(rs);
+                        if (record.ip() == null || record.ip().isBlank()) {
+                            plugin.getLogger().warning("Skipping " + tablePrefix + "ip_bans row with missing IP.");
+                            continue;
+                        }
+                        result.add(record);
+                    } catch (RuntimeException e) {
+                        // Same row-skip policy as loadAllBans (see above).
+                        plugin.getLogger().warning("Skipping corrupt row in " + tablePrefix + "ip_bans: " + e.getMessage());
                     }
-                    result.add(record);
-                } catch (RuntimeException e) {
-                    // Same row-skip policy as loadAllBans (see above).
-                    plugin.getLogger().warning("Skipping corrupt row in " + tablePrefix + "ip_bans: " + e.getMessage());
                 }
             }
         }

@@ -55,9 +55,9 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
         }
 
         String target = args[0];
-        String reason = args.length > 1
+        String reason = defaultReason(args.length > 1
                 ? String.join(" ", Arrays.copyOfRange(args, 1, args.length))
-                : message("default-reason", "No reason specified.");
+                : null);
 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
@@ -124,8 +124,13 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
                 }
             }
 
-            manager.tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, result -> {
+            manager.tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, (result, banDbError) -> {
                 if (isGone(sender)) return;
+                if (banDbError) {
+                    sender.sendMessage(render(
+                            message("db-error", "<red>Database error, please try again later.")));
+                    return;
+                }
                 if (result.isEmpty()) {
                     sender.sendMessage(render(
                             message("ip-already-banned", "<red>%ip% is already banned.").replace("%ip%", esc(ip))));
@@ -197,7 +202,7 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
             } else {
                 try {
                     lastIp = manager.findLastIpByNameStrict(arg);
-                } catch (SQLException e) {
+                } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().warning("Could not look up last IP for " + arg + ": " + e.getMessage());
                     dbError = true;
                 }

@@ -21,6 +21,9 @@ import java.util.Map;
 public class MenuListener implements Listener {
 
     private final PlainBase plugin;
+    // Click debounce: 300ms per player+menu+slot — double-fires (client resend,
+    // rapid clicks) must not run commands/messages twice.
+    private final java.util.Map<String, Long> lastClick = new java.util.concurrent.ConcurrentHashMap<>();
 
     public MenuListener(PlainBase plugin) {
         this.plugin = plugin;
@@ -65,6 +68,25 @@ public class MenuListener implements Listener {
         MenuManager.ItemDefinition def = items.get(rawSlot);
         if (def == null) return;
 
+        // Debounce 300ms per player+menu+slot (see field): ignore rapid repeats.
+        // The menu name is part of the key so the same slot in two different
+        // menus never suppresses each other.
+        String debounceKey = player.getUniqueId() + ":" + holder.getMenuName() + ":" + rawSlot;
+        long now = System.currentTimeMillis();
+        Long last = lastClick.get(debounceKey);
+        if (last != null && now - last < 300) return;
+        lastClick.put(debounceKey, now);
+        // Opportunistic expiry purge: only when the map grew large, drop
+        // expired entries so it stays bounded without per-click iteration
+        // (removeIf only, never clear(): a mass expiry must not lift all
+        // debounces at once).
+        if (lastClick.size() > 1000) {
+            lastClick.entrySet().removeIf(en -> {
+                Long ts = en.getValue();
+                return ts == null || now - ts > 300;
+            });
+        }
+
         if (def.close()) {
             player.closeInventory();
         }
@@ -101,14 +123,39 @@ public class MenuListener implements Listener {
             for (String cmd : commands) {
                 if (cmd == null || cmd.trim().isEmpty()) continue;
 
-                // Commands go to performCommand, never through MiniMessage, so
-                // the raw name stays correct here (escaping would corrupt it).
-                String finalCmd = plugin.applyPlaceholders(player, cmd);
+                // Player name is quoted/validated before performCommand: a name
+                // with spaces or special chars must not split or inject extra
+                // commands. %player% is replaced with the quoted form first,
+                // then remaining placeholders run; control chars reject the line.
+                String preQuoted = cmd.replace("%player%", quotePlayerName(player.getName()));
+                String finalCmd = plugin.applyPlaceholders(player, preQuoted);
+                if (finalCmd == null) continue;
+                if (finalCmd.contains("\n") || finalCmd.contains("\r") || finalCmd.contains("\u0000")) {
+                    plugin.getLogger().warning("Rejected menu command with control chars in menu '" + menu.name() + "'");
+                    continue;
+                }
                 if (finalCmd.startsWith("/")) finalCmd = finalCmd.substring(1);
+                if (finalCmd.trim().isEmpty()) continue;
 
-                player.performCommand(finalCmd);
+                try {
+                    player.performCommand(finalCmd);
+                } catch (Exception e) {
+                    plugin.getLogger().fine("Failed menu command for " + player.getName() + ": " + e.getMessage());
+                }
             }
         }
+    }
+
+    /**
+     * Quotes/validates a player name for command use: plain
+     * {@code [A-Za-z0-9_]} names pass through, anything else is double-quoted
+     * (with embedded quotes/backslashes stripped) so it stays one argument.
+     */
+    private static String quotePlayerName(String name) {
+        if (name == null) return "\"\"";
+        if (name.matches("[A-Za-z0-9_]+")) return name;
+        String sanitized = name.replace("\\", "").replace("\"", "");
+        return "\"" + sanitized + "\"";
     }
 
     /**
