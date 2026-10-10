@@ -2,6 +2,7 @@ package de.jgaertig.plainBase.teleport.tpa.commands;
 
 import de.jgaertig.plainBase.PlainBase;
 import de.jgaertig.plainBase.teleport.tpa.TPAManager;
+import de.jgaertig.plainBase.vanish.VanishManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
@@ -72,7 +73,7 @@ public class TPACommand implements BasicCommand {
             return;
         }
 
-        if (!player.canSee(target)) {
+        if (!canSeeTarget(player, target)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Player not found!"));
             return;
         }
@@ -87,13 +88,32 @@ public class TPACommand implements BasicCommand {
     }
 
     /**
+     * Vanish-aware visibility (perm-aware via VanishManager.canSee, same
+     * oracle guard as VanishCommand): a vanished target looks offline unless
+     * the viewer may see vanished players. Falls back to vanilla canSee when
+     * the vanish module is unavailable. Never throws.
+     */
+    private boolean canSeeTarget(Player viewer, Player target) {
+        try {
+            VanishManager vanishManager = plugin.getVanishManager();
+            if (vanishManager != null) return vanishManager.canSee(viewer, target);
+        } catch (Exception ignored) {
+        }
+        try {
+            return viewer.canSee(target);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
      * Exact-first lookup: Bukkit#getPlayer does prefix matching ("Alex" also
      * matches "Alexander"), which could address the wrong player on a typo.
      * Exact first, fuzzy only as fallback — and the fuzzy fallback never
-     * resolves to a player invisible to the viewer (same pattern as
-     * TeamManager#onlinePlayerExactFirst).
+     * resolves to a player invisible to the viewer (vanish-aware, same
+     * pattern as TeamManager#onlinePlayerExactFirst).
      */
-    private static Player resolveOnlineExactFirst(Player viewer, String name) {
+    private Player resolveOnlineExactFirst(Player viewer, String name) {
         if (name == null) return null;
         Player exact = Bukkit.getPlayerExact(name);
         if (exact != null) return exact;
@@ -105,7 +125,7 @@ public class TPACommand implements BasicCommand {
         }
         if (fuzzy == null) return null;
         try {
-            if (!viewer.canSee(fuzzy)) return null;
+            if (!canSeeTarget(viewer, fuzzy)) return null;
         } catch (Exception e) {
             return null;
         }
@@ -151,15 +171,18 @@ public class TPACommand implements BasicCommand {
             if (!hasTpaPermission(sender)) return List.of();
             if (sender instanceof Player player) {
                 // Suggest may run off the entity thread (Folia): copy the
-                // player list first and guard canSee per player — on failure
-                // fall back to the unfiltered list instead of breaking.
+                // player list first and guard visibility per player — on
+                // failure fall back to the unfiltered list instead of breaking.
+                // Vanished players are filtered vanish-aware (perm-aware via
+                // VanishManager.canSee); console stays unfiltered (below).
                 try {
                     List<Player> online = new java.util.ArrayList<>(Bukkit.getOnlinePlayers());
+                    VanishManager vanishManager = plugin.getVanishManager();
                     List<String> out = new java.util.ArrayList<>();
                     for (Player o : online) {
                         boolean visible = true;
                         try {
-                            visible = player.canSee(o);
+                            visible = vanishManager != null ? vanishManager.canSee(player, o) : player.canSee(o);
                         } catch (Exception ignored) {
                         }
                         if (visible && o.getName().toLowerCase(Locale.ROOT).startsWith(prefix)) {

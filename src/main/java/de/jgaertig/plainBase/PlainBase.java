@@ -82,6 +82,15 @@ public final class PlainBase extends JavaPlugin {
     /** Pending async config writes, awaited with timeout in stopModules(). */
     private final List<CompletableFuture<Void>> pendingSaves =
             Collections.synchronizedList(new ArrayList<>());
+    /**
+     * Loop-breaker for global-thread hops (ensureGlobalThread/stopModules):
+     * Bukkit.isPrimaryThread() does not reliably detect the Folia global
+     * region thread, so a rescheduled call would otherwise re-detect
+     * "off-thread" and reschedule forever. Set on the rescheduled task
+     * before re-entering; a call that still looks off-thread with the guard
+     * set proceeds with a warning instead of rescheduling again (max 1 hop).
+     */
+    private final ThreadLocal<Boolean> globalThreadHopGuard = ThreadLocal.withInitial(() -> Boolean.FALSE);
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     // Volatile: read off-thread (VanishManager/TeamManager scheduler hops,
     // PlaceholderAPI expansion, Brigadier suggestions) while reloadModules()
@@ -201,7 +210,7 @@ public final class PlainBase extends JavaPlugin {
 
         reloadModules();
 
-        getLogger().info("Successfully Enabled! (Version " + getPluginMeta().getVersion() + ")");
+        getLogger().info("Successfully Enabled! (Version " + getVersionSafe() + ")");
     }
 
     @Override
@@ -232,7 +241,20 @@ public final class PlainBase extends JavaPlugin {
         removePermissions();
         commandsRegistered = false;
 
-        getLogger().info("Successfully Disabled! (Version " + getPluginMeta().getVersion() + ")");
+        getLogger().info("Successfully Disabled! (Version " + getVersionSafe() + ")");
+    }
+
+    /**
+     * P2: getPluginMeta() must never break enable/disable logging (e.g. mock
+     * or half-torn-down server during tests/shutdown). Never throws.
+     */
+    private String getVersionSafe() {
+        try {
+            String version = getPluginMeta().getVersion();
+            return version != null ? version : "unknown";
+        } catch (Exception e) {
+            return "unknown";
+        }
     }
 
     /**
@@ -548,28 +570,50 @@ public final class PlainBase extends JavaPlugin {
      * Thread-guard: these lifecycle/config paths must run on the global region
      * (or primary) thread. Off-thread callers are warned and rescheduled
      * instead of touching Bukkit state. Build-neutral via
-     * {@link org.bukkit.Bukkit#isPrimaryThread()}.
+     * {@link org.bukkit.Bukkit#isPrimaryThread()}, with a loop-breaker (max 1
+     * reschedule): where isPrimaryThread() misses the Folia global region
+     * thread, the rescheduled call proceeds with a warning instead of
+     * rescheduling forever.
      */
     private boolean ensureGlobalThread(String what, Runnable reschedule) {
-        try {
-            if (Bukkit.isPrimaryThread()) return true;
-        } catch (Exception ignored) {
+        if (isOnGlobalThread()) {
+            if (Boolean.TRUE.equals(globalThreadHopGuard.get())) {
+                getLogger().warning(what + " rescheduled call still looks off-thread, continuing anyway (loop-breaker).");
+            }
             return true;
         }
         getLogger().warning(what + " called off-thread, rescheduling on the global region thread.");
         try {
             Bukkit.getGlobalRegionScheduler().run(this, t -> {
                 if (!isEnabled()) return;
+                globalThreadHopGuard.set(Boolean.TRUE);
                 try {
                     reschedule.run();
                 } catch (Exception e) {
                     getLogger().warning("Rescheduled " + what + " failed: " + e.getMessage());
+                } finally {
+                    globalThreadHopGuard.remove();
                 }
             });
         } catch (Exception e) {
             getLogger().warning("Could not reschedule " + what + ": " + e.getMessage());
         }
         return false;
+    }
+
+    /**
+     * Build-neutral global-thread check: true when Bukkit.isPrimaryThread()
+     * says so, when it cannot be determined (fail-open, previous behavior), or
+     * when this thread already runs a rescheduled hop (loop-breaker for the
+     * Folia global region thread).
+     */
+    private boolean isOnGlobalThread() {
+        try {
+            if (Bukkit.isPrimaryThread()) return true;
+        } catch (Exception ignored) {
+            return true;
+        }
+        return Boolean.TRUE.equals(globalThreadHopGuard.get());
     }
 
     /**
@@ -584,7 +628,13 @@ public final class PlainBase extends JavaPlugin {
         // though the old in-memory config still said enabled). Module configs
         // in the configs map are untouched by reloadConfig(), so the
         // spawn/menu flush inside stopModules() still sees the old data.
-        reloadConfig();
+        // P2: a corrupt config.yml must never kill the whole reload — keep
+        // the old in-memory config on failure (reloadConfig is fail-safe).
+        try {
+            reloadConfig();
+        } catch (Exception e) {
+            getLogger().warning("Failed to reload config.yml, keeping previous config: " + e.getMessage());
+        }
         // Reload path: never block the global region thread on pending async
         // writes or synchronous disk I/O (the disable path uses stopModules()).
         stopModules(false);
@@ -770,15 +820,50 @@ public final class PlainBase extends JavaPlugin {
      *              (async continuation, no disk I/O on the calling thread).
      */
     public void stopModules(boolean block) {
-        // Thread-guard (warn-only by design): onDisable() must run
-        // synchronously even when called during shutdown where rescheduling
-        // would silently drop the whole shutdown path. Reload callers already
-        // arrive via the global region thread (see reloadModules()).
-        try {
-            if (!Bukkit.isPrimaryThread()) {
-                getLogger().warning("stopModules called off-thread, continuing synchronously.");
+        // Off-thread hop (bounded, deadlock-free): the HandlerList/Bukkit
+        // state below must run on the global region thread — never continue
+        // off-thread after a warning. Reschedules once and waits at most 5s
+        // (same budget as awaitPendingSaves), then returns. The hop sets the
+        // loop-breaker guard so the re-entrant call proceeds even where
+        // Bukkit.isPrimaryThread() misses the Folia global thread (no
+        // self-wait deadlock: the re-entrant call never blocks). While
+        // disabling the scheduler may reject the hop — then abort instead of
+        // running Bukkit API off-thread.
+        if (!isOnGlobalThread()) {
+            getLogger().warning("stopModules called off-thread, rescheduling on the global region thread.");
+            if (!isEnabled()) {
+                getLogger().warning("stopModules skipped: plugin is disabling, cannot hop threads safely.");
+                return;
             }
-        } catch (Exception ignored) {
+            final CompletableFuture<Void> hopped = new CompletableFuture<>();
+            try {
+                Bukkit.getGlobalRegionScheduler().run(this, t -> {
+                    if (!isEnabled()) {
+                        hopped.complete(null);
+                        return;
+                    }
+                    globalThreadHopGuard.set(Boolean.TRUE);
+                    try {
+                        stopModules(block);
+                    } catch (Exception e) {
+                        getLogger().warning("Rescheduled stopModules failed: " + e.getMessage());
+                    } finally {
+                        globalThreadHopGuard.remove();
+                        hopped.complete(null);
+                    }
+                });
+            } catch (Exception e) {
+                getLogger().warning("Could not reschedule stopModules, aborting off-thread run: " + e.getMessage());
+                return;
+            }
+            try {
+                hopped.get(5, TimeUnit.SECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                getLogger().warning("Timed out waiting for stopModules on the global region thread.");
+            } catch (Exception e) {
+                getLogger().fine("Interrupted waiting for stopModules: " + e.getMessage());
+            }
+            return;
         }
         // Flush pending async writes first: async tasks may be cancelled on
         // disable/reload and their changes would be lost. Disable path waits
@@ -804,12 +889,16 @@ public final class PlainBase extends JavaPlugin {
                 }
             } else {
                 final VanishManager vm = vanishManager;
+                // Snapshot BEFORE configs.clear() below: the async task runs
+                // after clear() and must not read the live map (would see
+                // null and fall back to the wrong persist default).
+                final FileConfiguration vanishSnapshot = getVanishConfig();
                 final CompletableFuture<Void> flushFuture = new CompletableFuture<>();
                 trackPendingSave(flushFuture);
                 try {
                     Bukkit.getAsyncScheduler().runNow(this, task -> {
                         try {
-                            vm.flushSync();
+                            vm.flushSync(vanishSnapshot);
                         } catch (Exception e) {
                             getLogger().warning("Failed to flush vanish state on reload: " + e.getMessage());
                         } finally {
@@ -1049,12 +1138,22 @@ public final class PlainBase extends JavaPlugin {
      * config.yml keeps working after an update instead of silently assuming
      * defaults. In-memory only — like the module merge, missing keys persist
      * on the next saveConfig() (no comment-stripping rewrite here). Never
-     * throws.
+     * throws: a corrupt config.yml keeps the previous in-memory config
+     * (Bukkit leaves the old instance in place when the re-read fails).
      */
     @Override
     public void reloadConfig() {
-        super.reloadConfig();
-        mergeMissingRootDefaults();
+        try {
+            super.reloadConfig();
+        } catch (Exception e) {
+            getLogger().warning("Failed to reload config.yml, keeping previous config: " + e.getMessage());
+            return;
+        }
+        try {
+            mergeMissingRootDefaults();
+        } catch (Exception e) {
+            getLogger().warning("Failed to merge defaults for config.yml: " + e.getMessage());
+        }
     }
 
     private void mergeMissingRootDefaults() {
@@ -1138,6 +1237,15 @@ public final class PlainBase extends JavaPlugin {
         }
     }
 
+    /**
+     * Snapshot of the loaded module configs (unmodifiable map copy).
+     * P2: the map is a copy, but the values are live
+     * {@link FileConfiguration} instances — do not mutate them; guard reads
+     * with {@code synchronized(config)} (module configs) or
+     * {@code synchronized(configLock)} for the root config (see
+     * {@link #getConfigLock()}), since {@link #reloadConfig()} may swap
+     * instances at any time.
+     */
     public Map<String, FileConfiguration> getConfigs() {
         return Collections.unmodifiableMap(new HashMap<>(configs));
     }
@@ -1442,19 +1550,28 @@ public final class PlainBase extends JavaPlugin {
                         } catch (Exception ignored) {
                         }
                     }
+                    // P2: restore the carried pre-vanish self state instead of
+                    // hardcoding defaults — a third-party silent/collidable flag
+                    // must survive the reveal. Fallback to defaults only when no
+                    // snapshot exists for this player.
+                    final VanishManager.PrevSelfState carried =
+                            previousSelfStates != null ? previousSelfStates.get(uuid) : null;
                     try {
                         target.getScheduler().run(this, t -> {
                             if (!target.isOnline()) return;
+                            boolean restoreInvisible = carried != null ? carried.invisible() : false;
+                            boolean restoreCollidable = carried != null ? carried.collidable() : true;
+                            boolean restoreSilent = carried != null ? carried.silent() : false;
                             try {
-                                target.setInvisible(false);
+                                target.setInvisible(restoreInvisible);
                             } catch (Exception ignored) {
                             }
                             try {
-                                target.setCollidable(true);
+                                target.setCollidable(restoreCollidable);
                             } catch (Exception ignored) {
                             }
                             try {
-                                target.setSilent(false);
+                                target.setSilent(restoreSilent);
                             } catch (Exception ignored) {
                             }
                         }, null);
@@ -1751,6 +1868,82 @@ public final class PlainBase extends JavaPlugin {
                     + ", changes will be flushed on shutdown: " + e.getMessage());
             future.complete(null);
         }
+    }
+
+    /**
+     * Folia-safe persist for the root config changed from commands
+     * (/plainbase toggle): snapshots in memory under configLock (no disk I/O
+     * on the calling thread) and writes the bytes on the async scheduler.
+     * Same guards as {@link #saveModuleConfigAsync}: sequence guard (a stale
+     * snapshot never overwrites a newer one) and atomic temp-file publish (a
+     * failed write never leaves a half-written config.yml behind), keyed
+     * "config.yml". Tracked in pendingSaves so the disable path still awaits
+     * it (bounded). Never throws; the future completes when the write settled
+     * (callers hop back to the global thread for reload/messages to keep
+     * modify-save-reload ordering). Comment stripping is unchanged Bukkit
+     * behavior (saveToString), only the thread is moved.
+     */
+    public CompletableFuture<Void> saveConfigAsync() {
+        final String data;
+        synchronized (configLock) {
+            FileConfiguration rootCfg = getConfig();
+            if (rootCfg == null) {
+                getLogger().warning("Cannot save config.yml: config is not loaded.");
+                return CompletableFuture.completedFuture(null);
+            }
+            try {
+                data = rootCfg.saveToString();
+            } catch (Exception e) {
+                getLogger().log(java.util.logging.Level.SEVERE, "Could not save config.yml!", e);
+                return CompletableFuture.completedFuture(null);
+            }
+        }
+        final long mySeq = configSeq.computeIfAbsent("config.yml", k -> new AtomicLong()).incrementAndGet();
+        final File target = new File(getDataFolder(), "config.yml");
+        final Object fileLock = getFileLock("config.yml");
+        final CompletableFuture<Void> future = new CompletableFuture<>();
+        synchronized (pendingSaves) {
+            pendingSaves.removeIf(CompletableFuture::isDone);
+            pendingSaves.add(future);
+        }
+        Runnable write = () -> {
+            try {
+                AtomicLong seq = configSeq.get("config.yml");
+                if (seq != null && seq.get() != mySeq) {
+                    return;
+                }
+                synchronized (fileLock) {
+                    if (seq != null && seq.get() != mySeq) {
+                        return;
+                    }
+                    File parent = target.getParentFile();
+                    if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                        getLogger().warning("Could not create directory: " + parent);
+                        return;
+                    }
+                    java.nio.file.Path tmp = target.toPath().resolveSibling(target.getName() + ".tmp");
+                    Files.writeString(tmp, data, StandardCharsets.UTF_8);
+                    try {
+                        Files.move(tmp, target.toPath(),
+                                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                        Files.move(tmp, target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+            } catch (Exception e) {
+                getLogger().log(java.util.logging.Level.SEVERE, "Could not save config.yml!", e);
+            } finally {
+                future.complete(null);
+            }
+        };
+        try {
+            Bukkit.getAsyncScheduler().runNow(this, task -> write.run());
+        } catch (Exception e) {
+            getLogger().warning("Could not schedule async save of config.yml"
+                    + ", changes will be flushed on shutdown: " + e.getMessage());
+            future.complete(null);
+        }
+        return future;
     }
 
     /**

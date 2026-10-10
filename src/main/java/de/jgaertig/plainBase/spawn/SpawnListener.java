@@ -181,9 +181,10 @@ public class SpawnListener implements Listener {
                 plugin.getLogger().warning("Spawn teleport for " + player.getName() + ": Y=" + rawY
                         + " out of bounds [" + world.getMinHeight() + "," + world.getMaxHeight()
                         + ") at '" + path + "', falling back to world spawn.");
+                player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Spawn location was out of bounds, using world spawn instead. Contact an admin!"));
                 loc = world.getSpawnLocation().clone();
             } else {
-                loc = new Location(world, rawX, rawY, rawZ, yaw, pitch);
+                loc = resolveSafeSpawnLocation(world, new Location(world, rawX, rawY, rawZ, yaw, pitch), player, path);
             }
             player.teleportAsync(loc).thenAccept(success -> {
                 // thenAccept runs off the entity thread: hop back onto the
@@ -228,6 +229,57 @@ public class SpawnListener implements Listener {
             // Runs on a delayed scheduler task after join: must never throw.
             plugin.getLogger().warning("Spawn teleport failed for "
                     + (player != null ? player.getName() : "<unknown>") + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Spawn safety: when feet/head at the configured location are obstructed,
+     * scan up (max +5, same pattern as TPAManager arrival) for feet+head
+     * passable with solid ground below. Never throws and never blocks: when no
+     * safe spot is found the original location is used with a warning, so
+     * existing admin setups keep working.
+     */
+    private Location resolveSafeSpawnLocation(World world, Location loc, Player player, String path) {
+        try {
+            if (world == null || loc == null) return loc;
+            if (isSpawnSpotSafe(loc)) return loc;
+            Location found = null;
+            int foundOffset = 0;
+            for (int i = 1; i <= 5; i++) {
+                Location cand = loc.clone().add(0, i, 0);
+                if (cand.getY() + 1 >= world.getMaxHeight()) break;
+                if (cand.getY() < world.getMinHeight()) continue;
+                if (isSpawnSpotSafe(cand)) {
+                    found = cand;
+                    foundOffset = i;
+                    break;
+                }
+            }
+            if (found != null) {
+                plugin.getLogger().warning("Spawn teleport for " + player.getName()
+                        + ": configured location at '" + path + "' obstructed, using safe spot +" + foundOffset + " up.");
+                player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Spawn location was obstructed, using nearest safe spot instead. Contact an admin!"));
+                return found;
+            }
+            plugin.getLogger().warning("Spawn teleport for " + player.getName()
+                    + ": configured location at '" + path + "' obstructed and no safe spot found within +5, teleporting anyway.");
+            player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Warning: spawn location looks obstructed. Contact an admin!"));
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check spawn safety at '" + path + "': " + e.getMessage());
+        }
+        return loc;
+    }
+
+    private boolean isSpawnSpotSafe(Location cand) {
+        try {
+            org.bukkit.block.Block feet = cand.getBlock();
+            org.bukkit.block.Block head = cand.clone().add(0, 1, 0).getBlock();
+            org.bukkit.block.Block ground = cand.clone().add(0, -1, 0).getBlock();
+            if (!feet.isPassable() || !head.isPassable()) return false;
+            return ground.getType().isSolid();
+        } catch (Exception e) {
+            // Fail-open: a lookup error must never block the teleport.
+            return true;
         }
     }
 

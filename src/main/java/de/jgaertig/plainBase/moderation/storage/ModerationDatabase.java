@@ -36,7 +36,7 @@ public class ModerationDatabase {
 
     private final PlainBase plugin;
     private final boolean mysql;
-    private HikariDataSource dataSource;
+    private volatile HikariDataSource dataSource;
 
     public ModerationDatabase(PlainBase plugin) {
         this.plugin = plugin;
@@ -91,7 +91,16 @@ public class ModerationDatabase {
             config.setUsername(modCfg.getString("storage.mysql.username", "root"));
             config.setPassword(modCfg.getString("storage.mysql.password", ""));
             config.setMaximumPoolSize(Math.min(10, Math.max(2, modCfg.getInt("storage.mysql.pool-size", 5))));
-            config.setDriverClassName("com.mysql.cj.jdbc.Driver");
+            // Shade relocates the bytecode (com.mysql -> de.jgaertig.plainBase.libs.mysql)
+            // but NOT string literals: the Services file is rewritten, this String is
+            // not. Probe the relocated name first (shaded jar), fall back to the
+            // original (unshaded IDE/test classpath).
+            try {
+                Class.forName("de.jgaertig.plainBase.libs.mysql.cj.jdbc.Driver");
+                config.setDriverClassName("de.jgaertig.plainBase.libs.mysql.cj.jdbc.Driver");
+            } catch (ClassNotFoundException e) {
+                config.setDriverClassName("com.mysql.cj.jdbc.Driver");
+            }
             // Statement-cache tunables are Connector/J (MySQL) only — setting
             // them globally is a no-op on SQLite and only misleading there.
             config.addDataSourceProperty("cachePrepStmts", "true");
@@ -616,11 +625,28 @@ public class ModerationDatabase {
     public BanRecord insertBan(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long duration) throws SQLException {
         ensureConnected();
         long bannedAt = System.currentTimeMillis();
+        String retireSql = "UPDATE " + prefixChecked() + "bans SET revoked = 1, unbanned_at = ? WHERE uuid = ? AND revoked = 0 AND duration >= 0 AND (? - banned_at >= duration)";
         String sql = "INSERT INTO " + prefixChecked() + "bans (uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
+        String uuidLower = uuid.toString().toLowerCase(java.util.Locale.ROOT);
         try (Connection conn = connOrThrow();
+             PreparedStatement retire = conn.prepareStatement(retireSql);
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
+            // Re-ban after expiry: an expired tempban row stays revoked = 0
+            // (expiry is computed, never written back), so the partial unique
+            // index WHERE revoked = 0 would reject the re-ban even though the
+            // live check correctly reports "not banned". Retire ONLY expired
+            // rows (same expiry predicate as findActiveBan, inverted) — an
+            // actually-active ban is never touched and still collides on the
+            // partial index, which BanManager reports as "already banned".
+            // System expiry, not a staff unban: unbanned_by_* stay NULL, only
+            // unbanned_at is set so the row remains in the recent-history
+            // window. Same SQL on both dialects (no DDL change, no new keys).
+            retire.setLong(1, bannedAt);
+            retire.setString(2, uuidLower);
+            retire.setLong(3, bannedAt);
+            retire.executeUpdate();
+            ps.setString(1, uuidLower);
             ps.setString(2, name);
             ps.setString(3, reason);
             ps.setString(4, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
@@ -737,15 +763,30 @@ public class ModerationDatabase {
 
     public IpBanRecord insertIpBan(String ip, String reason, UUID staffUuid, String staffName, long duration) throws SQLException {
         ensureConnected();
+        // Canonicalize at the entrance (same defense-in-depth as
+        // BanManager#trackPlayerIp): only canonical spellings are stored, so
+        // exact-match lookups can never miss on notation. Unparseable input
+        // keeps its raw value — no new rejection path here.
+        String normalized = ModerationCommandBase.normalizeIp(ip);
+        if (normalized != null) ip = normalized;
         long bannedAt = System.currentTimeMillis();
         // Single storedIp for DB and cache record: the clip255 guard must apply
         // to both, otherwise the in-memory record diverges from the persisted
         // row (lookup by exact IP would miss after a clip).
         String storedIp = clip255(ip, "ip_ban.ip");
+        String retireSql = "UPDATE " + prefixChecked() + "ip_bans SET revoked = 1, unbanned_at = ? WHERE ip = ? AND revoked = 0 AND duration >= 0 AND (? - banned_at >= duration)";
         String sql = "INSERT INTO " + prefixChecked() + "ip_bans (ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
         try (Connection conn = connOrThrow();
+             PreparedStatement retire = conn.prepareStatement(retireSql);
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            // Same expired-row retirement as insertBan (see there): an
+            // expired temp-IP-ban would otherwise collide on the partial
+            // unique index WHERE revoked = 0. Active IP bans are untouched.
+            retire.setLong(1, bannedAt);
+            retire.setString(2, storedIp);
+            retire.setLong(3, bannedAt);
+            retire.executeUpdate();
             ps.setString(1, storedIp);
             ps.setString(2, reason);
             ps.setString(3, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
@@ -776,6 +817,8 @@ public class ModerationDatabase {
     @Deprecated
     public int revokeIpBan(String ip, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
         ensureConnected();
+        String normalized = ModerationCommandBase.normalizeIp(ip);
+        if (normalized != null) ip = normalized;
         String sql = "UPDATE " + prefixChecked() + "ip_bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE ip = ? AND revoked = 0";
         try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
@@ -793,6 +836,8 @@ public class ModerationDatabase {
      */
     public List<Integer> findActiveIpBanIds(String ip, long now) throws SQLException {
         ensureConnected();
+        String normalized = ModerationCommandBase.normalizeIp(ip);
+        if (normalized != null) ip = normalized;
         String sql = "SELECT id FROM " + prefixChecked() + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
         List<Integer> ids = new ArrayList<>();
         try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -1038,6 +1083,8 @@ public class ModerationDatabase {
      */
     public IpBanRecord findActiveIpBan(String ip, long now) throws SQLException {
         ensureConnected();
+        String normalized = ModerationCommandBase.normalizeIp(ip);
+        if (normalized != null) ip = normalized;
         // Overflow-free expiry check (same reasoning as findActiveBan).
         String sql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at " +
                 "FROM " + prefixChecked() + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 1";

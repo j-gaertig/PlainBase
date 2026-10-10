@@ -74,9 +74,10 @@ public class PlainBaseCommand implements BasicCommand {
                         // reads/mutations go through the central configLock (not
                         // the config instance, which reloadConfig() may swap).
                         // Single critical section: whitelist check + read-modify
-                        // under one lock, snapshot newStatus; saveConfig() runs
-                        // after the lock but on the same global thread, so no
-                        // interleaved toggle can slip between modify and save.
+                        // under one lock, snapshot newStatus; the async save
+                        // below snapshots under the same lock and the reload is
+                        // chained after the write completed, so the toggled
+                        // value is never wiped by a premature disk re-read.
                         String actualKey = null;
                         boolean newStatus = false;
                         boolean found;
@@ -114,18 +115,46 @@ public class PlainBaseCommand implements BasicCommand {
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
                             return;
                         }
-                        // NOTE: saveConfig() rewrites config.yml WITHOUT comments
+                        // NOTE: saveConfigAsync() rewrites config.yml WITHOUT comments
                         // (Bukkit YamlConfiguration strips them) — the toggle
                         // itself is unaffected, but hand-written comments are
                         // lost. The success message below says so.
-                        plugin.saveConfig();
-                        plugin.reloadModules();
-                        if (sender instanceof Player player && !player.isOnline()) return;
-                        String statusColor = newStatus ? "<green>enabled" : "<red>disabled";
-                        sender.sendMessage(plugin.getMiniMessage().deserialize(
-                                "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
-                                        + " <dark_gray>(Note: saving removed comments from config.yml.)"
-                        ));
+                        // Folia: no sync disk I/O on the global region thread —
+                        // the reload (which re-reads config.yml from disk) is
+                        // chained after the write completed, then the message.
+                        final boolean appliedStatus = newStatus;
+                        plugin.saveConfigAsync().whenComplete((v, saveError) -> {
+                            if (saveError != null) {
+                                plugin.getLogger().warning("Async save of config.yml failed: " + saveError.getMessage());
+                            }
+                            try {
+                                Bukkit.getGlobalRegionScheduler().run(plugin, reloadTask -> {
+                                    if (!plugin.isEnabled()) return;
+                                    try {
+                                        plugin.reloadModules();
+                                        if (sender instanceof Player player && !player.isOnline()) return;
+                                        String statusColor = appliedStatus ? "<green>enabled" : "<red>disabled";
+                                        sender.sendMessage(plugin.getMiniMessage().deserialize(
+                                                "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
+                                                        + " <dark_gray>(Note: saving removed comments from config.yml.)"
+                                        ));
+                                    } catch (Exception e) {
+                                        plugin.getLogger().log(Level.WARNING, "Failed to reload after toggle of " + moduleName, e);
+                                        try {
+                                            if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
+                                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
+                                        } catch (Exception ignored) {
+                                        }
+                                    }
+                                });
+                            } catch (Exception e) {
+                                plugin.getLogger().warning("Failed to schedule reload after toggle: " + e.getMessage());
+                                try {
+                                    sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
+                                } catch (Exception ignored) {
+                                }
+                            }
+                        });
                     } catch (Exception e) {
                         plugin.getLogger().log(Level.WARNING, "Failed to toggle module " + moduleName, e);
                         try {
@@ -304,7 +333,12 @@ public class PlainBaseCommand implements BasicCommand {
                         builder.append(line);
                     }
 
-                    JsonArray versions = JsonParser.parseString(builder.toString()).getAsJsonArray();
+                    JsonElement parsed = JsonParser.parseString(builder.toString());
+                    if (!parsed.isJsonArray()) {
+                        plugin.getLogger().warning("Modrinth API returned unexpected response, aborting update check.");
+                        return null;
+                    }
+                    JsonArray versions = parsed.getAsJsonArray();
                     if (versions.isEmpty()) {
                         return "NOT_FOUND";
                     }

@@ -79,7 +79,9 @@ public class TeamManager {
     // uuid -> the team currently mirrored on the vanilla scoreboard (see class javadoc).
     // Entries are removed on quit via handleQuit (called from TeamListener):
     // the scoreboard entry is removed under the player's current name and the
-    // map entry is dropped, so no per-player state lingers in memory.
+    // map entry is dropped. Only this mirror entry is cleaned — memberships,
+    // invites and requests persist for offline players (offline targeting by
+    // UUID keeps working), so per-player team state does linger by design.
     private final Map<UUID, String> scoreboardTeamOf = new ConcurrentHashMap<>();
 
     // Scoreboard teams created by THIS manager instance (vanilla names "pb_<id>").
@@ -515,6 +517,7 @@ public class TeamManager {
         // /plainbase reload could have cleared getTeamConfig() to null.
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         final int maxTeams = maxTeamsOf(cfgSnapshot);
+        final long capturedGeneration = generation;
         // T1: inviting to a deleted team must not create ghost state.
         if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
         // V4: never reveal a vanished player's existence via invite probing.
@@ -523,6 +526,13 @@ public class TeamManager {
             // Callback may run on the async/global path after a reload — never
             // let it throw into the scheduler; entity sends go via dispatch.
             try {
+                // Stale-instance guard (see GENERATION): a reload swaps in a new
+                // manager with fresh maps — mutating this old instance would
+                // report success while the entry vanishes. Fail with retry.
+                if (capturedGeneration != GENERATION.get()) {
+                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    return;
+                }
                 if (denyVanishedOracleResolved(staff, target, targetName, cfgSnapshot)) return;
                 UUID uuid = target.getUniqueId();
                 Component receivedNotice = null;
@@ -630,10 +640,16 @@ public class TeamManager {
         String id = teamId.toLowerCase(Locale.ROOT);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         final int maxTeams = maxTeamsOf(cfgSnapshot);
+        final long capturedGeneration = generation;
         if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
         if (denyVanishedOracle(staff, targetName, cfgSnapshot)) return;
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
             try {
+                // Stale-instance guard (see invite): never mutate after reload.
+                if (capturedGeneration != GENERATION.get()) {
+                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    return;
+                }
                 if (denyVanishedOracleResolved(staff, target, targetName, cfgSnapshot)) return;
                 UUID uuid = target.getUniqueId();
                 Component addedNotice = null;
@@ -649,14 +665,20 @@ public class TeamManager {
                             return;
                         }
 
-                        // Adding directly also clears any pending invite/request for this team.
+                        // Adding directly also clears any pending invite/request for this team
+                        // (same computeIfPresent-with-purge pattern as accept/deny, so no
+                        // empty sets linger in the maps).
                         synchronized (INVITES_LOCK) {
-                            Set<String> pendingInvites = invites.get(uuid);
-                            if (pendingInvites != null) pendingInvites.remove(id);
+                            invites.computeIfPresent(uuid, (k, set) -> {
+                                set.remove(id);
+                                return set.isEmpty() ? null : set;
+                            });
                         }
                         synchronized (REQUESTS_LOCK) {
-                            Set<UUID> pendingRequests = requests.get(id);
-                            if (pendingRequests != null) pendingRequests.remove(uuid);
+                            requests.computeIfPresent(id, (k, set) -> {
+                                set.remove(uuid);
+                                return set.isEmpty() ? null : set;
+                            });
                         }
                         saveInvites();
                         saveRequests();
@@ -688,9 +710,15 @@ public class TeamManager {
     public void kick(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        final long capturedGeneration = generation;
         if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
             try {
+                // Stale-instance guard (see invite): never mutate after reload.
+                if (capturedGeneration != GENERATION.get()) {
+                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    return;
+                }
                 UUID uuid = target.getUniqueId();
                 Component kickedNotice = null;
                 String onlineName = targetName;
@@ -825,9 +853,15 @@ public class TeamManager {
     public void denyRequest(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        final long capturedGeneration = generation;
         if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
             try {
+                // Stale-instance guard (see invite): never mutate after reload.
+                if (capturedGeneration != GENERATION.get()) {
+                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    return;
+                }
                 UUID uuid = target.getUniqueId();
                 Component rejectedNotice = null;
                 synchronized (lockFor(uuid)) {
@@ -857,6 +891,7 @@ public class TeamManager {
     public void setRole(CommandSender staff, String teamId, String targetName, String roleStr) {
         String id = teamId.toLowerCase(Locale.ROOT);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        final long capturedGeneration = generation;
         Role role;
         try {
             role = Role.valueOf(roleStr.toUpperCase(Locale.ROOT));
@@ -868,6 +903,11 @@ public class TeamManager {
 
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
             try {
+                // Stale-instance guard (see invite): never mutate after reload.
+                if (capturedGeneration != GENERATION.get()) {
+                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    return;
+                }
                 UUID uuid = target.getUniqueId();
                 Component roleNotice = null;
                 String onlineName = targetName;
@@ -1219,7 +1259,12 @@ public class TeamManager {
     private static String lookupName(UUID uuid) {
         try {
             Player online = Bukkit.getPlayer(uuid);
-            if (online != null) return online.getName();
+            if (online != null) {
+                // getName() can return null on a half-gone player — fall back
+                // to the UUID string instead of leaking a null downstream.
+                String name = online.getName();
+                return name != null ? name : uuid.toString();
+            }
         } catch (RuntimeException e) {
             // fall through to UUID string
         }
@@ -1243,7 +1288,11 @@ public class TeamManager {
                     return uuid.toString();
                 }
             }
-            return online.getName();
+            // getName() can return null on a half-gone player — same UUID
+            // fallback as the offline path above (and no vanish oracle: the
+            // UUID form renders exactly like an offline player).
+            String name = online.getName();
+            return name != null ? name : uuid.toString();
         } catch (RuntimeException e) {
             return uuid.toString();
         }

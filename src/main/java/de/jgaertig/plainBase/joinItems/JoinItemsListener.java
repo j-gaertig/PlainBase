@@ -28,6 +28,7 @@ import org.bukkit.persistence.PersistentDataType;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 
 public class JoinItemsListener implements Listener {
 
@@ -37,6 +38,15 @@ public class JoinItemsListener implements Listener {
     // not spam the configured commands. Key is uuid:configKey so two
     // different items never suppress each other.
     private final java.util.Map<String, Long> lastInteract = new java.util.concurrent.ConcurrentHashMap<>();
+    // UUIDs whose last death kept the inventory (per-death event flag, NOT the
+    // gamerule): PlayerRespawnEvent has no keep-inventory flag of its own, so
+    // onRespawn consults this set ALONGSIDE the gamerule. Without it a death
+    // with keepInventory=true but gamerule=false would re-give (duplicate),
+    // and a death with keepInventory=false but gamerule=true would skip the
+    // re-give after onDeath already filtered the drops (loss). Consumed on
+    // respawn; cleared when a later death did not keep, so no stale entry can
+    // suppress a future re-give.
+    private final java.util.Set<UUID> keepInventoryDeaths = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public JoinItemsListener(PlainBase plugin) {
         this.plugin = plugin;
@@ -46,7 +56,9 @@ public class JoinItemsListener implements Listener {
     private boolean isActionRestricted(Player player, ItemStack item, String restrictionFlag) {
         if (item == null || !isJoinItem(item)) return false;
         org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
-        if (cfg == null) return false;
+        // Fail-closed like joinItemHasFlag below: a missing config (e.g. racing
+        // a reload) must keep items restricted, never silently unlock them.
+        if (cfg == null) return true;
 
         // Code default matches the shipped joinitems.yml (op-bypass: false):
         // OPs are restricted like everyone else unless the admin opts in.
@@ -359,7 +371,14 @@ public class JoinItemsListener implements Listener {
         // their normal drop behaviour.
         // "no-drop" items must never drop either: dropping them on death
         // would bypass the no-drop protection (and duplicate re-given ones).
-        if (event.getKeepInventory()) return;
+        // The keepInventory outcome is recorded for onRespawn (see
+        // keepInventoryDeaths): the respawn event carries no such flag, and
+        // the gamerule alone can disagree with the per-death outcome.
+        if (event.getKeepInventory()) {
+            keepInventoryDeaths.add(event.getEntity().getUniqueId());
+            return;
+        }
+        keepInventoryDeaths.remove(event.getEntity().getUniqueId());
         try {
             event.getDrops().removeIf(item -> isRegiveAfterDeathJoinItem(item) || isNoDropJoinItem(item));
         } catch (Exception e) {
@@ -440,7 +459,14 @@ public class JoinItemsListener implements Listener {
         // keepInventory guard: with the keep-inventory gamerule the player never
         // lost the items, so re-giving them here would duplicate every stack.
         // (GameRules, not the deprecated-for-removal GameRule constants.)
-        if (Boolean.TRUE.equals(player.getWorld().getGameRuleValue(GameRules.KEEP_INVENTORY))) return;
+        // The gamerule alone is not enough: the death may have kept inventory
+        // via the per-death event flag while the gamerule is off (dupe), or
+        // dropped via the flag while the gamerule is on (loss after onDeath
+        // already filtered the drops) — so the recorded death outcome counts
+        // too. Consumed here (remove), so a stale entry can never suppress a
+        // later, unrelated respawn.
+        boolean diedWithKeep = keepInventoryDeaths.remove(player.getUniqueId());
+        if (diedWithKeep || Boolean.TRUE.equals(player.getWorld().getGameRuleValue(GameRules.KEEP_INVENTORY))) return;
         player.getScheduler().runDelayed(plugin, task -> {
             if (!player.isOnline()) return;
             if (plugin.getJoinItemsConfig() == null) return;

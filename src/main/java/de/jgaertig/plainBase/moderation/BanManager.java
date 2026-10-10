@@ -473,6 +473,13 @@ public class BanManager {
             callback.accept(Optional.empty(), true);
             return;
         }
+        // Canonicalize once at the entrance (same defense-in-depth as
+        // trackPlayerIp): live-check, cache comparison and insert below must
+        // all use one spelling. Unparseable input keeps its raw value —
+        // callers already reject nulls via ip-not-found, so no new rejection
+        // path here. Final local: the async lambda below captures it.
+        String normalizedEntrance = ModerationCommandBase.normalizeIp(ip);
+        final String targetIp = normalizedEntrance != null ? normalizedEntrance : ip;
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             // Live check first (same reasoning as tryBanAsync); cache is
             // only the fallback when the DB itself is unreachable. Blocking
@@ -481,10 +488,10 @@ public class BanManager {
             IpBanRecord live = null;
             boolean liveOk = false;
             try {
-                live = db.findActiveIpBan(ip, now);
+                live = db.findActiveIpBan(targetIp, now);
                 liveOk = true;
             } catch (SQLException | RuntimeException e) {
-                plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
+                plugin.getLogger().warning("Could not live-check IP ban for " + targetIp + ", falling back to cache: " + e.getMessage());
             }
             if (live != null) {
                 IpBanRecord seen = live;
@@ -494,19 +501,19 @@ public class BanManager {
                 complete(() -> callback.accept(Optional.empty(), false));
                 return;
             }
-            if (!liveOk && ipBansCache.stream().anyMatch(r -> r.ip() != null && r.ip().equals(ip) && r.isActive(now))) {
+            if (!liveOk && ipBansCache.stream().anyMatch(r -> r.ip() != null && r.ip().equals(targetIp) && r.isActive(now))) {
                 complete(() -> callback.accept(Optional.empty(), false));
                 return;
             }
             IpBanRecord record;
             try {
-                record = db.insertIpBan(ip, reason, staffUuid, staffName, durationMillis);
+                record = db.insertIpBan(targetIp, reason, staffUuid, staffName, durationMillis);
             } catch (SQLException | RuntimeException e) {
-                plugin.getLogger().severe("Could not insert IP ban for " + ip + ": " + e.getMessage());
+                plugin.getLogger().severe("Could not insert IP ban for " + targetIp + ": " + e.getMessage());
                 // Lost race (see tryBanAsync): re-check before crying DB error.
                 IpBanRecord raced = null;
                 try {
-                    raced = db.findActiveIpBan(ip, System.currentTimeMillis());
+                    raced = db.findActiveIpBan(targetIp, System.currentTimeMillis());
                 } catch (SQLException | RuntimeException ignored) {
                 }
                 if (raced != null) {
@@ -583,16 +590,21 @@ public class BanManager {
     /**
      * Hops the answer back onto the global region thread (same
      * async-then-region pattern as before). If the scheduler is gone
-     * (shutdown race despite the isEnabled guards), runs the answer directly
-     * instead of throwing and hanging the caller silently.
+     * (shutdown race despite the isEnabled guards), the answer is SKIPPED
+     * with a log line — running it directly would execute Bukkit API
+     * off-thread, which is only safe on the primary thread.
      */
     private void complete(Runnable answer) {
         try {
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> answer.run());
         } catch (RuntimeException e) {
-            try {
-                answer.run();
-            } catch (RuntimeException ignored) {
+            if (Bukkit.isPrimaryThread()) {
+                try {
+                    answer.run();
+                } catch (RuntimeException ignored) {
+                }
+            } else {
+                plugin.getLogger().warning("Skipping moderation callback during shutdown: scheduler unavailable.");
             }
         }
     }

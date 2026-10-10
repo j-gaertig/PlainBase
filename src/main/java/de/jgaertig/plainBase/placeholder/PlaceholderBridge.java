@@ -46,7 +46,11 @@ public final class PlaceholderBridge {
             try {
                 safeName = MiniMessage.miniMessage().escapeTags(player.getName());
             } catch (Exception e) {
-                safeName = player.getName();
+                // getName() itself can throw/return null on a half-gone player
+                // (login race) — never call it a second time here (it could
+                // throw again); fall back to a fixed placeholder so the
+                // replace below can never NPE.
+                safeName = "?";
             }
             result = text.replace("%player%", safeName);
         }

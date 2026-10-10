@@ -134,6 +134,11 @@ public class VanishCommand implements BasicCommand {
             player.sendMessage(plugin.getMiniMessage().deserialize(
                     "<gray>" + plugin.getMiniMessage().escapeTags(target.getName()) + " is now " + (nowVanished ? "<green>vanished" : "<red>visible") + "<gray>."
             ));
+            // Non-executor targets always get a direct notice (same strings as
+            // toggleAll/self-vanish, no new keys) so nobody is vanished blind.
+            target.sendMessage(plugin.getMiniMessage().deserialize(
+                    nowVanished ? "<green>You are now vanished!" : "<gray>You are no longer vanished."
+            ));
             return;
         }
 

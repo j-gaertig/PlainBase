@@ -117,6 +117,30 @@ public class SetFirstSpawn implements BasicCommand {
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to check world border for /setfirstspawn: " + e.getMessage());
             }
+            // Spawn safety (warn-only): an obstructed spawn suffocates players
+            // on arrival. Never blocks saving — intentional admin setups (e.g.
+            // enclosed spawn rooms) must keep working.
+            try {
+                org.bukkit.block.Block feet = loc.getBlock();
+                org.bukkit.block.Block head = loc.clone().add(0, 1, 0).getBlock();
+                org.bukkit.block.Block ground = loc.clone().add(0, -1, 0).getBlock();
+                boolean obstructed = !feet.isPassable() || !head.isPassable();
+                boolean noGround;
+                try {
+                    noGround = !ground.getType().isSolid();
+                } catch (Exception e) {
+                    noGround = false;
+                }
+                if (obstructed || noGround) {
+                    String detail = obstructed ? "target block obstructed" : "no solid ground below";
+                    plugin.getLogger().warning("/setfirstspawn by " + player.getName() + ": location "
+                            + String.format("%.1f, %.1f, %.1f", loc.getX(), loc.getY(), loc.getZ())
+                            + " in '" + loc.getWorld().getName() + "' may be unsafe (" + detail + ") — players may suffocate or fall.");
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Warning: this first-spawn location may be unsafe (" + detail + "). Players may suffocate or fall — move to a safe spot and re-run to silence this warning."));
+                }
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to check spawn safety for /setfirstspawn: " + e.getMessage());
+            }
             saveToSpawnConfig(firstSpawnConfig, loc);
         } else {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Failed to set first spawn location!"));

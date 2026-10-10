@@ -76,9 +76,9 @@ public class TeleportListener implements Listener {
             checkAndCancel(event.getPlayer(), "move");
             return;
         }
-        if (from.distanceSquared(to) < 1e-6
-                && Float.compare(from.getYaw(), to.getYaw()) == 0
-                && Float.compare(from.getPitch(), to.getPitch()) == 0) return;
+        // Position-only epsilon: yaw/pitch-only movement (looking around)
+        // must never break the warmup — only a real position change does.
+        if (from.distanceSquared(to) <= 0.01) return;
 
         checkAndCancel(event.getPlayer(), "move");
     }
@@ -209,7 +209,7 @@ public class TeleportListener implements Listener {
      * cancel_on only gates move/damage/death/interact.
      */
     private void cancelWarmupsUnconditionally(Player p) {
-        cancelWarmupsUnconditionally(p, "move");
+        cancelWarmupsUnconditionally(p, "teleport");
     }
 
     private void cancelWarmupsUnconditionally(Player p, String flag) {
@@ -241,6 +241,10 @@ public class TeleportListener implements Listener {
             case "damage" -> "You took damage!";
             case "death" -> "You died!";
             case "interact" -> "You interacted!";
+            // External teleport / world change (cancelWarmupsUnconditionally):
+            // must not repeat the "Teleport cancelled: " prefix that
+            // TPAManager/RTPManager prepend — hence a short reason here.
+            case "teleport" -> "You teleported!";
             default -> "Teleport cancelled!";
         };
     }

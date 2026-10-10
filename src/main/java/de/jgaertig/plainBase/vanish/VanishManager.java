@@ -203,13 +203,26 @@ public class VanishManager {
      * applies self state — there is no window where the player is visible.
      */
     public void applyOnJoin(Player player) {
+        applyOnJoin(player, null);
+    }
+
+    /**
+     * P2 single-read join path: the listener already read the persisted flag
+     * (for join-message suppression) — pass it as {@code persistedVanishHint}
+     * so the file is not read twice per join. A null hint means "not
+     * pre-read": the pre-hide reads it itself. Never throws.
+     */
+    public void applyOnJoin(Player player, Boolean persistedVanishHint) {
         // Synchronous pre-hide: must happen before the join message is
         // broadcast (right after the event) and before any viewer can see
         // the joiner. Guarded so disk I/O only happens when persistence is on.
         try {
             FileConfiguration cfg = plugin.getVanishConfig();
-            if (cfg != null && cfg.getBoolean("vanish.persist-on-rejoin", true)
-                    && hasPersistedVanish(player.getUniqueId())) {
+            boolean persistOn = cfg != null && cfg.getBoolean("vanish.persist-on-rejoin", true);
+            boolean persisted = persistOn && (persistedVanishHint != null
+                    ? persistedVanishHint
+                    : hasPersistedVanish(player.getUniqueId()));
+            if (persisted) {
                 vanishedPlayers.add(player.getUniqueId());
                 for (Player viewer : Bukkit.getOnlinePlayers()) {
                     if (viewer.equals(player)) continue;
@@ -412,13 +425,23 @@ public class VanishManager {
      * longer vanished so players who never rejoin cannot leak memory.
      */
     public void flushSync() {
-        FileConfiguration vanishConfig;
+        FileConfiguration snapshot = null;
         try {
-            vanishConfig = plugin.getVanishConfig();
-        } catch (Exception e) {
-            return;
+            snapshot = plugin.getVanishConfig();
+        } catch (Exception ignored) {
         }
-        boolean persist = vanishConfig == null || vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
+        flushSync(snapshot);
+    }
+
+    /**
+     * Snapshot variant for the reload path: stopModules(false) schedules the
+     * flush async while configs.clear() runs immediately — the task must use
+     * the config captured BEFORE clear (a live lookup would see null and fall
+     * back to the wrong persist default). A null snapshot keeps the previous
+     * default (persist on). Never throws.
+     */
+    public void flushSync(FileConfiguration snapshot) {
+        boolean persist = snapshot == null || snapshot.getBoolean("vanish.persist-on-rejoin", true);
         for (UUID uuid : new java.util.HashSet<>(vanishedPlayers)) {
             if (uuid == null) continue;
             try {
@@ -730,6 +753,49 @@ public class VanishManager {
         }, null);
     }
 
+    /**
+     * P1 sync-first mirror of {@link #resetSelfState(Player)} for
+     * {@link #resetAll()}: EntityScheduler tasks scheduled during disable may
+     * be discarded, leaving stuck invisibility/collision behind. Every direct
+     * call may throw off the entity thread — on the first throw this returns
+     * false WITHOUT consuming the snapshot so the scheduled fallback still
+     * restores it. Returns true when fully applied (caller then skips the
+     * scheduled self-state fallback). Never throws.
+     */
+    private boolean tryResetSelfStateSync(Player player, FileConfiguration snapshot) {
+        try {
+            if (player == null || !player.isOnline()) return false;
+            UUID uuid;
+            try {
+                uuid = player.getUniqueId();
+            } catch (Exception e) {
+                return false;
+            }
+            PrevSelfState prev = prevSelfStates.get(uuid);
+            if (prev != null) {
+                player.setInvisible(prev.invisible());
+                player.setCollidable(prev.collidable());
+                player.setSilent(prev.silent());
+                prevSelfStates.remove(uuid, prev);
+                return true;
+            }
+            // No stored state: same generic fallback as resetSelfState(),
+            // config-gated (only reset what vanish would have applied).
+            // The caller iterates vanishedPlayers, so wasVanished holds.
+            FileConfiguration config = plugin.getVanishConfig();
+            if (config == null) config = snapshot;
+            boolean resetInvisible = config == null || config.getBoolean("vanish.invisible", true);
+            if (resetInvisible) player.setInvisible(false);
+            boolean resetCollision = config == null || config.getBoolean("vanish.no-collision", true);
+            boolean resetSilent = config == null || config.getBoolean("vanish.no-step-sound", true);
+            if (resetCollision) player.setCollidable(true);
+            if (resetSilent) player.setSilent(false);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void resetSelfState(Player player) {
         if (player == null || !player.isOnline()) return;
         UUID syncUuid;
@@ -821,12 +887,15 @@ public class VanishManager {
      */
     public void resetAll() {
         boolean persist;
+        FileConfiguration cfgSnapshot;
         try {
-            FileConfiguration cfg = plugin.getVanishConfig();
-            persist = cfg == null || cfg.getBoolean("vanish.persist-on-rejoin", true);
+            cfgSnapshot = plugin.getVanishConfig();
+            persist = cfgSnapshot == null || cfgSnapshot.getBoolean("vanish.persist-on-rejoin", true);
         } catch (Exception e) {
             persist = true;
+            cfgSnapshot = null;
         }
+        final FileConfiguration snapshot = cfgSnapshot;
         for (UUID uuid : new java.util.HashSet<>(vanishedPlayers)) {
             try {
                 if (!persist) {
@@ -843,13 +912,42 @@ public class VanishManager {
                 }
                 Player player = Bukkit.getPlayer(uuid);
                 if (player != null) {
-                    // BUG-1 order: resetSelfState before remove (see unvanish).
+                    // P1 sync-first: EntityScheduler tasks scheduled here may be
+                    // discarded on disable — attempt the direct reveal first
+                    // (best-effort, guarded), keep the scheduled variants as
+                    // fallback for cross-region viewers that reject direct calls.
+                    boolean restoredSync = false;
                     try {
-                        resetSelfState(player);
+                        restoredSync = tryResetSelfStateSync(player, snapshot);
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to sync-reset vanish state for " + uuid + ": " + e.getMessage());
+                    }
+                    // BUG-1 order: resetSelfState before remove (see unvanish).
+                    // Skipped when the sync path already restored a snapshot —
+                    // the fallback would find no snapshot and take the generic
+                    // path instead (same values when scheduler is alive, but
+                    // must not run when it already consumed the prev state).
+                    try {
+                        if (!restoredSync) resetSelfState(player);
                     } catch (Exception e) {
                         plugin.getLogger().fine("Failed to reset vanish state for " + uuid + ": " + e.getMessage());
                     }
                     vanishedPlayers.remove(uuid);
+                    try {
+                        for (Player viewer : Bukkit.getOnlinePlayers()) {
+                            if (viewer.equals(player)) continue;
+                            try {
+                                viewer.showEntity(plugin, player);
+                            } catch (Exception ignored) {
+                            }
+                            try {
+                                viewer.listPlayer(player);
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to sync-reveal vanished player " + uuid + ": " + e.getMessage());
+                    }
                     try {
                         for (Player viewer : Bukkit.getOnlinePlayers()) {
                             if (viewer.equals(player)) continue;

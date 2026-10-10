@@ -40,18 +40,25 @@ public class VanishListener implements Listener {
         // HIGHEST so this runs after MessagesListener and cannot be overwritten.
         // Null-guards first: manager, then config, then the (file-IO) check last
         // so no disk read happens when it is not needed.
+        // P2 single-read: the flag is read once here and passed as a hint to
+        // applyOnJoin() so the same file is not read twice per join.
+        Boolean persistedHint = null;
         try {
             if (vanishManager != null && config != null
-                    && config.getBoolean("vanish.hide-join-quit-messages", true)
-                    && vanishManager.hasPersistedVanish(player.getUniqueId())) {
-                event.joinMessage(null);
+                    && (config.getBoolean("vanish.hide-join-quit-messages", true)
+                        || config.getBoolean("vanish.persist-on-rejoin", true))) {
+                persistedHint = vanishManager.hasPersistedVanish(player.getUniqueId());
+                if (config.getBoolean("vanish.hide-join-quit-messages", true)
+                        && persistedHint) {
+                    event.joinMessage(null);
+                }
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to handle vanish join state for " + player.getName() + ": " + e.getMessage());
         }
 
         if (vanishManager != null) {
-            vanishManager.applyOnJoin(player);
+            vanishManager.applyOnJoin(player, persistedHint);
         }
     }
 

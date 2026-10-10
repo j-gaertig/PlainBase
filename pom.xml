@@ -56,10 +56,6 @@
                             <shadedPattern>de.jgaertig.plainBase.libs.hikari</shadedPattern>
                         </relocation>
                         <relocation>
-                            <pattern>org.sqlite</pattern>
-                            <shadedPattern>de.jgaertig.plainBase.libs.sqlite</shadedPattern>
-                        </relocation>
-                        <relocation>
                             <pattern>com.mysql</pattern>
                             <shadedPattern>de.jgaertig.plainBase.libs.mysql</shadedPattern>
                         </relocation>

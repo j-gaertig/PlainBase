@@ -613,9 +613,19 @@ public abstract class ModerationCommandBase {
      * target.getScheduler().run(plugin, t -> ..., null) pattern.
      */
     protected void kickSafely(Player target, Component message) {
-        target.getScheduler().run(plugin, t -> {
-            if (target.isOnline()) target.kick(message);
-        }, null);
+        try {
+            target.getScheduler().run(plugin, t -> {
+                try {
+                    if (target.isOnline()) target.kick(message);
+                } catch (RuntimeException e) {
+                    plugin.getLogger().warning("Could not kick player "
+                            + java.util.Objects.toString(target.getUniqueId(), "?") + ": " + e.getMessage());
+                }
+            }, null);
+        } catch (RuntimeException e) {
+            plugin.getLogger().warning("Could not schedule kick for player "
+                    + java.util.Objects.toString(target.getUniqueId(), "?") + ": " + e.getMessage());
+        }
     }
 
     protected void broadcast(String message) {

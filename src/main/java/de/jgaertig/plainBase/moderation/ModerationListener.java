@@ -37,7 +37,14 @@ public class ModerationListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPreLogin(AsyncPlayerPreLoginEvent event) {
-        if (!plugin.getConfig().getBoolean("modules.moderation", false)) return;
+        // This event runs OFF the main thread and the config object is
+        // reload-mutable — a concurrent /plainbase reload can throw here.
+        // Fail open (allow the login), never block all logins on a config race.
+        try {
+            if (!plugin.getConfig().getBoolean("modules.moderation", false)) return;
+        } catch (RuntimeException e) {
+            return;
+        }
 
         BanManager manager = plugin.getBanManager();
         if (manager == null) return;
@@ -85,11 +92,32 @@ public class ModerationListener implements Listener {
 
         // Snapshot every config value this check needs up front: a reload can
         // mutate the config mid-check (this event runs async), so locals keep
-        // one consistent decision instead of half-old/half-new behavior.
+        // one consistent decision instead of half-old/half-new behavior. The
+        // config object is never touched again below — message helpers take
+        // plain snapshot strings, so no FileConfiguration access ever happens
+        // off-thread past this point.
         // Separate guards: an IP ban must still be enforced when the UUID ban
         // is disabled (and vice versa) — never return early on one flag.
-        boolean banEnabled = modConfig.getBoolean("ban.enabled", true);
-        boolean ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
+        final boolean banEnabled;
+        final boolean ipBanEnabled;
+        final String banTemplate;
+        final String tempbanTemplate;
+        final String ipbanTemplate;
+        try {
+            banEnabled = modConfig.getBoolean("ban.enabled", true);
+            ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
+            banTemplate = Objects.toString(
+                    modConfig.getString("messages.ban-screen", "<red>You are banned."), "<red>You are banned.");
+            tempbanTemplate = Objects.toString(
+                    modConfig.getString("messages.tempban-screen", "<red>You are banned."), "<red>You are banned.");
+            ipbanTemplate = Objects.toString(
+                    modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
+                    "<red>Your IP address is banned.");
+        } catch (RuntimeException e) {
+            plugin.getLogger().warning("Could not read moderation config during pre-login for "
+                    + Objects.toString(event.getName(), "?") + " — allowing login (fail-open).");
+            return;
+        }
         if (!banEnabled && !ipBanEnabled) return;
 
         try {
@@ -101,7 +129,8 @@ public class ModerationListener implements Listener {
                     // stays — a builder bug can never let a banned player in.
                     event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, Component.text("You are banned."));
                     try {
-                        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, banKickMessage(ban, modConfig));
+                        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED,
+                                banKickMessage(ban, ban.isPermanent() ? banTemplate : tempbanTemplate));
                     } catch (RuntimeException e) {
                         plugin.getLogger().warning("Could not build ban screen, keeping fallback: " + e.getMessage());
                     }
@@ -114,7 +143,7 @@ public class ModerationListener implements Listener {
                 if (ipBan != null) {
                     event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, Component.text("Your IP address is banned."));
                     try {
-                        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, ipBanKickMessage(ipBan, modConfig));
+                        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, ipBanKickMessage(ipBan, ipbanTemplate));
                     } catch (RuntimeException e) {
                         plugin.getLogger().warning("Could not build IP-ban screen, keeping fallback: " + e.getMessage());
                     }
@@ -299,19 +328,15 @@ public class ModerationListener implements Listener {
         }
     }
 
-    private Component banKickMessage(BanRecord ban, FileConfiguration modConfig) {
-        // The config is passed in (it was already null-checked by the caller);
-        // a /plainbase reload racing the async pre-login event can still null
-        // it between check and use, so a null here falls back to a plain
-        // screen instead of NPE-ing. Fail-open keeps the login allowed only
-        // via onPreLogin's guard; here denial was already decided, so a
-        // fallback message is correct.
-        String template = modConfig == null ? "<red>You are banned." : Objects.toString(
-                modConfig.getString(
-                        ban.isPermanent() ? "messages.ban-screen" : "messages.tempban-screen",
-                        "<red>You are banned."),
-                "<red>You are banned.");
-        return renderBanScreen(ban, template);
+    /**
+     * Builds the ban screen from an already-snapshotted template (taken at the
+     * top of onPreLogin/onJoin): touches no config, so it is safe to call
+     * off-thread. A null template falls back to a plain screen instead of
+     * NPE-ing. Fail-open keeps the login allowed only via onPreLogin's guard;
+     * here denial was already decided, so a fallback message is correct.
+     */
+    private Component banKickMessage(BanRecord ban, String template) {
+        return renderBanScreen(ban, Objects.toString(template, "<red>You are banned."));
     }
 
     /**
@@ -334,11 +359,13 @@ public class ModerationListener implements Listener {
         return kickMessage(text);
     }
 
-    private Component ipBanKickMessage(IpBanRecord ban, FileConfiguration modConfig) {
-        String template = modConfig == null ? "<red>Your IP address is banned." : Objects.toString(
-                modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
-                "<red>Your IP address is banned.");
-        return renderIpBanScreen(ban, template);
+    /**
+     * Builds the IP-ban screen from an already-snapshotted template (taken at
+     * the top of onPreLogin/onJoin): touches no config, so it is safe to call
+     * off-thread.
+     */
+    private Component ipBanKickMessage(IpBanRecord ban, String template) {
+        return renderIpBanScreen(ban, Objects.toString(template, "<red>Your IP address is banned."));
     }
 
     /**

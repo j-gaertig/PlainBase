@@ -15,7 +15,15 @@ public class GlobalListener implements Listener {
 
     @EventHandler
     public void onAdminJoin(PlayerJoinEvent event) {
-        if (!event.getPlayer().hasPermission("plainbase.admin")) return;
+        // hasPermission may throw with a broken permissions setup — never let
+        // a version-hint listener break the join.
+        final boolean isAdmin;
+        try {
+            isAdmin = event.getPlayer().hasPermission("plainbase.admin");
+        } catch (Exception e) {
+            return;
+        }
+        if (!isAdmin) return;
 
         // String comparison (mirrors PlainBase.compareVersions semantics): a
         // double comparison would treat 1.10 as equal to 1.1, and even

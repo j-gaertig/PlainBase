@@ -13,18 +13,18 @@ tpa:
       - death
       - interact
   commands:
-      tpa:
-        enabled: true
-      tpahere:
-        enabled: true
-      tpaccept:
-        enabled: true
-      tpdeny:
-        enabled: true
-      tpauto:
-        enabled: true
-      tpacancel:
-        enabled: true
+    tpa:
+      enabled: true
+    tpahere:
+      enabled: true
+    tpaccept:
+      enabled: true
+    tpdeny:
+      enabled: true
+    tpauto:
+      enabled: true
+    tpacancel:
+      enabled: true
 
 rtp:
   enabled: true
@@ -74,8 +74,8 @@ rtp:
       - POINTED_DRIPSTONE
 
   commands:
-      rtp:
-        enabled: true
+    rtp:
+      enabled: true
 
 # DO NOT EDIT BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
 version: "1.0"
