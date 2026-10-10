@@ -65,6 +65,28 @@ public class SetSpawn implements BasicCommand {
         }
 
         if (!(loc == null)) {
+            if (!Double.isFinite(loc.getX()) || !Double.isFinite(loc.getY()) || !Double.isFinite(loc.getZ())) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Invalid coordinates!"));
+                return;
+            }
+            if (loc.getWorld() == null) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Failed to set spawn location!"));
+                return;
+            }
+            try {
+                var border = loc.getWorld().getWorldBorder();
+                double centerX = border.getCenter().getX();
+                double centerZ = border.getCenter().getZ();
+                double half = border.getSize() / 2.0;
+                if (!Double.isFinite(centerX) || !Double.isFinite(centerZ) || !Double.isFinite(half)
+                        || Math.abs(loc.getX() - centerX) > half
+                        || Math.abs(loc.getZ() - centerZ) > half) {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Location is outside the world border!"));
+                    return;
+                }
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to check world border for /setspawn: " + e.getMessage());
+            }
             saveToSpawnConfig(loc);
         } else {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Failed to set spawn location!"));
@@ -82,13 +104,16 @@ public class SetSpawn implements BasicCommand {
 
     private void saveToSpawnConfig(Location loc) {
         var config = plugin.getSpawnConfig();
-        config.set("spawn.location.world", loc.getWorld().getName());
-        config.set("spawn.location.x", loc.getX());
-        config.set("spawn.location.y", loc.getY());
-        config.set("spawn.location.z", loc.getZ());
-        config.set("spawn.location.yaw", (double) loc.getYaw());
-        config.set("spawn.location.pitch", (double) loc.getPitch());
-        config.set("spawn.enabled", true);
+        if (config == null) return;
+        synchronized (config) {
+            config.set("spawn.location.world", loc.getWorld().getName());
+            config.set("spawn.location.x", loc.getX());
+            config.set("spawn.location.y", loc.getY());
+            config.set("spawn.location.z", loc.getZ());
+            config.set("spawn.location.yaw", (double) loc.getYaw());
+            config.set("spawn.location.pitch", (double) loc.getPitch());
+            config.set("spawn.enabled", true);
+        }
         plugin.saveSpawnConfigAsync();
     }
 }

@@ -34,10 +34,13 @@ public final class DurationParser {
 
         while (matcher.find()) {
             matchedChars += matcher.group().length();
-            long amount = Long.parseLong(matcher.group(1));
+            String amountStr = matcher.group(1);
             String unit = matcher.group(2).toLowerCase(Locale.ROOT);
             try {
+                long amount = Long.parseLong(amountStr);
                 totalMillis = Math.addExact(totalMillis, Math.multiplyExact(amount, unitMillis(unit)));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Duration too large: " + input, e);
             } catch (ArithmeticException e) {
                 throw new IllegalArgumentException("Duration too large: " + input);
             }

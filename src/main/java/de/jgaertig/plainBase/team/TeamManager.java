@@ -56,7 +56,11 @@ public class TeamManager {
     }
 
     private final PlainBase plugin;
-    private final Map<String, TeamDefinition> teams = new LinkedHashMap<>();
+    // Copy-on-write snapshot, replaced wholesale by loadTeamDefinitions(): concurrent
+    // readers (commands, placeholders, scoreboard sync on other threads) only ever see
+    // the old or the new complete map, never a half-cleared one. Reads need no lock;
+    // the published map itself is never mutated in place.
+    private volatile Map<String, TeamDefinition> teams = Map.of();
 
     // teamId -> (uuid -> role)
     private final Map<String, Map<UUID, Role>> memberships = new ConcurrentHashMap<>();
@@ -64,7 +68,13 @@ public class TeamManager {
     private final Map<UUID, Set<String>> invites = new ConcurrentHashMap<>();
     // teamId -> pending join-request uuids
     private final Map<String, Set<UUID>> requests = new ConcurrentHashMap<>();
-    // uuid -> the team currently mirrored on the vanilla scoreboard (see class javadoc)
+    // uuid -> the team currently mirrored on the vanilla scoreboard (see class javadoc).
+    // NOTE (audit V21/V22, documented as open, not changed): entries are kept
+    // across quit on purpose (offline targeting, relog resync via
+    // resyncScoreboard) and no quit hook is wired — one small entry per ever
+    // mirrored player stays in memory. Dropping the entry on quit without a
+    // matching scoreboard-entry removal would desync the mirror, so any
+    // cleanup needs the listener change owned elsewhere.
     private final Map<UUID, String> scoreboardTeamOf = new ConcurrentHashMap<>();
 
     // Scoreboard teams created by THIS manager instance (vanilla names "pb_<id>").
@@ -146,12 +156,14 @@ public class TeamManager {
     // ---------------------------------------------------------------
 
     private void loadTeamDefinitions() {
-        teams.clear();
         FileConfiguration config = plugin.getTeamConfig();
         if (config == null) return;
         ConfigurationSection section = config.getConfigurationSection("teams");
         if (section == null) return;
 
+        // Built locally, then published atomically (see teams field): readers
+        // never observe the intermediate cleared/half-filled state.
+        Map<String, TeamDefinition> fresh = new LinkedHashMap<>();
         for (String rawId : section.getKeys(false)) {
             try {
                 String id = rawId.toLowerCase(Locale.ROOT);
@@ -168,13 +180,14 @@ public class TeamManager {
                 String displayName = section.getString(rawId + ".display-name", id);
                 String color = section.getString(rawId + ".color", "<white>");
                 NamedTextColor vanillaColor = resolveVanillaColor(color);
-                teams.put(id, new TeamDefinition(id, displayName, color, vanillaColor));
+                fresh.put(id, new TeamDefinition(id, displayName, color, vanillaColor));
             } catch (Exception e) {
                 // One broken definition must never abort the whole parse —
                 // skip it loudly, keep the remaining teams.
                 plugin.getLogger().warning("Team '" + rawId + "' skipped: could not parse definition (" + e.getMessage() + ").");
             }
         }
+        teams = Collections.unmodifiableMap(fresh);
     }
 
     private NamedTextColor resolveVanillaColor(String miniMessageColor) {
@@ -204,8 +217,12 @@ public class TeamManager {
         return teams.get(id.toLowerCase(Locale.ROOT));
     }
 
+    /**
+     * Snapshot copy — callers can never mutate live state, and iteration stays
+     * safe against a concurrent reload replacing the definitions map.
+     */
     public Collection<TeamDefinition> getTeams() {
-        return teams.values();
+        return List.copyOf(teams.values());
     }
 
     public int getMaxTeamsPerPlayer() {
@@ -539,7 +556,7 @@ public class TeamManager {
     public void listTeams(CommandSender sender) {
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         sender.sendMessage(msg(cfgSnapshot, "list-header"));
-        for (TeamDefinition def : teams.values()) {
+        for (TeamDefinition def : getTeams()) {
             int count = getMembers(def.id()).size();
             String fallback = "%team-display% (%count% members)";
             String displayLegacy = cfgSnapshot != null ? cfgSnapshot.getString("messages.list-entry", fallback) : fallback;
@@ -932,46 +949,59 @@ public class TeamManager {
     }
 
     private void loadState() {
-        memberships.clear();
-        FileConfiguration members = YamlConfiguration.loadConfiguration(dataFile("members.yml"));
-        for (String teamId : members.getKeys(false)) {
-            ConfigurationSection section = members.getConfigurationSection(teamId);
-            if (section == null) continue;
-            Map<UUID, Role> map = new ConcurrentHashMap<>();
-            for (String uuidStr : section.getKeys(false)) {
-                try {
-                    map.put(UUID.fromString(uuidStr), Role.valueOf(section.getString(uuidStr, "MEMBER")));
-                } catch (IllegalArgumentException ignored) {
+        // Serialized against every manager instance's async save*Sync() via the
+        // same static per-file locks: a reload must never repopulate the maps
+        // while another instance's save task is snapshotting them (or vice
+        // versa), which could otherwise persist or load a torn mix of old and
+        // new state across a /plainbase reload. (Does not drain already-queued
+        // async saves of a previous instance — those snapshot that instance's
+        // own maps, so they can only rewrite data that instance already held.)
+        synchronized (MEMBERS_LOCK) {
+            memberships.clear();
+            FileConfiguration members = YamlConfiguration.loadConfiguration(dataFile("members.yml"));
+            for (String teamId : members.getKeys(false)) {
+                ConfigurationSection section = members.getConfigurationSection(teamId);
+                if (section == null) continue;
+                Map<UUID, Role> map = new ConcurrentHashMap<>();
+                for (String uuidStr : section.getKeys(false)) {
+                    try {
+                        map.put(UUID.fromString(uuidStr), Role.valueOf(section.getString(uuidStr, "MEMBER")));
+                    } catch (IllegalArgumentException ignored) {
+                    }
                 }
-            }
-            memberships.put(teamId.toLowerCase(Locale.ROOT), map);
-        }
-
-        invites.clear();
-        FileConfiguration invitesConfig = YamlConfiguration.loadConfiguration(dataFile("invites.yml"));
-        for (String uuidStr : invitesConfig.getKeys(false)) {
-            try {
-                UUID uuid = UUID.fromString(uuidStr);
-                Set<String> set = ConcurrentHashMap.newKeySet();
-                for (String team : invitesConfig.getStringList(uuidStr)) {
-                    set.add(team.toLowerCase(Locale.ROOT));
-                }
-                if (!set.isEmpty()) invites.put(uuid, set);
-            } catch (IllegalArgumentException ignored) {
+                memberships.put(teamId.toLowerCase(Locale.ROOT), map);
             }
         }
 
-        requests.clear();
-        FileConfiguration requestsConfig = YamlConfiguration.loadConfiguration(dataFile("requests.yml"));
-        for (String teamId : requestsConfig.getKeys(false)) {
-            Set<UUID> set = ConcurrentHashMap.newKeySet();
-            for (String uuidStr : requestsConfig.getStringList(teamId)) {
+        synchronized (INVITES_LOCK) {
+            invites.clear();
+            FileConfiguration invitesConfig = YamlConfiguration.loadConfiguration(dataFile("invites.yml"));
+            for (String uuidStr : invitesConfig.getKeys(false)) {
                 try {
-                    set.add(UUID.fromString(uuidStr));
+                    UUID uuid = UUID.fromString(uuidStr);
+                    Set<String> set = ConcurrentHashMap.newKeySet();
+                    for (String team : invitesConfig.getStringList(uuidStr)) {
+                        set.add(team.toLowerCase(Locale.ROOT));
+                    }
+                    if (!set.isEmpty()) invites.put(uuid, set);
                 } catch (IllegalArgumentException ignored) {
                 }
             }
-            requests.put(teamId.toLowerCase(Locale.ROOT), set);
+        }
+
+        synchronized (REQUESTS_LOCK) {
+            requests.clear();
+            FileConfiguration requestsConfig = YamlConfiguration.loadConfiguration(dataFile("requests.yml"));
+            for (String teamId : requestsConfig.getKeys(false)) {
+                Set<UUID> set = ConcurrentHashMap.newKeySet();
+                for (String uuidStr : requestsConfig.getStringList(teamId)) {
+                    try {
+                        set.add(UUID.fromString(uuidStr));
+                    } catch (IllegalArgumentException ignored) {
+                    }
+                }
+                requests.put(teamId.toLowerCase(Locale.ROOT), set);
+            }
         }
     }
 

@@ -29,7 +29,7 @@ public class MenuManager {
                                  Material fillMaterial, Map<Integer, ItemDefinition> items) {
 
         public Component buildTitle(PlainBase plugin, Player viewer) {
-            String raw = title != null ? plugin.applyPlaceholders(viewer, title) : name;
+            String raw = title != null ? MenuManager.applyPlaceholdersSafe(plugin, viewer, title) : name;
             if (raw == null) raw = name != null ? name : "";
             try {
                 return plugin.getMiniMessage().deserialize(raw);
@@ -236,7 +236,7 @@ public class MenuManager {
         if (meta == null) return item;
 
         if (def.name() != null && !def.name().isEmpty()) {
-            String rawName = plugin.applyPlaceholders(viewer, def.name());
+            String rawName = applyPlaceholdersSafe(plugin, viewer, def.name());
             if (rawName == null) rawName = "";
             try {
                 meta.displayName(plugin.getMiniMessage().deserialize(rawName));
@@ -250,7 +250,7 @@ public class MenuManager {
         if (def.lore() != null) {
             for (String line : def.lore()) {
                 if (line == null) continue;
-                String raw = plugin.applyPlaceholders(viewer, line);
+                String raw = applyPlaceholdersSafe(plugin, viewer, line);
                 if (raw == null) raw = "";
                 try {
                     lore.add(plugin.getMiniMessage().deserialize(raw));
@@ -266,6 +266,22 @@ public class MenuManager {
         return item;
     }
 
+    /**
+     * Placeholder expansion safe for MiniMessage (same pattern as
+     * TeamManager#msg): the viewer's own name is substituted escaped BEFORE
+     * PlaceholderAPI runs, so a name containing MiniMessage tags can never
+     * inject formatting or click events into titles, names, lore or messages.
+     * The admin-authored template itself stays raw on purpose (MiniMessage by
+     * design). Package-private for MenuListener (same package, no new API).
+     */
+    static String applyPlaceholdersSafe(PlainBase plugin, Player viewer, String template) {
+        if (template == null) return null;
+        String pre = viewer != null
+                ? template.replace("%player%", plugin.getMiniMessage().escapeTags(viewer.getName()))
+                : template;
+        return plugin.applyPlaceholders(viewer, pre);
+    }
+
     public void createMenu(String name) {
         FileConfiguration config = plugin.getMenuConfig();
         if (config == null) {
@@ -273,7 +289,10 @@ public class MenuManager {
             return;
         }
         String path = "menus." + name;
-        config.set(path + ".title", "<gray>" + name);
+        // The name is player-typed (/menu new) and lands inside a MiniMessage
+        // template — escape it so tags in the name cannot inject formatting or
+        // click events into the stored title (same pattern as TeamManager#msg).
+        config.set(path + ".title", "<gray>" + plugin.getMiniMessage().escapeTags(name));
         config.set(path + ".size", 27);
         config.set(path + ".items", null);
         // Async persist: the in-memory config is already updated, so the

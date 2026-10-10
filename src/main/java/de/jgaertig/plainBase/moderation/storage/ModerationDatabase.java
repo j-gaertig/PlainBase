@@ -54,8 +54,20 @@ public class ModerationDatabase {
             int port = plugin.getModerationConfig().getInt("storage.mysql.port", 3306);
             String database = plugin.getModerationConfig().getString("storage.mysql.database", "plainbase");
             boolean useSsl = plugin.getModerationConfig().getBoolean("storage.mysql.useSSL", false);
+            if (host == null || !(host.matches("[A-Za-z0-9._-]+") || host.matches("\\[[0-9a-fA-F:.]+\\]"))) {
+                plugin.getLogger().warning("Invalid storage.mysql.host '" + host + "', falling back to localhost");
+                host = "localhost";
+            }
+            if (database == null || !database.matches("[A-Za-z0-9_$]+")) {
+                plugin.getLogger().warning("Invalid storage.mysql.database '" + database + "', falling back to plainbase");
+                database = "plainbase";
+            }
+            if (port < 1 || port > 65535) {
+                plugin.getLogger().warning("Invalid storage.mysql.port '" + port + "', falling back to 3306");
+                port = 3306;
+            }
             config.setJdbcUrl("jdbc:mysql://" + host + ":" + port + "/" + database
-                    + "?useSSL=" + useSsl + "&characterEncoding=utf8&autoReconnect=true"
+                    + "?useSSL=" + useSsl + "&characterEncoding=utf8"
                     + "&connectTimeout=5000&socketTimeout=10000");
             config.setUsername(plugin.getModerationConfig().getString("storage.mysql.username", "root"));
             config.setPassword(plugin.getModerationConfig().getString("storage.mysql.password", ""));
@@ -85,6 +97,14 @@ public class ModerationDatabase {
         config.setConnectionTimeout(5000);
         config.setValidationTimeout(3000);
         config.setInitializationFailTimeout(5000);
+        // Pool hardening: recycle connections before typical MySQL wait_timeout
+        // (8h) / NAT timeouts, probe idle ones, cap idle retention.
+        config.setMaxLifetime(280000);
+        config.setKeepaliveTime(30000);
+        config.setIdleTimeout(60000);
+        config.addDataSourceProperty("cachePrepStmts", "true");
+        config.addDataSourceProperty("prepStmtCacheSize", "250");
+        config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
         dataSource = new HikariDataSource(config);
 
         try {
@@ -133,29 +153,36 @@ public class ModerationDatabase {
         String p = prefix();
         String autoInc = mysql ? "INT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
         String varchar = mysql ? "VARCHAR(255)" : "TEXT";
+        // UUID columns: fixed CHAR(36) ascii_bin on fresh MySQL installs so
+        // UUID lookups compare case-sensitively and stay index-friendly.
+        // (CREATE TABLE IF NOT EXISTS never alters existing tables — no
+        // migration, no schema break for current installs.)
+        String uuidCol = mysql ? "CHAR(36) CHARACTER SET ascii COLLATE ascii_bin" : "TEXT";
 
         try (Statement st = conn.createStatement()) {
             st.executeUpdate("CREATE TABLE IF NOT EXISTS " + p + "bans (" +
                     "id " + autoInc + ", " +
-                    "uuid " + varchar + " NOT NULL, " +
+                    "uuid " + uuidCol + " NOT NULL, " +
                     "name " + varchar + ", " +
                     "reason " + varchar + ", " +
-                    "staff_uuid " + varchar + ", " +
+                    "staff_uuid " + uuidCol + ", " +
                     "staff_name " + varchar + ", " +
                     "banned_at BIGINT NOT NULL, " +
                     "duration BIGINT NOT NULL, " +
                     "revoked BOOLEAN NOT NULL DEFAULT 0, " +
-                    "unbanned_by_uuid " + varchar + ", " +
+                    "unbanned_by_uuid " + uuidCol + ", " +
                     "unbanned_by_name " + varchar + ", " +
                     "unbanned_at BIGINT NOT NULL DEFAULT 0)");
             createIndexIfMissing(st, p + "bans_uuid_idx", p + "bans", "uuid");
+            createIndexIfMissing(st, p + "bans_uuid_revoked_at_idx", p + "bans", "uuid, revoked, banned_at");
+            createPartialUniqueIndex(st, p + "bans_uuid_active_uidx", p + "bans", "uuid");
 
             st.executeUpdate("CREATE TABLE IF NOT EXISTS " + p + "kicks (" +
                     "id " + autoInc + ", " +
-                    "uuid " + varchar + " NOT NULL, " +
+                    "uuid " + uuidCol + " NOT NULL, " +
                     "name " + varchar + ", " +
                     "reason " + varchar + ", " +
-                    "staff_uuid " + varchar + ", " +
+                    "staff_uuid " + uuidCol + ", " +
                     "staff_name " + varchar + ", " +
                     "kicked_at BIGINT NOT NULL)");
             createIndexIfMissing(st, p + "kicks_uuid_idx", p + "kicks", "uuid");
@@ -164,22 +191,47 @@ public class ModerationDatabase {
                     "id " + autoInc + ", " +
                     "ip " + varchar + " NOT NULL, " +
                     "reason " + varchar + ", " +
-                    "staff_uuid " + varchar + ", " +
+                    "staff_uuid " + uuidCol + ", " +
                     "staff_name " + varchar + ", " +
                     "banned_at BIGINT NOT NULL, " +
                     "duration BIGINT NOT NULL, " +
                     "revoked BOOLEAN NOT NULL DEFAULT 0, " +
-                    "unbanned_by_uuid " + varchar + ", " +
+                    "unbanned_by_uuid " + uuidCol + ", " +
                     "unbanned_by_name " + varchar + ", " +
                     "unbanned_at BIGINT NOT NULL DEFAULT 0)");
             createIndexIfMissing(st, p + "ip_bans_ip_idx", p + "ip_bans", "ip");
+            createIndexIfMissing(st, p + "ip_bans_ip_revoked_at_idx", p + "ip_bans", "ip, revoked, banned_at");
+            createPartialUniqueIndex(st, p + "ip_bans_ip_active_uidx", p + "ip_bans", "ip");
 
             st.executeUpdate("CREATE TABLE IF NOT EXISTS " + p + "player_ips (" +
-                    "uuid " + varchar + " NOT NULL, " +
+                    "uuid " + uuidCol + " NOT NULL, " +
                     "name " + varchar + ", " +
                     "last_ip " + varchar + ", " +
                     "last_seen BIGINT NOT NULL, " +
                     "PRIMARY KEY (uuid))");
+            createIndexIfMissing(st, p + "player_ips_name_idx", p + "player_ips", "name");
+        }
+    }
+
+    /**
+     * Partial uniqueness: at most one unrevoked row per uuid/ip. SQLite
+     * supports partial indexes natively; MySQL has no partial-index support
+     * (portably), so there this is best-effort only — the application-level
+     * live check inside BanManager's mutationLock plus revoke-by-key (row
+     * count decides success) prevent duplicates on a single server, while a
+     * genuinely simultaneous cross-server race on shared MySQL stays
+     * last-write-wins (documented limitation; a SELECT ... FOR UPDATE
+     * transaction around check-then-insert would be the full fix and is left
+     * out deliberately to avoid a schema/locking behaviour change here).
+     */
+    private void createPartialUniqueIndex(Statement st, String indexName, String table, String column) {
+        if (mysql) return; // no partial-index support — best-effort no-op (see javadoc)
+        try {
+            st.executeUpdate("CREATE UNIQUE INDEX IF NOT EXISTS " + indexName + " ON " + table + "(" + column + ") WHERE revoked = 0");
+        } catch (SQLException e) {
+            // Pre-existing duplicate active rows (legacy data) would violate
+            // the index — never break setup over it, just log loudly.
+            plugin.getLogger().warning("Could not create partial unique index " + indexName + ": " + e.getMessage());
         }
     }
 
@@ -207,13 +259,13 @@ public class ModerationDatabase {
     public BanRecord insertBan(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long duration) throws SQLException {
         long bannedAt = System.currentTimeMillis();
         String sql = "INSERT INTO " + prefix() + "bans (uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', '', 0)";
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, uuid.toString());
+            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, name);
             ps.setString(3, reason);
-            ps.setString(4, staffUuid == null ? "" : staffUuid.toString());
+            ps.setString(4, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(5, staffName);
             ps.setLong(6, bannedAt);
             ps.setLong(7, duration);
@@ -222,18 +274,29 @@ public class ModerationDatabase {
             try (ResultSet keys = ps.getGeneratedKeys()) {
                 id = keys.next() ? keys.getInt(1) : -1;
             }
-            return new BanRecord(id, uuid, name, reason, staffUuid, staffName, bannedAt, duration, false, null, "", 0L);
+            return new BanRecord(id, uuid, name, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
         }
     }
 
-    public void revokeBan(int id, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
-        String sql = "UPDATE " + prefix() + "bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE id = ?";
+    /**
+     * Revokes ALL unrevoked rows for the uuid (not just one id) so legacy
+     * duplicate active rows can never survive an /unban.
+     * <p>
+     * MySQL note: without partial-unique-index support this check-then-act
+     * is best-effort under a genuinely simultaneous cross-server race
+     * (single-server callers serialize via BanManager's mutationLock); a
+     * {@code SELECT ... FOR UPDATE} transaction would be the full fix.
+     *
+     * @return number of rows revoked; unban success is decided on this count
+     */
+    public int revokeBan(UUID uuid, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        String sql = "UPDATE " + prefix() + "bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE uuid = ? AND revoked = 0";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, staffUuid == null ? "" : staffUuid.toString());
+            ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, staffName);
             ps.setLong(3, unbannedAt);
-            ps.setInt(4, id);
-            ps.executeUpdate();
+            ps.setString(4, uuid.toString().toLowerCase(java.util.Locale.ROOT));
+            return ps.executeUpdate();
         }
     }
 
@@ -242,10 +305,10 @@ public class ModerationDatabase {
         String sql = "INSERT INTO " + prefix() + "kicks (uuid, name, reason, staff_uuid, staff_name, kicked_at) VALUES (?, ?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, uuid.toString());
+            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, name);
             ps.setString(3, reason);
-            ps.setString(4, staffUuid == null ? "" : staffUuid.toString());
+            ps.setString(4, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(5, staffName);
             ps.setLong(6, kickedAt);
             ps.executeUpdate();
@@ -260,12 +323,12 @@ public class ModerationDatabase {
     public IpBanRecord insertIpBan(String ip, String reason, UUID staffUuid, String staffName, long duration) throws SQLException {
         long bannedAt = System.currentTimeMillis();
         String sql = "INSERT INTO " + prefix() + "ip_bans (ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
-                "VALUES (?, ?, ?, ?, ?, ?, 0, '', '', 0)";
+                "VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
             ps.setString(1, ip);
             ps.setString(2, reason);
-            ps.setString(3, staffUuid == null ? "" : staffUuid.toString());
+            ps.setString(3, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(4, staffName);
             ps.setLong(5, bannedAt);
             ps.setLong(6, duration);
@@ -274,18 +337,25 @@ public class ModerationDatabase {
             try (ResultSet keys = ps.getGeneratedKeys()) {
                 id = keys.next() ? keys.getInt(1) : -1;
             }
-            return new IpBanRecord(id, ip, reason, staffUuid, staffName, bannedAt, duration, false, null, "", 0L);
+            return new IpBanRecord(id, ip, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
         }
     }
 
-    public void revokeIpBan(int id, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
-        String sql = "UPDATE " + prefix() + "ip_bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE id = ?";
+    /**
+     * Revokes ALL unrevoked rows for the IP (not just one id); success is
+     * decided on the returned row count. MySQL cross-server race caveat: see
+     * {@link #revokeBan}.
+     *
+     * @return number of rows revoked
+     */
+    public int revokeIpBan(String ip, UUID staffUuid, String staffName, long unbannedAt) throws SQLException {
+        String sql = "UPDATE " + prefix() + "ip_bans SET revoked = 1, unbanned_by_uuid = ?, unbanned_by_name = ?, unbanned_at = ? WHERE ip = ? AND revoked = 0";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, staffUuid == null ? "" : staffUuid.toString());
+            ps.setString(1, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, staffName);
             ps.setLong(3, unbannedAt);
-            ps.setInt(4, id);
-            ps.executeUpdate();
+            ps.setString(4, ip);
+            return ps.executeUpdate();
         }
     }
 
@@ -297,7 +367,7 @@ public class ModerationDatabase {
                   "ON CONFLICT(uuid) DO UPDATE SET name = ?, last_ip = ?, last_seen = ?";
         long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
+            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setString(2, name);
             ps.setString(3, ip);
             ps.setLong(4, now);
@@ -385,10 +455,13 @@ public class ModerationDatabase {
      * enforced immediately on THIS server's very next login attempt.
      */
     public BanRecord findActiveBan(UUID uuid, long now) throws SQLException {
+        // Overflow-free expiry check: (? - banned_at < duration) never adds
+        // two large longs (banned_at + duration could wrap for huge tempbans).
+        // LOWER() on both sides keeps legacy mixed-case UUID rows readable.
         String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at " +
-                "FROM " + prefix() + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR banned_at + duration > ?) ORDER BY banned_at DESC LIMIT 1";
+                "FROM " + prefix() + "bans WHERE LOWER(uuid) = LOWER(?) AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 1";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
+            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setLong(2, now);
             try (ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? mapBan(rs) : null;
@@ -397,8 +470,9 @@ public class ModerationDatabase {
     }
 
     public IpBanRecord findActiveIpBan(String ip, long now) throws SQLException {
+        // Overflow-free expiry check (same reasoning as findActiveBan).
         String sql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at " +
-                "FROM " + prefix() + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR banned_at + duration > ?) ORDER BY banned_at DESC LIMIT 1";
+                "FROM " + prefix() + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 1";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, ip);
             ps.setLong(2, now);

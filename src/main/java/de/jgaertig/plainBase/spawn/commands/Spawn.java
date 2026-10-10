@@ -80,16 +80,43 @@ public class Spawn implements BasicCommand {
             return;
         }
 
-        Location loc = new Location(
-                world,
-                config.getDouble(path + ".x"),
-                config.getDouble(path + ".y"),
-                config.getDouble(path + ".z"),
-                (float) config.getDouble(path + ".yaw"),
-                (float) config.getDouble(path + ".pitch")
-        );
+        double rawX = config.getDouble(path + ".x");
+        double rawY = config.getDouble(path + ".y");
+        double rawZ = config.getDouble(path + ".z");
+        if (!Double.isFinite(rawX) || !Double.isFinite(rawY) || !Double.isFinite(rawZ)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is not set correctly. Contact an admin."));
+            plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": non-finite coordinates in spawn.yml!");
+            return;
+        }
+        double rawYaw = config.getDouble(path + ".yaw");
+        double rawPitch = config.getDouble(path + ".pitch");
+        float yaw = Double.isFinite(rawYaw) ? (float) rawYaw : 0f;
+        float pitch = Double.isFinite(rawPitch) ? (float) rawPitch : 0f;
 
-        player.teleportAsync(loc);
+        Location loc;
+        if (rawY < world.getMinHeight() || rawY >= world.getMaxHeight()) {
+            plugin.getLogger().warning("Spawn teleport for " + player.getName() + ": Y=" + rawY
+                    + " out of bounds [" + world.getMinHeight() + "," + world.getMaxHeight()
+                    + "), falling back to world spawn.");
+            loc = world.getSpawnLocation().clone();
+        } else {
+            loc = new Location(world, rawX, rawY, rawZ, yaw, pitch);
+        }
+
+        player.teleportAsync(loc).thenAccept(success -> {
+            if (!player.isOnline()) {
+                return;
+            }
+            try {
+                if (Boolean.TRUE.equals(success)) {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleported to spawn!"));
+                } else {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
+                }
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to notify " + player.getName() + " about spawn teleport: " + e.getMessage());
+            }
+        });
 
     }
 }

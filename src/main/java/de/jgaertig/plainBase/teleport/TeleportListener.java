@@ -17,6 +17,16 @@ import java.util.List;
 public class TeleportListener implements Listener {
     private final PlainBase plugin;
 
+    // Cached cancel_on lists: PlayerMoveEvent fires very frequently, and each
+    // checkAndCancel() previously re-parsed both lists from teleport.yml on
+    // every event. The cache is keyed by config instance identity — PlainBase
+    // swaps in a new FileConfiguration object on every reload (configs map
+    // clear + put, teleport.yml is never mutated in place), so a fresh read
+    // happens automatically after reload: no stale state, no behaviour change.
+    private volatile org.bukkit.configuration.file.FileConfiguration cachedConfig;
+    private volatile List<String> cachedTpaCancelOn = List.of();
+    private volatile List<String> cachedRtpCancelOn = List.of();
+
     public TeleportListener(PlainBase plugin) {
         this.plugin = plugin;
     }
@@ -97,13 +107,21 @@ public class TeleportListener implements Listener {
     private void checkAndCancel(Player p, String flag) {
         if (p == null) return;
         try {
-            List<String> tpaCancelFlags = plugin.getTeleportConfig().getStringList("tpa.counter.cancel_on");
-            if (tpaCancelFlags.contains(flag) && plugin.getTPAManager() != null) {
+            org.bukkit.configuration.file.FileConfiguration cfg = plugin.getTeleportConfig();
+            // Transient null mid-reload (configs cleared, not yet re-put):
+            // nothing to check against, same as the old NPE-caught path.
+            if (cfg == null) return;
+            if (cfg != cachedConfig) {
+                cachedTpaCancelOn = List.copyOf(cfg.getStringList("tpa.counter.cancel_on"));
+                cachedRtpCancelOn = List.copyOf(cfg.getStringList("rtp.counter.cancel_on"));
+                cachedConfig = cfg;
+            }
+
+            if (cachedTpaCancelOn.contains(flag) && plugin.getTPAManager() != null) {
                 plugin.getTPAManager().cancelWarmup(p, generateReason(flag));
             }
 
-            List<String> rtpCancelFlags = plugin.getTeleportConfig().getStringList("rtp.counter.cancel_on");
-            if (rtpCancelFlags.contains(flag) && plugin.getRTPManager() != null) {
+            if (cachedRtpCancelOn.contains(flag) && plugin.getRTPManager() != null) {
                 plugin.getRTPManager().cancelWarmup(p, generateReason(flag));
             }
         } catch (Exception e) {

@@ -32,7 +32,11 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
         int page = 1;
         if (args.length >= 1) {
             try {
-                page = Math.max(1, Integer.parseInt(args[0]));
+                long parsed = Long.parseLong(args[0]);
+                // Clamp to a sane range: prevents int overflow in
+                // (page - 1) * PAGE_SIZE for absurd inputs like 9999999999.
+                parsed = Math.min(10000L, Math.max(1L, parsed));
+                page = (int) parsed;
             } catch (NumberFormatException e) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize("<red>'" + esc(args[0]) + "' is not a valid page number — showing page 1."));
             }
@@ -44,8 +48,9 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
         if (active.isEmpty()) {
             sender.sendMessage(plugin.getMiniMessage().deserialize(message("banlist-empty", "<gray>There are currently no active bans.")));
         } else {
-            int from = (page - 1) * PAGE_SIZE;
-            if (from < active.size()) {
+            long fromLong = ((long) page - 1L) * (long) PAGE_SIZE;
+            int from = (int) Math.min(fromLong, Integer.MAX_VALUE);
+            if (fromLong < active.size()) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("banlist-header", "<gray>--- Active bans (%count%) ---").replace("%count%", String.valueOf(active.size()))));
 
@@ -66,8 +71,9 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
 
         List<IpBanRecord> activeIps = plugin.getBanManager().getActiveIpBans();
         if (!activeIps.isEmpty()) {
-            int from = (page - 1) * PAGE_SIZE;
-            if (from < activeIps.size()) {
+            long fromLong = ((long) page - 1L) * (long) PAGE_SIZE;
+            int from = (int) Math.min(fromLong, Integer.MAX_VALUE);
+            if (fromLong < activeIps.size()) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("banlist-ip-header", "<gray>--- Active IP bans (%count%) ---").replace("%count%", String.valueOf(activeIps.size()))));
 

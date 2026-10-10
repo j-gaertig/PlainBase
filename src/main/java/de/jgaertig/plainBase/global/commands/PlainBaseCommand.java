@@ -43,29 +43,69 @@ public class PlainBaseCommand implements BasicCommand {
         if (args.length >= 2 && args[0].equalsIgnoreCase("toggle")) {
             String moduleName = args[1];
             String path = "modules." + moduleName;
+            String safeModule = plugin.getMiniMessage().escapeTags(moduleName);
 
-            if (plugin.getConfig().contains(path)) {
-                boolean currentStatus = plugin.getConfig().getBoolean(path);
-                boolean newStatus = !currentStatus;
-
-                plugin.getConfig().set(path, newStatus);
-                plugin.saveConfig();
-
-                String statusColor = newStatus ? "<green>enabled" : "<red>disabled";
-                String safeModule = plugin.getMiniMessage().escapeTags(moduleName);
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
-                ));
-                plugin.reloadModules();
-            } else {
+            if (moduleName.isEmpty()) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
+                return;
+            }
+
+            // Folia: only validated above; config write, save and module
+            // reload run on the global region thread, success message in callback.
+            try {
+                Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                    if (!plugin.isEnabled()) return;
+                    try {
+                        if (!plugin.getConfig().contains(path)) {
+                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
+                            return;
+                        }
+                        boolean newStatus = !plugin.getConfig().getBoolean(path);
+                        plugin.getConfig().set(path, newStatus);
+                        plugin.saveConfig();
+                        plugin.reloadModules();
+                        if (sender instanceof Player player && !player.isOnline()) return;
+                        String statusColor = newStatus ? "<green>enabled" : "<red>disabled";
+                        sender.sendMessage(plugin.getMiniMessage().deserialize(
+                                "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
+                        ));
+                    } catch (Exception e) {
+                        plugin.getLogger().warning("Failed to toggle module " + moduleName + ": " + e.getMessage());
+                        try {
+                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                });
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to schedule module toggle: " + e.getMessage());
+                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
             }
             return;
         }
 
         if (args.length >= 1 && args[0].equalsIgnoreCase("reload")) {
-            plugin.reloadModules();
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<green>Config reloaded and modules updated!"));
+            // Folia: reloadModules() touches Bukkit state — hop to the global
+            // region thread, success message in callback.
+            try {
+                Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                    if (!plugin.isEnabled()) return;
+                    try {
+                        plugin.reloadModules();
+                        if (sender instanceof Player player && !player.isOnline()) return;
+                        sender.sendMessage(plugin.getMiniMessage().deserialize("<green>Config reloaded and modules updated!"));
+                    } catch (Exception e) {
+                        plugin.getLogger().warning("Failed to reload modules: " + e.getMessage());
+                        try {
+                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reload modules!"));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                });
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to schedule reload: " + e.getMessage());
+                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reload modules!"));
+            }
             return;
         }
 
@@ -133,13 +173,18 @@ public class PlainBaseCommand implements BasicCommand {
         }
 
         if (args.length == 2 && args[0].equalsIgnoreCase("toggle")) {
-            ConfigurationSection modules = plugin.getConfig().getConfigurationSection("modules");
-            if (modules != null) {
-                String input = args[1].toLowerCase(Locale.ROOT);
-                return modules.getKeys(false).stream()
-                        .filter(s -> s.startsWith(input))
-                        .toList();
+            // Suggestions may run off-thread while a reload swaps the config:
+            // copy the keys under lock, filter outside of it.
+            List<String> keys;
+            org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
+            synchronized (cfg) {
+                ConfigurationSection modules = cfg.getConfigurationSection("modules");
+                keys = (modules == null) ? List.of() : List.copyOf(modules.getKeys(false));
             }
+            String input = args[1].toLowerCase(Locale.ROOT);
+            return keys.stream()
+                    .filter(s -> s.startsWith(input))
+                    .toList();
         }
         return List.of();
     }

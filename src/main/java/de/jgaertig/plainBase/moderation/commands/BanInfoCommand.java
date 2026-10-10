@@ -96,8 +96,16 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                 }
                 if (lastIp == null) return;
 
+                // Compare canonical forms (stored rows may use legacy
+                // spellings like ::ffff:1.2.3.4); null-guarded on both sides.
+                String normLast = normalizeIp(lastIp);
+                if (normLast == null) return;
                 long now = System.currentTimeMillis();
-                boolean ipBanned = manager.getActiveIpBans().stream().anyMatch(r -> r.ip().equals(lastIp) && r.isActive(now));
+                boolean ipBanned = manager.getActiveIpBans().stream().anyMatch(r -> {
+                    if (r == null || r.ip() == null) return false;
+                    String normRow = normalizeIp(r.ip());
+                    return normRow != null && normRow.equals(normLast) && r.isActive(now);
+                });
                 if (!ipBanned) return;
 
                 org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {

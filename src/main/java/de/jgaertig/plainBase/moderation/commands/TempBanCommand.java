@@ -45,8 +45,9 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
         try {
             durationMillis = DurationParser.parse(args[1]);
         } catch (IllegalArgumentException e) {
+            String detail = e.getMessage() != null ? " (" + esc(e.getMessage()) + ")" : "";
             sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("invalid-duration", "<red>Invalid duration. Use e.g. 1d, 2h30m, 7d or permanent.")));
+                    message("invalid-duration", "<red>Invalid duration. Use e.g. 1d, 2h30m, 7d or permanent.") + detail));
             return;
         }
 
@@ -81,7 +82,11 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                     return;
                 }
             } else if (!isAdmin(sender)) {
-                warnOfflineExemptUnchecked(name);
+                // Offline players expose no permission API, so exempt/admin
+                // status cannot be verified — non-admins must not ban them at
+                // all (hard reject, not just a log line). Admins bypass.
+                sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+                return;
             }
 
             BanManager manager = plugin.getBanManager();

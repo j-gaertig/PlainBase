@@ -20,6 +20,10 @@ public class BroadcastManager {
     }
 
     public void startBroadcasts() {
+        // Double-start guard: starting twice without a stop must never stack
+        // duplicate repeating tasks (each start would otherwise add a full new
+        // set of timers on top of the still-running ones).
+        stopBroadcasts();
         var messagesConfig = plugin.getMessagesConfig();
         if (messagesConfig == null) return;
         ConfigurationSection section = messagesConfig.getConfigurationSection("broadcasts");

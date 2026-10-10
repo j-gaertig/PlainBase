@@ -3,6 +3,7 @@ package de.jgaertig.plainBase.joinItems;
 import de.jgaertig.plainBase.PlainBase;
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
+import org.bukkit.GameRules;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.configuration.ConfigurationSection;
@@ -43,7 +44,9 @@ public class JoinItemsListener implements Listener {
         org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
         if (cfg == null) return false;
 
-        if (player.isOp() && cfg.getBoolean("settings.op-bypass", true)) {
+        // Code default matches the shipped joinitems.yml (op-bypass: false):
+        // OPs are restricted like everyone else unless the admin opts in.
+        if (player.isOp() && cfg.getBoolean("settings.op-bypass", false)) {
             return false;
         }
 
@@ -146,24 +149,26 @@ public class JoinItemsListener implements Listener {
         ItemStack item = event.getItem();
         if (item == null || !isJoinItem(item)) return;
 
+        // Only right-click activates a join item — a left-click (attack, block
+        // hit) must pass through and never be swallowed by the item.
+        if (!event.getAction().name().contains("RIGHT")) return;
+
         event.setCancelled(true);
 
-        if (event.getAction().name().contains("RIGHT")) {
-            String configKey = item.getItemMeta().getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
-            if (configKey != null) {
-                org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
-                if (cfg == null) return;
-                List<String> commands = cfg.getStringList("items." + configKey + ".commands");
-                for (String cmd : commands) {
-                    if (cmd == null || cmd.trim().isEmpty()) continue;
+        String configKey = item.getItemMeta().getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
+        if (configKey != null) {
+            org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
+            if (cfg == null) return;
+            List<String> commands = cfg.getStringList("items." + configKey + ".commands");
+            for (String cmd : commands) {
+                if (cmd == null || cmd.trim().isEmpty()) continue;
 
-                    String finalCmd = cmd.replace("%player%", event.getPlayer().getName());
-                    if (finalCmd.startsWith("/")) {
-                        finalCmd = finalCmd.substring(1);
-                    }
-
-                    event.getPlayer().performCommand(finalCmd);
+                String finalCmd = cmd.replace("%player%", event.getPlayer().getName());
+                if (finalCmd.startsWith("/")) {
+                    finalCmd = finalCmd.substring(1);
                 }
+
+                event.getPlayer().performCommand(finalCmd);
             }
         }
     }
@@ -195,8 +200,13 @@ public class JoinItemsListener implements Listener {
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onCreativeClick(InventoryCreativeEvent event) {
         if (event.getWhoClicked() instanceof Player player) {
+            // Fallback without a new key: "no-inventory-move" also blocks the
+            // creative path, so items flagged only with it cannot be smuggled
+            // out via creative clicks.
             if (isActionRestricted(player, event.getCurrentItem(), "no-creative-move") ||
-                    isActionRestricted(player, event.getCursor(), "no-creative-move")) {
+                    isActionRestricted(player, event.getCursor(), "no-creative-move") ||
+                    isActionRestricted(player, event.getCurrentItem(), "no-inventory-move") ||
+                    isActionRestricted(player, event.getCursor(), "no-inventory-move")) {
                 event.setCancelled(true);
             }
         }
@@ -205,7 +215,11 @@ public class JoinItemsListener implements Listener {
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onDrag(InventoryDragEvent event) {
         if (event.getWhoClicked() instanceof Player player) {
-            if (isActionRestricted(player, event.getOldCursor(), "no-drag")) {
+            // Fallback without a new key: "no-inventory-move" also blocks
+            // dragging, so items flagged only with it cannot be smuggled out
+            // via the drag path.
+            if (isActionRestricted(player, event.getOldCursor(), "no-drag") ||
+                    isActionRestricted(player, event.getOldCursor(), "no-inventory-move")) {
                 event.setCancelled(true);
             }
         }
@@ -290,9 +304,15 @@ public class JoinItemsListener implements Listener {
     @EventHandler
     public void onRespawn(PlayerRespawnEvent event) {
         Player player = event.getPlayer();
+        // keepInventory guard: with the keep-inventory gamerule the player never
+        // lost the items, so re-giving them here would duplicate every stack.
+        // (GameRules, not the deprecated-for-removal GameRule constants.)
+        if (Boolean.TRUE.equals(player.getWorld().getGameRuleValue(GameRules.KEEP_INVENTORY))) return;
         player.getScheduler().runDelayed(plugin, task -> {
             if (!player.isOnline()) return;
             if (plugin.getJoinItemsConfig() == null) return;
+            // Re-checked: the rule could have been toggled during the delay.
+            if (Boolean.TRUE.equals(player.getWorld().getGameRuleValue(GameRules.KEEP_INVENTORY))) return;
             giveConfiguredItems(player, "re-give-after-death");
         }, null, 5L);
     }

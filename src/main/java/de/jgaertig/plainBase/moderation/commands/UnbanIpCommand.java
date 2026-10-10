@@ -31,6 +31,14 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         }
 
         String rawIp = args[0];
+        // Gate first (same as IpBanCommand): hostnames/player names are never
+        // resolved here — only raw IP literals. normalizeIp itself is also
+        // DNS-free, so this is defense-in-depth.
+        if (!isIpLike(rawIp)) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    message("invalid-ip", "<red>Invalid IP address: %ip%").replace("%ip%", esc(rawIp))));
+            return;
+        }
         // Normalize to canonical form so "1.2.3.4", "::ffff:1.2.3.4" etc.
         // match the stored ban row regardless of input spelling.
         String ip = normalizeIp(rawIp);

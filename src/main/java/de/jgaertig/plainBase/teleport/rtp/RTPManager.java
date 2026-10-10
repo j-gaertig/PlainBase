@@ -19,6 +19,11 @@ import java.util.concurrent.ThreadLocalRandom;
 public class RTPManager {
     private final PlainBase plugin;
 
+    // In-memory only by design: a /plainbase reload constructs a fresh RTPManager
+    // (see PlainBase stopModules/setupTeleport, which also cancels pending warmups
+    // and searches), so pending RTP cooldowns reset on reload. No persistence —
+    // documented behaviour, not a leak; entries of players who never return are
+    // purged opportunistically on read (isOnCooldown) and on quit/cancel.
     private final Map<UUID, Long> cooldowns = new ConcurrentHashMap<>();
     private final Map<UUID, ScheduledTask> activeWarmups = new ConcurrentHashMap<>();
     private final Set<UUID> searching = ConcurrentHashMap.newKeySet();
@@ -207,6 +212,18 @@ public class RTPManager {
             cooldowns.remove(player.getUniqueId());
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
             return;
+        }
+
+        // Double-warmup guard (RTP side): a pending TPA warmup for the same player
+        // must not fire after this RTP teleport. cancelWarmup is a no-op with no
+        // message when no TPA warmup exists. Mirror direction (TPA start cancels
+        // RTP) lives in TPAManager, owned elsewhere — see open points.
+        try {
+            if (plugin.getTPAManager() != null) {
+                plugin.getTPAManager().cancelWarmup(player, "RTP started.");
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to cancel TPA warmup for " + player.getName() + ": " + e.getMessage());
         }
 
         long seconds = teleportConfig.getLong("rtp.counter.seconds", 3);

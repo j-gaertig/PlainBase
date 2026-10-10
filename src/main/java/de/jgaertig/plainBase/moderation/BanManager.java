@@ -275,30 +275,20 @@ public class BanManager {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             boolean success;
             synchronized (mutationLock) {
-                // Prefer the live row (another server may have banned/unbanned
-                // since our last refresh); fall back to cache on DB failure.
-                BanRecord active = null;
+                long now = System.currentTimeMillis();
                 try {
-                    active = db.findActiveBan(uuid, System.currentTimeMillis());
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().warning("Could not live-check ban for " + uuid + ", falling back to cache: " + e.getMessage());
-                }
-                if (active == null) active = getActiveBan(uuid).orElse(null);
-                if (active == null) {
-                    success = false;
-                } else {
-                    BanRecord old = active;
-                    long now = System.currentTimeMillis();
-                    try {
-                        db.revokeBan(old.id(), staffUuid, staffName, now);
-                        BanRecord revoked = old.withRevoked(staffUuid, staffName, now);
-                        replaceBanById(bansByUuid.get(uuid), old.id(), revoked);
-                        replaceBanById(bansCache, old.id(), revoked);
+                    // Revoke-by-key revokes ALL unrevoked rows for this uuid;
+                    // success is decided on the row count (0 = nothing to unban).
+                    int revoked = db.revokeBan(uuid, staffUuid, staffName, now);
+                    if (revoked > 0) {
+                        revokeAllBansInCache(uuid, staffUuid, staffName, now);
                         success = true;
-                    } catch (SQLException e) {
-                        plugin.getLogger().severe("Could not revoke ban for " + uuid + ": " + e.getMessage());
+                    } else {
                         success = false;
                     }
+                } catch (SQLException e) {
+                    plugin.getLogger().severe("Could not revoke ban for " + uuid + ": " + e.getMessage());
+                    success = false;
                 }
             }
             boolean finalSuccess = success;
@@ -360,32 +350,54 @@ public class BanManager {
             boolean success;
             synchronized (mutationLock) {
                 long now = System.currentTimeMillis();
-                IpBanRecord old = null;
                 try {
-                    old = db.findActiveIpBan(ip, now);
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
-                }
-                if (old == null) {
-                    old = ipBansCache.stream().filter(r -> r.ip().equals(ip) && r.isActive(now)).findFirst().orElse(null);
-                }
-                if (old == null) {
-                    success = false;
-                } else {
-                    try {
-                        db.revokeIpBan(old.id(), staffUuid, staffName, now);
-                        IpBanRecord revoked = old.withRevoked(staffUuid, staffName, now);
-                        replaceIpBanById(ipBansCache, old.id(), revoked);
+                    // Same revoke-by-key pattern as unbanPlayerAsync: all
+                    // unrevoked rows for this IP, row count decides success.
+                    int revoked = db.revokeIpBan(ip, staffUuid, staffName, now);
+                    if (revoked > 0) {
+                        revokeAllIpBansInCache(ip, staffUuid, staffName, now);
                         success = true;
-                    } catch (SQLException e) {
-                        plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
+                    } else {
                         success = false;
                     }
+                } catch (SQLException e) {
+                    plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
+                    success = false;
                 }
             }
             boolean finalSuccess = success;
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalSuccess));
         });
+    }
+
+    /**
+     * Marks every unrevoked cached ban for the uuid as revoked (mirrors the
+     * revoke-by-key UPDATE, which touches all rows, not just one id).
+     * Must be called while holding {@code mutationLock}.
+     */
+    private void revokeAllBansInCache(UUID uuid, UUID staffUuid, String staffName, long now) {
+        List<BanRecord> history = bansByUuid.get(uuid);
+        if (history != null) {
+            for (int i = 0; i < history.size(); i++) {
+                BanRecord r = history.get(i);
+                if (!r.revoked()) history.set(i, r.withRevoked(staffUuid, staffName, now));
+            }
+        }
+        for (int i = 0; i < bansCache.size(); i++) {
+            BanRecord r = bansCache.get(i);
+            if (!r.revoked() && r.uuid().equals(uuid)) bansCache.set(i, r.withRevoked(staffUuid, staffName, now));
+        }
+    }
+
+    /**
+     * Marks every unrevoked cached IP ban for the ip as revoked.
+     * Must be called while holding {@code mutationLock}.
+     */
+    private void revokeAllIpBansInCache(String ip, UUID staffUuid, String staffName, long now) {
+        for (int i = 0; i < ipBansCache.size(); i++) {
+            IpBanRecord r = ipBansCache.get(i);
+            if (!r.revoked() && r.ip() != null && r.ip().equals(ip)) ipBansCache.set(i, r.withRevoked(staffUuid, staffName, now));
+        }
     }
 
     private void replaceBanById(List<BanRecord> list, int id, BanRecord replacement) {

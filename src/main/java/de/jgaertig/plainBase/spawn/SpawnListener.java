@@ -70,15 +70,37 @@ public class SpawnListener implements Listener {
                 return;
             }
 
-            Location loc = new Location(
-                    world,
-                    config.getDouble(path + ".x"),
-                    config.getDouble(path + ".y"),
-                    config.getDouble(path + ".z"),
-                    (float) config.getDouble(path + ".yaw"),
-                    (float) config.getDouble(path + ".pitch")
-            );
-            player.teleportAsync(loc);
+            Location loc;
+            double rawX = config.getDouble(path + ".x");
+            double rawY = config.getDouble(path + ".y");
+            double rawZ = config.getDouble(path + ".z");
+            if (!Double.isFinite(rawX) || !Double.isFinite(rawY) || !Double.isFinite(rawZ)) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn location is not set correctly. Contact an admin!"));
+                plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": non-finite coordinates at '" + path + "'.");
+                return;
+            }
+            double rawYaw = config.getDouble(path + ".yaw");
+            double rawPitch = config.getDouble(path + ".pitch");
+            float yaw = Double.isFinite(rawYaw) ? (float) rawYaw : 0f;
+            float pitch = Double.isFinite(rawPitch) ? (float) rawPitch : 0f;
+
+            if (rawY < world.getMinHeight() || rawY >= world.getMaxHeight()) {
+                plugin.getLogger().warning("Spawn teleport for " + player.getName() + ": Y=" + rawY
+                        + " out of bounds [" + world.getMinHeight() + "," + world.getMaxHeight()
+                        + ") at '" + path + "', falling back to world spawn.");
+                loc = world.getSpawnLocation().clone();
+            } else {
+                loc = new Location(world, rawX, rawY, rawZ, yaw, pitch);
+            }
+            player.teleportAsync(loc).thenAccept(success -> {
+                if (!Boolean.TRUE.equals(success) && player.isOnline()) {
+                    try {
+                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
+                    } catch (Exception ex) {
+                        plugin.getLogger().warning("Failed to notify " + player.getName() + " about spawn teleport failure: " + ex.getMessage());
+                    }
+                }
+            });
         } catch (Exception e) {
             // Runs on a delayed scheduler task after join: must never throw.
             plugin.getLogger().warning("Spawn teleport failed for "

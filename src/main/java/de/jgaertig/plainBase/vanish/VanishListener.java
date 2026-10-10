@@ -79,11 +79,27 @@ public class VanishListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onDeath(PlayerDeathEvent event) {
-        // A vanished player must not leak via the death message.
+        // A vanished player must not leak via the death message — neither as
+        // the victim ("X died") nor as the killer ("X was slain by Y").
         try {
-            if (plugin.getVanishManager() != null
-                    && plugin.getVanishManager().isVanished(event.getEntity())) {
+            if (plugin.getVanishManager() == null) return;
+            if (plugin.getVanishManager().isVanished(event.getEntity())) {
                 event.deathMessage(null);
+                return;
+            }
+            Player killer = event.getEntity().getKiller();
+            if (killer != null && plugin.getVanishManager().isVanished(killer)) {
+                event.deathMessage(null);
+                return;
+            }
+            try {
+                if (event.getDamageSource() != null
+                        && event.getDamageSource().getCausingEntity() instanceof Player causing
+                        && plugin.getVanishManager().isVanished(causing)) {
+                    event.deathMessage(null);
+                }
+            } catch (NoSuchMethodError | Exception ignored) {
+                // Older API without DamageSource#getCausingEntity — killer check above covers melee.
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to handle vanish death state for " + event.getEntity().getName() + ": " + e.getMessage());

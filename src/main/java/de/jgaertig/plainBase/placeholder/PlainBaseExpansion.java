@@ -41,6 +41,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
 
     @Override
     public String onPlaceholderRequest(Player player, @NotNull String params) {
+        if (params == null || params.isEmpty()) return null;
         return switch (params.toLowerCase(Locale.ROOT)) {
             case "version" -> plugin.getPluginMeta().getVersion();
             case "vanished" -> player != null && plugin.getVanishManager() != null

@@ -52,23 +52,40 @@ public class TPAManager {
     }
 
     public void sendRequest(Player requester, Player target, RequestType type) {
+        if (requester == null || target == null) return;
+        UUID requesterId = requester.getUniqueId();
+        UUID targetId = target.getUniqueId();
 
-        if (activeSessions.containsKey(target.getUniqueId())) {
-            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>This player already has a pending teleport request. Try again later."));
+        if (requesterId.equals(targetId)) {
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You cannot send a teleport request to yourself."));
+            return;
+        }
+        if (!requester.isOnline() || !target.isOnline()) {
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>That player is currently not online."));
             return;
         }
 
         for (TpaSession session : activeSessions.values()) {
-            if (session.requesterId().equals(requester.getUniqueId())) {
+            if (session.requesterId().equals(requesterId)) {
                 requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You already have an outgoing teleport request! Use /tpacancel to cancel it."));
                 return;
             }
         }
 
+        // Atomic reservation: only one request per target can win. The timeout
+        // task is scheduled only after the reservation succeeded, so a lost
+        // race never leaks a timeout task or overwrites the winner.
+        TpaSession stub = new TpaSession(requesterId, type, null);
+        if (activeSessions.putIfAbsent(targetId, stub) != null) {
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>This player already has a pending teleport request. Try again later."));
+            return;
+        }
+
         requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleport request sent to <yellow>" + esc(target.getName()) + "<gray>."));
         target.sendMessage(plugin.getMiniMessage().deserialize("<yellow>" + esc(requester.getName()) + " <gray>has sent you a teleport request."));
 
-        if (tpAutoPlayers.contains(target.getUniqueId())) {
+        if (tpAutoPlayers.contains(targetId)) {
+            activeSessions.remove(targetId, stub);
             startTeleportProcedure(requester, target, type);
             return;
         }
@@ -85,21 +102,44 @@ public class TPAManager {
                         "<gray>Use <green>/tpaccept <gray>or <red>/tpdeny<gray>."
         ));
 
-        ScheduledTask timeoutTask = Bukkit.getAsyncScheduler().runDelayed(plugin, (t) -> {
-            if (activeSessions.containsKey(target.getUniqueId())) {
-                expireRequest(target.getUniqueId());
-            }
-        }, timeoutSeconds, TimeUnit.SECONDS);
+        ScheduledTask timeoutTask;
+        try {
+            timeoutTask = Bukkit.getAsyncScheduler().runDelayed(plugin, (t) -> {
+                expireRequest(targetId);
+            }, timeoutSeconds, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            activeSessions.remove(targetId, stub);
+            plugin.getLogger().warning("Failed to schedule TPA timeout for " + target.getName() + ": " + e.getMessage());
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request failed. Try again later."));
+            return;
+        }
 
-        activeSessions.put(target.getUniqueId(), new TpaSession(requester.getUniqueId(), type, timeoutTask));
+        TpaSession full = new TpaSession(requesterId, type, timeoutTask);
+        if (!activeSessions.replace(targetId, stub, full)) {
+            // Session was removed concurrently (quit/cancel/accept) before the
+            // timeout was attached — never leak the orphan timeout task.
+            timeoutTask.cancel();
+        }
     }
 
     public void acceptRequest(Player target) {
-        TpaSession session = activeSessions.get(target.getUniqueId());
-        if (session == null) {
+        if (!acceptIfPresent(target)) {
             target.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any pending requests!"));
-            return;
         }
+    }
+
+    /**
+     * Accepts the pending request for target if one exists. Silent (no
+     * "no pending" message) when no session is present, so toggleTpAuto
+     * enabling tpauto without a pending request only prints the
+     * Enabled-message. Returns true iff a session was present.
+     */
+    private boolean acceptIfPresent(Player target) {
+        TpaSession session = activeSessions.remove(target.getUniqueId());
+        if (session == null) {
+            return false;
+        }
+        if (session.timeoutTask() != null) session.timeoutTask().cancel();
 
         Player requester = Bukkit.getPlayer(session.requesterId());
         if (requester != null) {
@@ -107,24 +147,22 @@ public class TPAManager {
         } else {
             target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
         }
-
-        clearSession(target.getUniqueId());
+        return true;
     }
 
     public void denyRequest(Player target) {
-        TpaSession session = activeSessions.get(target.getUniqueId());
+        TpaSession session = activeSessions.remove(target.getUniqueId());
         if (session == null) {
             target.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any pending requests!"));
             return;
         }
+        if (session.timeoutTask() != null) session.timeoutTask().cancel();
 
         Player requester = Bukkit.getPlayer(session.requesterId());
         if (requester != null) {
             requester.sendMessage(plugin.getMiniMessage().deserialize("<red>" + esc(target.getName()) + " denied your teleport request."));
         }
         target.sendMessage(plugin.getMiniMessage().deserialize("<red>Request denied."));
-
-        clearSession(target.getUniqueId());
     }
 
     /**
@@ -147,7 +185,9 @@ public class TPAManager {
             tpAutoPlayers.add(uuid);
             player.sendMessage(plugin.getMiniMessage().deserialize("<gray>TP-Auto <green>enabled<gray>."));
             newStatus = true;
-            if (activeSessions.containsKey(uuid)) acceptRequest(player);
+            // Silent accept: no containsKey pre-check (TOCTOU) and no
+            // "no pending" spam when nothing is pending or on session race.
+            acceptIfPresent(player);
         }
         savePlayerData(uuid, newStatus);
     }
@@ -178,6 +218,18 @@ public class TPAManager {
 
         Player toTeleport = (type == RequestType.TPA) ? requester : target;
         Player destination = (type == RequestType.TPA) ? target : requester;
+
+        // Mirror to RTPManager.proceedToWarmup (which cancels the TPA warmup on
+        // RTP start): a pending RTP warmup for the same player must not fire
+        // after this TPA teleport. cancelWarmup is a no-op with no message
+        // when no RTP warmup exists.
+        try {
+            if (toTeleport != null && plugin.getRTPManager() != null) {
+                plugin.getRTPManager().cancelWarmup(toTeleport, "TPA started.");
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to cancel RTP warmup for " + toTeleport.getName() + ": " + e.getMessage());
+        }
 
         long seconds = plugin.getTeleportConfig().getLong("tpa.counter.seconds", 3);
         // Clamp like tpa.request_timeout above: negative/huge values must never

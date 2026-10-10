@@ -69,7 +69,11 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
                     return;
                 }
             } else if (!isAdmin(sender)) {
-                warnOfflineExemptUnchecked(name);
+                // Offline players expose no permission API, so exempt/admin
+                // status cannot be verified — non-admins must not ban them at
+                // all (hard reject, not just a log line). Admins bypass.
+                sender.sendMessage(plugin.getMiniMessage().deserialize(message("exempt", "<red>You cannot punish this player.")));
+                return;
             }
 
             BanManager manager = plugin.getBanManager();

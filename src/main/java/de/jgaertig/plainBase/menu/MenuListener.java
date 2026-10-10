@@ -78,9 +78,11 @@ public class MenuListener implements Listener {
         String message = def.message();
         if (message != null && !message.isEmpty()) {
             // A broken admin message template (bad MiniMessage) must never
-            // break the click handler — fall back to plain text.
+            // break the click handler — fall back to plain text. The message
+            // is expanded via MenuManager#applyPlaceholdersSafe so the
+            // clicking player's name cannot inject MiniMessage tags.
             try {
-                player.sendMessage(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(player, message)));
+                player.sendMessage(plugin.getMiniMessage().deserialize(MenuManager.applyPlaceholdersSafe(plugin, player, message)));
             } catch (Exception e) {
                 plugin.getLogger().warning("Invalid message '" + message + "' in menu '" + menu.name() + "': " + e.getMessage());
                 try {
@@ -95,6 +97,8 @@ public class MenuListener implements Listener {
             for (String cmd : commands) {
                 if (cmd == null || cmd.trim().isEmpty()) continue;
 
+                // Commands go to performCommand, never through MiniMessage, so
+                // the raw name stays correct here (escaping would corrupt it).
                 String finalCmd = plugin.applyPlaceholders(player, cmd);
                 if (finalCmd.startsWith("/")) finalCmd = finalCmd.substring(1);
 

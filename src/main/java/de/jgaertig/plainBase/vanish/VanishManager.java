@@ -39,6 +39,11 @@ public class VanishManager {
         return Set.copyOf(vanishedPlayers);
     }
 
+    // NOTE: intentionally no bulk copyFrom(Set) — PlainBase.restoreVanishState()
+    // re-applies via vanish() so hide effects are preserved (resetAll did not
+    // run on reload with persist-on-rejoin=true). A plain addAll would copy
+    // the set without re-hiding.
+
     /**
      * Toggles the vanish state of a player.
      *
@@ -96,8 +101,41 @@ public class VanishManager {
     /**
      * Applies all vanish state to a player who just joined (e.g. after a rejoin
      * with persist-on-rejoin) and hides all existing vanished players from them.
+     * <p>
+     * P0 rejoin-window fix: the persisted-vanish check runs synchronously and
+     * the rejoining player is added to the in-memory set plus hidden from all
+     * online viewers immediately. The async load below then only confirms and
+     * applies self state — there is no window where the player is visible.
      */
     public void applyOnJoin(Player player) {
+        // Synchronous pre-hide: must happen before the join message is
+        // broadcast (right after the event) and before any viewer can see
+        // the joiner. Guarded so disk I/O only happens when persistence is on.
+        try {
+            FileConfiguration cfg = plugin.getVanishConfig();
+            if (cfg != null && cfg.getBoolean("vanish.persist-on-rejoin", true)
+                    && hasPersistedVanish(player.getUniqueId())) {
+                vanishedPlayers.add(player.getUniqueId());
+                for (Player viewer : Bukkit.getOnlinePlayers()) {
+                    if (viewer.equals(player)) continue;
+                    try {
+                        if (!canSee(viewer, player)) {
+                            viewer.hideEntity(plugin, player);
+                        }
+                    } catch (Exception e) {
+                        // Cross-region viewers may reject a direct hide call —
+                        // fall back to the scheduled variant (never breaks join).
+                        try {
+                            hideFrom(viewer, player);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to pre-hide rejoining vanished player " + player.getName() + ": " + e.getMessage());
+        }
+
         loadPlayerData(player);
 
         // A new viewer must not see players who are already vanished
@@ -138,7 +176,12 @@ public class VanishManager {
         if (!plugin.getVanishConfig().getBoolean("vanish.persist-on-rejoin", true)) return;
 
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
-            if (!hasPersistedVanish(player.getUniqueId())) return;
+            // The sync pre-hide in applyOnJoin() already added the player when
+            // the persisted flag was true. This async step only confirms and
+            // applies state — it must not drop a freshly vanished player whose
+            // save has not hit disk yet, so a pre-hidden entry counts as proof.
+            if (!vanishedPlayers.contains(player.getUniqueId())
+                    && !hasPersistedVanish(player.getUniqueId())) return;
 
             player.getScheduler().run(plugin, (t) -> {
                 if (!player.isOnline()) {

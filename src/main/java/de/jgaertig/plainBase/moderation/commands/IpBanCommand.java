@@ -12,7 +12,6 @@ import org.jetbrains.annotations.NotNull;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
-import java.util.regex.Pattern;
 import java.net.InetAddress;
 
 /**
@@ -21,10 +20,6 @@ import java.net.InetAddress;
  * an IP. IP bans are checked independently of UUID bans on every login.
  */
 public class IpBanCommand extends ModerationCommandBase implements BasicCommand {
-
-    // Deliberately permissive (IPv4 + IPv6) — good enough to distinguish
-    // "this looks like a raw IP" from "this looks like a player name".
-    private static final Pattern IP_LIKE = Pattern.compile("^[0-9a-fA-F.:]+$");
 
     public IpBanCommand(PlainBase plugin) {
         super(plugin);
@@ -84,17 +79,21 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
             }
 
             // Exempt/admin check for online players currently on this IP.
-            // Offline owners of the IP cannot be permission-checked (documented
-            // limitation) — logged for audit when the sender is no admin.
+            // Offline owners of the IP cannot be permission-checked, so
+            // non-admins may only ban an IP that belongs to a currently-online
+            // (verifiable) player — anything else is hard-rejected. Admins
+            // bypass (their own audit responsibility).
             if (!isAdmin(sender)) {
                 boolean protectedOwner = false;
+                boolean anyOnlineOnIp = false;
                 for (Player online : Bukkit.getOnlinePlayers()) {
                     String onlineIp = addressIp(online);
-                    if (onlineIp != null
-                            && ip.equals(onlineIp)
-                            && isProtectedTarget(online, sender)) {
-                        protectedOwner = true;
-                        break;
+                    if (onlineIp != null && ip.equals(onlineIp)) {
+                        anyOnlineOnIp = true;
+                        if (isProtectedTarget(online, sender)) {
+                            protectedOwner = true;
+                            break;
+                        }
                     }
                 }
                 if (protectedOwner) {
@@ -102,8 +101,11 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
                             message("exempt", "<red>You cannot punish this player.")));
                     return;
                 }
-                plugin.getLogger().warning("IP ban on " + ip + " by " + sender.getName()
-                        + " without full exempt/admin check (offline owners cannot be verified).");
+                if (!anyOnlineOnIp) {
+                    sender.sendMessage(render(
+                            message("exempt", "<red>You cannot punish this player.")));
+                    return;
+                }
             }
 
             manager.tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, result -> {
@@ -193,10 +195,6 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
     private static boolean isUsableStoredIp(String stored) {
         return stored != null && !stored.isBlank() && !"unknown".equalsIgnoreCase(stored.trim());
-    }
-
-    private static boolean isIpLike(String arg) {
-        return IP_LIKE.matcher(arg).matches() && (arg.contains(".") || arg.contains(":"));
     }
 
     @Override

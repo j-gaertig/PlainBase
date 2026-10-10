@@ -56,13 +56,16 @@ public final class PlainBase extends JavaPlugin {
     private final Map<String, FileConfiguration> configs = new ConcurrentHashMap<>();
     private final Map<String, Double> latestVersions = new HashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
-    private BroadcastManager broadcastManager;
-    private TPAManager tpaManager;
-    private RTPManager rtpManager;
-    private VanishManager vanishManager;
-    private MenuManager menuManager;
-    private BanManager banManager;
-    private TeamManager teamManager;
+    // Volatile: read off-thread (VanishManager/TeamManager scheduler hops,
+    // PlaceholderAPI expansion, Brigadier suggestions) while reloadModules()
+    // swaps them on the global region thread.
+    private volatile BroadcastManager broadcastManager;
+    private volatile TPAManager tpaManager;
+    private volatile RTPManager rtpManager;
+    private volatile VanishManager vanishManager;
+    private volatile MenuManager menuManager;
+    private volatile BanManager banManager;
+    private volatile TeamManager teamManager;
     private boolean placeholdersRegistered = false;
     private GlobalListener globalListener;
 
@@ -148,6 +151,18 @@ public final class PlainBase extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        // Always reveal vanished players on shutdown, even with
+        // persist-on-rejoin=true (persist only covers rejoins, not shutdown —
+        // otherwise players stay hidden with no manager left to unvanish them).
+        if (vanishManager != null) {
+            try {
+                vanishManager.resetAll();
+            } catch (Exception e) {
+                getLogger().fine("Failed to reset vanish state on disable: " + e.getMessage());
+            }
+            vanishManager = null;
+        }
+
         stopModules();
 
         if (placeholdersRegistered) {
@@ -456,6 +471,11 @@ public final class PlainBase extends JavaPlugin {
         );
     }
 
+    /**
+     * Must run on the global region thread: unregisters listeners, touches
+     * Bukkit state and does config disk I/O. Command call sites hop via
+     * Bukkit.getGlobalRegionScheduler() before calling this.
+     */
     public void reloadModules() {
         stopModules();
         reloadConfig();
@@ -491,6 +511,19 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void stopModules() {
+        // Synchronously flush pending async config writes first: async tasks
+        // may be cancelled on disable/reload and their changes would be lost.
+        try {
+            saveSpawnConfig();
+        } catch (Exception e) {
+            getLogger().fine("Failed to flush spawn.yml on shutdown: " + e.getMessage());
+        }
+        try {
+            saveMenuConfig();
+        } catch (Exception e) {
+            getLogger().fine("Failed to flush menu.yml on shutdown: " + e.getMessage());
+        }
+
         // Cache the vanish config BEFORE configs.clear() below: after clearing,
         // getVanishConfig() returns null and the persist check would NPE.
         FileConfiguration vanishConfig = getVanishConfig();
@@ -566,7 +599,10 @@ public final class PlainBase extends JavaPlugin {
     public FileConfiguration loadModuleConfig(String fileName) {
         File file = new File(getDataFolder(), "modules/" + fileName);
         if (!file.exists()) {
-            file.getParentFile().mkdirs();
+            File parent = file.getParentFile();
+            if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                getLogger().warning("Could not create directory: " + parent);
+            }
             saveResource("modules/" + fileName, false);
         }
 
@@ -700,6 +736,16 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public void setupVanish() {
+        // Carry over the old in-memory vanish set across reloads: stopModules()
+        // keeps vanished players hidden when persist-on-rejoin is enabled, so
+        // the fresh manager must know them again (no vanish leak window until
+        // the async per-player persist load catches up). Offline players are
+        // covered by their persisted player-data files via applyOnJoin().
+        // No bulk copyFrom by design: restoreVanishState() re-applies via
+        // vanish() so hide effects are preserved (resetAll did not run here).
+        Set<java.util.UUID> previousVanished = vanishManager != null
+                ? vanishManager.getVanishedPlayers() : Set.of();
+
         FileConfiguration vanishCfg = loadModuleConfig("vanish.yml");
         if (vanishCfg == null) {
             getLogger().severe("Could not load vanish.yml! The vanish module stays disabled until this is fixed.");
@@ -707,12 +753,34 @@ public final class PlainBase extends JavaPlugin {
         }
 
         vanishManager = new VanishManager(this);
+        restoreVanishState(previousVanished);
 
         getServer().getPluginManager().registerEvents(new VanishListener(this), this);
 
         // Re-apply persisted vanish state for already-online players after a reload
         for (Player player : Bukkit.getOnlinePlayers()) {
             vanishManager.applyOnJoin(player);
+        }
+    }
+
+    /**
+     * Re-applies a previously captured vanish set to the fresh manager using
+     * only the existing VanishManager API (getVanishedPlayers/vanish). Online
+     * players are re-vanished directly; offline ones re-vanish on join via
+     * their persisted files. Never throws.
+     */
+    private void restoreVanishState(Set<java.util.UUID> previousVanished) {
+        if (previousVanished == null || previousVanished.isEmpty() || vanishManager == null) return;
+        for (java.util.UUID uuid : previousVanished) {
+            try {
+                if (vanishManager.isVanished(uuid)) continue;
+                Player player = Bukkit.getPlayer(uuid);
+                if (player != null && player.isOnline()) {
+                    vanishManager.vanish(player);
+                }
+            } catch (Exception e) {
+                getLogger().fine("Failed to restore vanish state for " + uuid + ": " + e.getMessage());
+            }
         }
     }
 
@@ -879,7 +947,10 @@ public final class PlainBase extends JavaPlugin {
         Runnable write = () -> {
             try {
                 File parent = target.getParentFile();
-                if (parent != null) parent.mkdirs();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                    getLogger().warning("Could not create directory: " + parent);
+                    return;
+                }
                 Files.writeString(target.toPath(), data, StandardCharsets.UTF_8);
             } catch (Exception e) {
                 getLogger().severe("Could not save " + fileName + "!");

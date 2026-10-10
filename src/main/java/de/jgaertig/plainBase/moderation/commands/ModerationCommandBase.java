@@ -8,8 +8,6 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -138,13 +136,187 @@ abstract class ModerationCommandBase {
      * Normalizes an IP string (v4/v6, with/without brackets or leading zeros)
      * to its canonical host-address form so stored, cached and checked values
      * always compare equal. Returns null when the input is not a valid IP.
+     * <p>
+     * DNS-free literal parser: never touches {@code InetAddress.getByName()}
+     * (which can block on DNS — forbidden on region threads). Only IPv4/IPv6
+     * literals are accepted; hostnames are rejected. IPv4-mapped
+     * {@code ::ffff:a.b.c.d} addresses are unmapped to plain IPv4, and
+     * zone IDs ({@code %eth0}) are rejected.
      */
     protected static String normalizeIp(String ip) {
         try {
-            return InetAddress.getByName(ip).getHostAddress();
-        } catch (UnknownHostException | RuntimeException e) {
+            return normalizeIpLiteral(ip);
+        } catch (RuntimeException e) {
             return null;
         }
+    }
+
+    /**
+     * True when the argument looks like a raw IP (IPv4/IPv6 characters only).
+     * Pre-filter before {@link #normalizeIp}: distinguishes "looks like an IP"
+     * from "looks like a player name". Must stay in sync with
+     * IpBanCommand's gate.
+     */
+    protected static boolean isIpLike(String arg) {
+        if (arg == null) return false;
+        if (!IP_LIKE.matcher(arg).matches()) return false;
+        return arg.contains(".") || arg.contains(":");
+    }
+
+    private static final java.util.regex.Pattern IP_LIKE =
+            java.util.regex.Pattern.compile("^[0-9a-fA-F.:\\[\\]]+$");
+
+    static String normalizeIpLiteral(String ip) {
+        if (ip == null) return null;
+        String s = ip.trim();
+        if (s.isEmpty()) return null;
+        // Zone IDs (fe80::1%eth0) are never valid ban targets.
+        if (s.contains("%")) return null;
+        // Strip one pair of brackets around IPv6 literals ([::1]).
+        if (s.length() > 2 && s.charAt(0) == '[' && s.charAt(s.length() - 1) == ']') {
+            s = s.substring(1, s.length() - 1).trim();
+            if (s.isEmpty() || s.contains("%")) return null;
+        }
+        if (!s.contains(".") && !s.contains(":")) return null;
+        try {
+            if (s.contains(":")) {
+                byte[] v6 = parseIpv6Literal(s);
+                if (v6 == null) return null;
+                // Unmap ::ffff:0:0/96 (IPv4-mapped IPv6) to plain IPv4 so
+                // "::ffff:1.2.3.4" and "1.2.3.4" compare equal everywhere.
+                if (isIpv4Mapped(v6)) {
+                    return (v6[12] & 0xFF) + "." + (v6[13] & 0xFF) + "."
+                            + (v6[14] & 0xFF) + "." + (v6[15] & 0xFF);
+                }
+                return java.net.InetAddress.getByAddress(v6).getHostAddress();
+            }
+            byte[] v4 = parseIpv4Literal(s);
+            if (v4 == null) return null;
+            return java.net.InetAddress.getByAddress(v4).getHostAddress();
+        } catch (java.net.UnknownHostException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static byte[] parseIpv4Literal(String s) {
+        String[] parts = s.split("\\.", -1);
+        if (parts.length != 4) return null;
+        byte[] out = new byte[4];
+        for (int i = 0; i < 4; i++) {
+            String p = parts[i];
+            if (p.isEmpty() || p.length() > 3) return null;
+            for (int j = 0; j < p.length(); j++) {
+                if (!Character.isDigit(p.charAt(j))) return null;
+            }
+            try {
+                int v = Integer.parseInt(p);
+                if (v < 0 || v > 255) return null;
+                out[i] = (byte) v;
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        return out;
+    }
+
+    private static byte[] parseIpv6Literal(String s) {
+        // Split off an embedded IPv4 tail (e.g. ::ffff:1.2.3.4 -> 2 hextets).
+        String hextetPart = s;
+        int[] tail = null;
+        int lastColon = s.lastIndexOf(':');
+        if (lastColon >= 0 && s.indexOf('.') > lastColon) {
+            String v4tail = s.substring(lastColon + 1);
+            byte[] v4 = parseIpv4Literal(v4tail);
+            if (v4 == null) return null;
+            tail = new int[]{((v4[0] & 0xFF) << 8) | (v4[1] & 0xFF), ((v4[2] & 0xFF) << 8) | (v4[3] & 0xFF)};
+            hextetPart = s.substring(0, lastColon);
+            // "::ffff:1.2.3.4" -> hextetPart "::ffff"; "1.2.3.4" alone never
+            // reaches here (no colon).
+            if (hextetPart.isEmpty()) return null;
+        }
+        int dbl = hextetPart.indexOf("::");
+        if (dbl >= 0 && hextetPart.indexOf("::", dbl + 2) >= 0) return null; // at most one ::
+        java.util.List<Integer> head = new java.util.ArrayList<>();
+        java.util.List<Integer> tailGroups = new java.util.ArrayList<>();
+        try {
+            if (dbl >= 0) {
+                String left = hextetPart.substring(0, dbl);
+                String right = hextetPart.substring(dbl + 2);
+                if (!left.isEmpty()) {
+                    for (String g : left.split(":", -1)) {
+                        if (g.isEmpty()) return null;
+                        head.add(parseHextet(g));
+                    }
+                }
+                if (!right.isEmpty()) {
+                    for (String g : right.split(":", -1)) {
+                        if (g.isEmpty()) return null;
+                        tailGroups.add(parseHextet(g));
+                    }
+                }
+            } else {
+                if (hextetPart.isEmpty()) return null;
+                for (String g : hextetPart.split(":", -1)) {
+                    if (g.isEmpty()) return null;
+                    head.add(parseHextet(g));
+                }
+            }
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        int tailLen = tail == null ? 0 : 2;
+        int total = head.size() + tailGroups.size() + tailLen;
+        if (dbl >= 0) {
+            if (total > 8) return null;
+            int zeros = 8 - total;
+            int[] groups = new int[8];
+            int idx = 0;
+            for (int g : head) groups[idx++] = g;
+            idx += zeros;
+            for (int g : tailGroups) groups[idx++] = g;
+            if (tail != null) {
+                groups[idx++] = tail[0];
+                groups[idx++] = tail[1];
+            }
+            return hextetsToBytes(groups);
+        }
+        if (total != 8) return null;
+        int[] groups = new int[8];
+        int idx = 0;
+        for (int g : head) groups[idx++] = g;
+        for (int g : tailGroups) groups[idx++] = g;
+        if (tail != null) {
+            groups[idx++] = tail[0];
+            groups[idx++] = tail[1];
+        }
+        return hextetsToBytes(groups);
+    }
+
+    private static int parseHextet(String g) {
+        if (g.isEmpty() || g.length() > 4) throw new NumberFormatException(g);
+        for (int i = 0; i < g.length(); i++) {
+            char c = g.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) throw new NumberFormatException(g);
+        }
+        return Integer.parseInt(g, 16);
+    }
+
+    private static byte[] hextetsToBytes(int[] groups) {
+        byte[] out = new byte[16];
+        for (int i = 0; i < 8; i++) {
+            out[i * 2] = (byte) ((groups[i] >> 8) & 0xFF);
+            out[i * 2 + 1] = (byte) (groups[i] & 0xFF);
+        }
+        return out;
+    }
+
+    private static boolean isIpv4Mapped(byte[] v6) {
+        if (v6 == null || v6.length != 16) return false;
+        for (int i = 0; i < 10; i++) {
+            if (v6[i] != 0) return false;
+        }
+        return (v6[10] & 0xFF) == 0xFF && (v6[11] & 0xFF) == 0xFF;
     }
 
     /**

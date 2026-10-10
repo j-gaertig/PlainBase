@@ -115,7 +115,8 @@ public class MenuCommand implements BasicCommand {
                 }
                 player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Available menus:"));
                 for (String name : names) {
-                    player.sendMessage(plugin.getMiniMessage().deserialize("<gray>- <white>" + name));
+                    String safe = plugin.getMiniMessage().escapeTags(name == null ? "" : name);
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<gray>- <white>" + safe));
                 }
             }
             default -> sendUsage(player);

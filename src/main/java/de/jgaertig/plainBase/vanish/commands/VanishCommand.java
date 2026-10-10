@@ -199,7 +199,7 @@ public class VanishCommand implements BasicCommand {
                 players = List.of();
             } else if (sender instanceof Player viewer) {
                 players = Bukkit.getOnlinePlayers().stream()
-                        .filter(viewer::canSee)
+                        .filter(p -> plugin.getVanishManager().canSee(viewer, p))
                         .map(Player::getName)
                         .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(input))
                         .toList();

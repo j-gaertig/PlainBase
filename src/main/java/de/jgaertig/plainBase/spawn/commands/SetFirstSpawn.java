@@ -41,7 +41,7 @@ public class SetFirstSpawn implements BasicCommand {
         }
 
         if (!(sender instanceof Player player)) {
-            sender.sendMessage("This command can only be executed by players.");
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command can only be executed by players."));
             return;
         }
 
@@ -49,7 +49,7 @@ public class SetFirstSpawn implements BasicCommand {
 
         if (args.length == 0) {
             loc = player.getLocation();
-        } else if (args.length >= 3) {
+        } else if (args.length == 3) {
             try {
                 double x = parseCoordinate(args[0], player.getLocation().getX());
                 double y = parseCoordinate(args[1], player.getLocation().getY());
@@ -65,6 +65,28 @@ public class SetFirstSpawn implements BasicCommand {
         }
 
         if (!(loc == null)) {
+            if (!Double.isFinite(loc.getX()) || !Double.isFinite(loc.getY()) || !Double.isFinite(loc.getZ())) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Invalid coordinates!"));
+                return;
+            }
+            if (loc.getWorld() == null) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Failed to set first spawn location!"));
+                return;
+            }
+            try {
+                var border = loc.getWorld().getWorldBorder();
+                double centerX = border.getCenter().getX();
+                double centerZ = border.getCenter().getZ();
+                double half = border.getSize() / 2.0;
+                if (!Double.isFinite(centerX) || !Double.isFinite(centerZ) || !Double.isFinite(half)
+                        || Math.abs(loc.getX() - centerX) > half
+                        || Math.abs(loc.getZ() - centerZ) > half) {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Location is outside the world border!"));
+                    return;
+                }
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to check world border for /setfirstspawn: " + e.getMessage());
+            }
             saveToSpawnConfig(loc);
         } else {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Failed to set first spawn location!"));
@@ -82,13 +104,16 @@ public class SetFirstSpawn implements BasicCommand {
 
     private void saveToSpawnConfig(Location loc) {
         var config = plugin.getSpawnConfig();
-        config.set("first-spawn.location.world", loc.getWorld().getName());
-        config.set("first-spawn.location.x", loc.getX());
-        config.set("first-spawn.location.y", loc.getY());
-        config.set("first-spawn.location.z", loc.getZ());
-        config.set("first-spawn.location.yaw", (double) loc.getYaw());
-        config.set("first-spawn.location.pitch", (double) loc.getPitch());
-        config.set("first-spawn.enabled", true);
+        if (config == null) return;
+        synchronized (config) {
+            config.set("first-spawn.location.world", loc.getWorld().getName());
+            config.set("first-spawn.location.x", loc.getX());
+            config.set("first-spawn.location.y", loc.getY());
+            config.set("first-spawn.location.z", loc.getZ());
+            config.set("first-spawn.location.yaw", (double) loc.getYaw());
+            config.set("first-spawn.location.pitch", (double) loc.getPitch());
+            config.set("first-spawn.enabled", true);
+        }
         plugin.saveSpawnConfigAsync();
     }
 }

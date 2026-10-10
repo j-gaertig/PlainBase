@@ -25,14 +25,28 @@ public record IpBanRecord(
         return duration < 0;
     }
 
+    /**
+     * Saturating expiry timestamp (overflow-free): permanent bans map to
+     * {@link Long#MAX_VALUE} so no caller ever adds {@code bannedAt + duration}
+     * directly.
+     */
+    public long expiryMillis() {
+        if (isPermanent()) return Long.MAX_VALUE;
+        if (duration > Long.MAX_VALUE - bannedAt) return Long.MAX_VALUE;
+        return bannedAt + duration;
+    }
+
     public boolean isActive(long now) {
         if (revoked) return false;
-        return isPermanent() || now < bannedAt + duration;
+        if (isPermanent()) return true;
+        return now < expiryMillis();
     }
 
     public long remainingMillis(long now) {
         if (isPermanent()) return -1;
-        return Math.max(0, (bannedAt + duration) - now);
+        long expiry = expiryMillis();
+        if (expiry == Long.MAX_VALUE) return Long.MAX_VALUE - now;
+        return Math.max(0, expiry - now);
     }
 
     public IpBanRecord withRevoked(UUID byUuid, String byName, long at) {
