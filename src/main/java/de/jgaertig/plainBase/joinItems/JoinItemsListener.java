@@ -6,6 +6,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -25,6 +26,7 @@ import org.bukkit.persistence.PersistentDataType;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 public class JoinItemsListener implements Listener {
 
@@ -38,13 +40,15 @@ public class JoinItemsListener implements Listener {
 
     private boolean isActionRestricted(Player player, ItemStack item, String restrictionFlag) {
         if (item == null || !isJoinItem(item)) return false;
+        org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
+        if (cfg == null) return false;
 
-        if (player.isOp() && plugin.getJoinItemsConfig().getBoolean("settings.op-bypass", true)) {
+        if (player.isOp() && cfg.getBoolean("settings.op-bypass", true)) {
             return false;
         }
 
         String configKey = item.getItemMeta().getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
-        List<String> flags = plugin.getJoinItemsConfig().getStringList("items." + configKey + ".flags");
+        List<String> flags = cfg.getStringList("items." + configKey + ".flags");
 
         return flags.contains(restrictionFlag);
     }
@@ -55,7 +59,9 @@ public class JoinItemsListener implements Listener {
     }
 
     private void giveConfiguredItems(Player player, String requiredFlag) {
-        ConfigurationSection itemsSection = plugin.getJoinItemsConfig().getConfigurationSection("items");
+        org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
+        if (cfg == null) return;
+        ConfigurationSection itemsSection = cfg.getConfigurationSection("items");
         if (itemsSection == null) return;
 
         for (String key : itemsSection.getKeys(false)) {
@@ -89,20 +95,29 @@ public class JoinItemsListener implements Listener {
             ItemMeta meta = item.getItemMeta();
 
             if (meta != null) {
-                meta.displayName(plugin.getMiniMessage().deserialize(name));
+                meta.displayName(safeDeserialize(name, "name of join item '" + key + "'"));
                 List<Component> lore = new ArrayList<>();
                 for (String s : loreStrings) {
-                    lore.add(plugin.getMiniMessage().deserialize(s));
+                    lore.add(safeDeserialize(s, "lore of join item '" + key + "'"));
                 }
                 meta.lore(lore);
 
                 if (meta instanceof SkullMeta skullMeta) {
                     String owner = itemsSection.getString(key + ".skull-owner");
-                    if (owner != null) {
+                    if (owner != null && !owner.isEmpty()) {
                         if (owner.equals("%player%")) {
                             skullMeta.setOwningPlayer(player);
                         } else {
-                            skullMeta.setOwningPlayer(org.bukkit.Bukkit.getOfflinePlayer(owner));
+                            // Never do a blocking profile lookup on the server
+                            // thread: Bukkit.getOfflinePlayer(String) may hit
+                            // the network (Mojang API) and stall the join.
+                            // Only use an already-known profile (online or
+                            // cached); an unknown name leaves the skull
+                            // without an owner instead of blocking.
+                            OfflinePlayer cached = resolveCachedOfflinePlayer(owner);
+                            if (cached != null) {
+                                skullMeta.setOwningPlayer(cached);
+                            }
                         }
                     }
                 }
@@ -136,7 +151,9 @@ public class JoinItemsListener implements Listener {
         if (event.getAction().name().contains("RIGHT")) {
             String configKey = item.getItemMeta().getPersistentDataContainer().get(joinItemKey, PersistentDataType.STRING);
             if (configKey != null) {
-                List<String> commands = plugin.getJoinItemsConfig().getStringList("items." + configKey + ".commands");
+                org.bukkit.configuration.file.FileConfiguration cfg = plugin.getJoinItemsConfig();
+                if (cfg == null) return;
+                List<String> commands = cfg.getStringList("items." + configKey + ".commands");
                 for (String cmd : commands) {
                     if (cmd == null || cmd.trim().isEmpty()) continue;
 
@@ -208,7 +225,7 @@ public class JoinItemsListener implements Listener {
         // items for it would duplicate them. Exact match only: "/clearly"
         // or similar commands must not trigger a re-give.
         if (event.isCancelled()) return;
-        String message = event.getMessage().toLowerCase();
+        String message = event.getMessage().toLowerCase(Locale.ROOT);
         if (message.equals("/clear") || message.startsWith("/clear ")
                 || message.equals("/minecraft:clear") || message.startsWith("/minecraft:clear ")) {
             handleReGive(event.getPlayer(), message, "re-give-after-/clear");
@@ -275,6 +292,7 @@ public class JoinItemsListener implements Listener {
         Player player = event.getPlayer();
         player.getScheduler().runDelayed(plugin, task -> {
             if (!player.isOnline()) return;
+            if (plugin.getJoinItemsConfig() == null) return;
             giveConfiguredItems(player, "re-give-after-death");
         }, null, 5L);
     }
@@ -289,7 +307,11 @@ public class JoinItemsListener implements Listener {
             if (!target.equals(sender) && !sender.hasPermission("plainbase.admin") && !sender.isOp()) {
                 return;
             }
-            target.getScheduler().runDelayed(plugin, task -> { if (!target.isOnline()) return; giveConfiguredItems(target, flag); }, null, 3L);
+            target.getScheduler().runDelayed(plugin, task -> {
+                if (!target.isOnline()) return;
+                if (plugin.getJoinItemsConfig() == null) return;
+                giveConfiguredItems(target, flag);
+            }, null, 3L);
         }
     }
 
@@ -315,5 +337,35 @@ public class JoinItemsListener implements Listener {
     private boolean isJoinItem(ItemStack item) {
         if (item == null || item.getType() == Material.AIR || !item.hasItemMeta()) return false;
         return item.getItemMeta().getPersistentDataContainer().has(joinItemKey, PersistentDataType.STRING);
+    }
+
+    /**
+     * MiniMessage-deserializes config text with a plain-text fallback: a
+     * malformed tag in joinitems.yml must never break giving out items
+     * (on join and on respawn, which share this path).
+     */
+    private Component safeDeserialize(String raw, String context) {
+        if (raw == null) return Component.empty();
+        try {
+            return plugin.getMiniMessage().deserialize(raw);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to format " + context + ", using plain text: " + e.getMessage());
+            return Component.text(raw);
+        }
+    }
+
+    /**
+     * Resolves an offline player without any blocking lookup: online players
+     * first, then the profile cache only. Returns null when the name is not
+     * known locally (no network I/O, safe on the server thread).
+     */
+    private static OfflinePlayer resolveCachedOfflinePlayer(String name) {
+        try {
+            Player online = Bukkit.getPlayerExact(name);
+            if (online != null) return online;
+            return Bukkit.getOfflinePlayerIfCached(name);
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

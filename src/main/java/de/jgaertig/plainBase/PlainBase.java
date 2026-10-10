@@ -38,12 +38,22 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class PlainBase extends JavaPlugin {
 
-    private final Map<String, FileConfiguration> configs = new HashMap<>();
+    // ConcurrentHashMap: configs are read off-thread (BanManager refresh task,
+    // RTPManager/TPAManager async callbacks, VanishManager/TeamManager scheduler
+    // hops) while stopModules()/loadModuleConfig() mutate the map on the main
+    // thread. A plain HashMap would risk visibility issues and
+    // ConcurrentModificationExceptions during iteration (GlobalListener,
+    // checkAllConfigVersions).
+    private final Map<String, FileConfiguration> configs = new ConcurrentHashMap<>();
     private final Map<String, Double> latestVersions = new HashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     private BroadcastManager broadcastManager;
@@ -57,6 +67,15 @@ public final class PlainBase extends JavaPlugin {
     private GlobalListener globalListener;
 
     private boolean commandsRegistered = false;
+
+    /**
+     * Permission nodes actually registered by THIS plugin instance (see
+     * {@link #addPermissionIfMissing(Permission)}). {@link #removePermissions()}
+     * only ever removes these: a node that already existed (other plugin,
+     * permissions manager, plugin.yml) is foreign-owned and must survive our
+     * onDisable.
+     */
+    private final Set<String> ownedPermissions = ConcurrentHashMap.newKeySet();
 
     @Override
     public void onEnable() {
@@ -81,6 +100,12 @@ public final class PlainBase extends JavaPlugin {
         // their module being enabled. This way /vanish, /menu, /spawn, /tpa etc.
         // still work when a module is enabled later via /plainbase toggle or reload.
         // setupSpawn()/setupTeleport() only register listeners and managers.
+        // Guarded: a blind re-register would throw on the duplicate command
+        // literals. The flag is set immediately after registering (before
+        // reloadModules(), which must never be able to re-arm it by throwing),
+        // so a second onEnable() on the same instance can never register
+        // twice. A fresh instance (the normal reload path) starts with false
+        // via the field initializer.
         if (!commandsRegistered) {
             getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
                 var r = event.registrar();
@@ -113,13 +138,10 @@ public final class PlainBase extends JavaPlugin {
 
                 r.register("rtp", new RTPCommand(this));
             });
+            commandsRegistered = true;
         }
 
         reloadModules();
-
-        checkAllConfigVersions();
-
-        commandsRegistered = true;
 
         getLogger().info("Successfully Enabled!");
     }
@@ -131,191 +153,305 @@ public final class PlainBase extends JavaPlugin {
         if (placeholdersRegistered) {
             try {
                 new PlainBaseExpansion(this).unregister();
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                getLogger().fine("Failed to unregister PlaceholderAPI expansion: " + e.getMessage());
             }
             placeholdersRegistered = false;
         }
 
+        removePermissions();
+
         getLogger().info("Successfully Disabled!");
+    }
+
+    /**
+     * Every permission node registered in {@link #setupPermissions()}.
+     * Used by {@link #removePermissions()} so a server /reload or plugin
+     * re-enable never leaks stale permission registrations into the next
+     * lifecycle (Bukkit keeps permissions after onDisable unless removed).
+     */
+    private static final List<String> ALL_PERMISSIONS = List.of(
+            "plainbase.admin",
+            "plainbase.spawn.admin",
+            "plainbase.spawn.spawn",
+            "plainbase.spawn.setspawn",
+            "plainbase.spawn.disablespawn",
+            "plainbase.spawn.setfirstspawn",
+            "plainbase.spawn.disablefirstspawn",
+            "plainbase.teleport.admin",
+            "plainbase.teleport.rtp.admin",
+            "plainbase.teleport.rtp.rtp",
+            "plainbase.teleport.tpa.admin",
+            "plainbase.teleport.tpa.tpa",
+            "plainbase.teleport.tpa.tpaccept",
+            "plainbase.teleport.tpa.tpdeny",
+            "plainbase.teleport.tpa.tpacancel",
+            "plainbase.teleport.tpa.tpahere",
+            "plainbase.teleport.tpa.tpauto",
+            "plainbase.vanish.admin",
+            "plainbase.vanish.vanish",
+            "plainbase.vanish.vanish.other",
+            "plainbase.vanish.world",
+            "plainbase.vanish.all",
+            "plainbase.vanish.see",
+            "plainbase.menu.admin",
+            "plainbase.menu.new",
+            "plainbase.menu.delete",
+            "plainbase.menu.open",
+            "plainbase.menu.list",
+            "plainbase.moderation.admin",
+            "plainbase.moderation.ban",
+            "plainbase.moderation.tempban",
+            "plainbase.moderation.unban",
+            "plainbase.moderation.kick",
+            "plainbase.moderation.banlist",
+            "plainbase.moderation.baninfo",
+            "plainbase.moderation.notify",
+            "plainbase.moderation.exempt",
+            "plainbase.moderation.banip",
+            "plainbase.moderation.unbanip",
+            "plainbase.team.admin",
+            "plainbase.team.invite",
+            "plainbase.team.add",
+            "plainbase.team.kick",
+            "plainbase.team.setrole",
+            "plainbase.team.request",
+            "plainbase.team.accept",
+            "plainbase.team.deny",
+            "plainbase.team.reject",
+            "plainbase.team.leave",
+            "plainbase.team.list",
+            "plainbase.team.info",
+            "plainbase.team.invites",
+            "plainbase.team.requests"
+    );
+
+    /**
+     * Idempotent registration: a node that already exists (second onEnable
+     * without a prior onDisable, or a permission defined by another
+     * plugin/permissions manager) is left alone AND stays unowned — we only
+     * ever remove nodes we created ourselves (see {@link #removePermissions()}).
+     * A lost registration race is therefore also safe: the loser simply does
+     * not claim ownership.
+     */
+    private void addPermissionIfMissing(Permission permission) {
+        try {
+            if (getServer().getPluginManager().getPermission(permission.getName()) != null) {
+                return;
+            }
+            getServer().getPluginManager().addPermission(permission);
+            ownedPermissions.add(permission.getName());
+        } catch (IllegalArgumentException alreadyRegistered) {
+            // Raced with another registrar — the node exists now, but we did
+            // not create it, so it stays unowned and is never removed by us.
+            getLogger().fine("Permission already registered: " + permission.getName());
+        }
+    }
+
+    /**
+     * Removes only the nodes this instance actually registered (tracked in
+     * {@link #ownedPermissions}), so a server /reload or plugin re-enable
+     * starts from a clean slate without ever deleting a foreign same-named
+     * node: Bukkit permissions have no owner field, so a name collision with
+     * another plugin is otherwise indistinguishable — and the other plugin's
+     * node would silently vanish on our onDisable. Nodes we skipped because
+     * they already existed are deliberately left untouched.
+     * Deliberately NOT called from stopModules(): a /plainbase reload or
+     * module toggle must keep the nodes while managers are rebuilt —
+     * setupPermissions() only runs in onEnable().
+     */
+    private void removePermissions() {
+        for (String name : Set.copyOf(ownedPermissions)) {
+            try {
+                if (getServer().getPluginManager().getPermission(name) == null) {
+                    ownedPermissions.remove(name);
+                    continue;
+                }
+                getServer().getPluginManager().removePermission(name);
+                ownedPermissions.remove(name);
+            } catch (Exception e) {
+                getLogger().fine("Could not remove permission " + name + ": " + e.getMessage());
+            }
+        }
     }
 
     private void setupPermissions() {
         // General
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.admin", "PlainBase: Allows access to all permissions", PermissionDefault.OP)
         );
 
         // spawn module
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.spawn.admin", "PlainBase: Allows access to all permissions of the spawn module", PermissionDefault.OP)
         );
 
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.spawn.spawn", "PlainBase: Allows access to /spawn", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.spawn.setspawn", "PlainBase: Allows access to /setspawn", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.spawn.disablespawn", "PlainBase: Allows access to /disablespawn", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.spawn.setfirstspawn", "PlainBase: Allows access to /setfirstspawn", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.spawn.disablefirstspawn", "PlainBase: Allows access to /disablefirstspawn", PermissionDefault.OP)
         );
 
         // teleport module
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.admin", "PlainBase: Allows access to all permissions of the teleport module", PermissionDefault.OP)
         );
 
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.rtp.admin", "PlainBase: Allows access to all permissions of rtp of the teleport module", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.rtp.rtp", "PlainBase: Allows access to /rtp", PermissionDefault.TRUE)
         );
 
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.tpa.admin", "PlainBase: Allows access to all permissions of tpa of the teleport module", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.tpa.tpa", "PlainBase: Allows access to /tpa", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.tpa.tpaccept", "PlainBase: Allows access to /tpaccept", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.tpa.tpdeny", "PlainBase: Allows access to /tpdeny", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.tpa.tpacancel", "PlainBase: Allows access to /tpacancel", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.tpa.tpahere", "PlainBase: Allows access to /tpahere", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.teleport.tpa.tpauto", "PlainBase: Allows access to /tpauto", PermissionDefault.TRUE)
         );
 
         // vanish module
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.vanish.admin", "PlainBase: Allows access to all permissions of the vanish module", PermissionDefault.OP)
         );
 
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.vanish.vanish", "PlainBase: Allows access to /vanish", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.vanish.vanish.other", "PlainBase: Allows access to /vanish <player>", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.vanish.world", "PlainBase: Allows access to /vanish world", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.vanish.all", "PlainBase: Allows access to /vanish all", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.vanish.see", "PlainBase: Allows to see vanished players", PermissionDefault.OP)
         );
 
         // menu module
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.menu.admin", "PlainBase: Allows access to all permissions of the menu module", PermissionDefault.OP)
         );
 
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.menu.new", "PlainBase: Allows access to /menu new", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.menu.delete", "PlainBase: Allows access to /menu delete", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.menu.open", "PlainBase: Allows access to /menu open", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.menu.list", "PlainBase: Allows access to /menu list", PermissionDefault.TRUE)
         );
 
         // moderation module
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.admin", "PlainBase: Allows access to all permissions of the moderation module", PermissionDefault.OP)
         );
 
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.ban", "PlainBase: Allows access to /ban", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.tempban", "PlainBase: Allows access to /tempban", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.unban", "PlainBase: Allows access to /unban", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.kick", "PlainBase: Allows access to /kick", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.banlist", "PlainBase: Allows access to /banlist", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.baninfo", "PlainBase: Allows access to /baninfo", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.notify", "PlainBase: Allows seeing ban/kick broadcasts when broadcast.staff-only is enabled", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.exempt", "PlainBase: Makes a player immune to /ban and /kick by non-admins", PermissionDefault.FALSE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.banip", "PlainBase: Allows access to /banip", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.moderation.unbanip", "PlainBase: Allows access to /unbanip", PermissionDefault.OP)
         );
 
         // team module
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.admin", "PlainBase: Bypass — acts as team-admin on any team regardless of membership", PermissionDefault.OP)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.invite", "PlainBase: Allows access to /team <team> invite (team admins only)", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.add", "PlainBase: Allows access to /team <team> add (team admins only)", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.kick", "PlainBase: Allows access to /team <team> kick (team admins only)", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.setrole", "PlainBase: Allows access to /team <team> setrole (team admins only)", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.request", "PlainBase: Allows access to /team <team> request", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.accept", "PlainBase: Allows access to /team accept", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.deny", "PlainBase: Allows access to /team deny", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.reject", "PlainBase: Allows access to /team reject (team admins only)", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.leave", "PlainBase: Allows access to /team leave", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.list", "PlainBase: Allows access to /team list", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.info", "PlainBase: Allows access to /team info", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.invites", "PlainBase: Allows access to /team invites (list your own pending invites)", PermissionDefault.TRUE)
         );
-        getServer().getPluginManager().addPermission(
+        addPermissionIfMissing(
                 new Permission("plainbase.team.requests", "PlainBase: Allows access to /team requests (team admins only)", PermissionDefault.TRUE)
         );
     }
@@ -334,6 +470,12 @@ public final class PlainBase extends JavaPlugin {
         if (getConfig().getBoolean("modules.team", true)) setupTeam();
 
         ensureGlobalListener();
+
+        // Warning-only version check, also on every /plainbase reload/toggle:
+        // an outdated module config after an update must be noticed even when
+        // the server was never restarted. (onEnable() reaches this via
+        // reloadModules(), so no separate call there.)
+        checkAllConfigVersions();
     }
 
     /**
@@ -395,20 +537,26 @@ public final class PlainBase extends JavaPlugin {
         if (tpaManager != null) {
             try {
                 tpaManager.cancelAll();
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                getLogger().warning("Failed to cancel TPA tasks during shutdown: " + e.getMessage());
             }
         }
         tpaManager = null;
         if (rtpManager != null) {
             try {
                 rtpManager.cancelAll();
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                getLogger().warning("Failed to cancel RTP tasks during shutdown: " + e.getMessage());
             }
         }
         rtpManager = null;
 
         // Vanish config is cached locally above, so unregistering first is safe.
         org.bukkit.event.HandlerList.unregisterAll(this);
+        // ConcurrentHashMap: clear() is safe against concurrent off-thread
+        // reads (BanManager refresh, scheduler callbacks). Iterate a snapshot
+        // copy anywhere we traverse the map so a concurrent clear()/put()
+        // can never throw ConcurrentModificationException mid-iteration.
         configs.clear();
         // The unregister above also removed the global listener: drop the
         // reference so reloadModules() re-registers it via ensureGlobalListener().
@@ -462,9 +610,11 @@ public final class PlainBase extends JavaPlugin {
             checkVersion("config.yml", getConfig().getDouble("version", 0.0), configLatest);
         }
 
-        configs.forEach((name, config) -> {
+        // Snapshot copy: a concurrent stopModules() -> clear() on another
+        // thread must never break this traversal.
+        new HashMap<>(configs).forEach((name, config) -> {
             Double latest = latestVersions.get(name);
-            if (latest != null) {
+            if (latest != null && config != null) {
                 checkVersion("modules/" + name, config.getDouble("version", 0.0), latest);
             }
         });
@@ -487,15 +637,32 @@ public final class PlainBase extends JavaPlugin {
         getServer().getPluginManager().registerEvents(new SpawnListener(this), this);
     }
 
+    /**
+     * Synchronous persist. Only for shutdown/fallback paths — never call this
+     * from a command or region thread (it blocks on disk I/O). That path must
+     * use {@link #saveSpawnConfigAsync()} instead. Never throws.
+     */
     public void saveSpawnConfig() {
-        try {
-            FileConfiguration config = getSpawnConfig();
-            if (config != null) {
+        FileConfiguration config = getSpawnConfig();
+        if (config == null) return;
+        synchronized (config) {
+            try {
                 config.save(new File(getDataFolder(), "modules/spawn.yml"));
+            } catch (IOException e) {
+                getLogger().severe("Could not save spawn.yml!");
             }
-        } catch (IOException e) {
-            getLogger().severe("Could not save spawn.yml!");
         }
+    }
+
+    /**
+     * Folia-safe persist for command/region threads (/setspawn and friends):
+     * snapshots the config in memory (no disk I/O on the calling thread) and
+     * writes the bytes on the async scheduler. Failures are logged; the caller
+     * keeps its optimistic success message (a write failure here is a broken
+     * disk, not a user error). Never throws.
+     */
+    public void saveSpawnConfigAsync() {
+        saveModuleConfigAsync("spawn.yml", getSpawnConfig());
     }
 
     public void setupJoinItems() {
@@ -657,14 +824,74 @@ public final class PlainBase extends JavaPlugin {
         return configs.get("team.yml");
     }
 
+    /**
+     * Synchronous persist. Only for shutdown/fallback paths — never call this
+     * from a command or region thread (it blocks on disk I/O). That path must
+     * use {@link #saveMenuConfigAsync()} instead. Never throws.
+     */
     public void saveMenuConfig() {
-        try {
-            FileConfiguration config = getMenuConfig();
-            if (config != null) {
+        FileConfiguration config = getMenuConfig();
+        if (config == null) return;
+        synchronized (config) {
+            try {
                 config.save(new File(getDataFolder(), "modules/menu.yml"));
+            } catch (IOException e) {
+                getLogger().severe("Could not save menu.yml!");
             }
-        } catch (IOException e) {
-            getLogger().severe("Could not save menu.yml!");
+        }
+    }
+
+    /**
+     * Folia-safe persist for command/region threads (/menu new|delete):
+     * snapshots the config in memory (no disk I/O on the calling thread) and
+     * writes the bytes on the async scheduler. Failures are logged; the caller
+     * keeps its optimistic success message (a write failure here is a broken
+     * disk, not a user error). Never throws.
+     */
+    public void saveMenuConfigAsync() {
+        saveModuleConfigAsync("menu.yml", getMenuConfig());
+    }
+
+    /**
+     * Shared async writer for small module configs changed from commands.
+     * {@code FileConfiguration#saveToString()} is memory-only, so the calling
+     * (region) thread never touches the disk; the actual byte write runs
+     * async. Synchronized on the config because two players on different
+     * Folia regions could run the command concurrently. If the scheduler
+     * rejects the task (shutdown), falls back to a best-effort synchronous
+     * write. Never throws to the caller.
+     */
+    private void saveModuleConfigAsync(String fileName, FileConfiguration config) {
+        if (config == null) {
+            getLogger().warning("Cannot save " + fileName + ": config is not loaded.");
+            return;
+        }
+        final String data;
+        synchronized (config) {
+            try {
+                data = config.saveToString();
+            } catch (Exception e) {
+                getLogger().severe("Could not save " + fileName + "!");
+                return;
+            }
+        }
+        final File target = new File(getDataFolder(), "modules/" + fileName);
+        Runnable write = () -> {
+            try {
+                File parent = target.getParentFile();
+                if (parent != null) parent.mkdirs();
+                Files.writeString(target.toPath(), data, StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                getLogger().severe("Could not save " + fileName + "!");
+            }
+        };
+        try {
+            Bukkit.getAsyncScheduler().runNow(this, task -> write.run());
+        } catch (Exception e) {
+            try {
+                write.run();
+            } catch (Exception ignored) {
+            }
         }
     }
 

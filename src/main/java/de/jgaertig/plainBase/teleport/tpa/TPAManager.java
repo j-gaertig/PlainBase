@@ -24,6 +24,11 @@ public class TPAManager {
 
 
     private final Map<UUID, TpaSession> activeSessions = new ConcurrentHashMap<>();
+    // tpAutoPlayers persists per-player tpauto flags in data/playerdata/<uuid>.yml
+    // (see loadPlayerData/savePlayerData). Entries intentionally survive quit:
+    // removal on quit would discard the persisted preference. A Set guarantees
+    // no duplicate growth — add() is idempotent, so repeated toggles/joins
+    // cannot accumulate entries.
     private final Set<UUID> tpAutoPlayers = ConcurrentHashMap.newKeySet();
     private final Map<UUID, ScheduledTask> activeWarmups = new ConcurrentHashMap<>();
 
@@ -33,6 +38,17 @@ public class TPAManager {
 
     public TPAManager(PlainBase plugin) {
         this.plugin = plugin;
+    }
+
+    /**
+     * Escapes a user-controlled value (player name) so it can be safely
+     * concatenated into a MiniMessage template BEFORE deserialization —
+     * without this, a name like {@code <click:run_command:...>} would inject
+     * formatting/click events (same pattern as ModerationCommandBase#esc and
+     * TeamManager#msg).
+     */
+    private String esc(String s) {
+        return plugin.getMiniMessage().escapeTags(s == null ? "" : s);
     }
 
     public void sendRequest(Player requester, Player target, RequestType type) {
@@ -49,8 +65,8 @@ public class TPAManager {
             }
         }
 
-        requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleport request sent to <yellow>" + target.getName() + "<gray>."));
-        target.sendMessage(plugin.getMiniMessage().deserialize("<yellow>" + requester.getName() + " <gray>has sent you a teleport request."));
+        requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleport request sent to <yellow>" + esc(target.getName()) + "<gray>."));
+        target.sendMessage(plugin.getMiniMessage().deserialize("<yellow>" + esc(requester.getName()) + " <gray>has sent you a teleport request."));
 
         if (tpAutoPlayers.contains(target.getUniqueId())) {
             startTeleportProcedure(requester, target, type);
@@ -88,6 +104,8 @@ public class TPAManager {
         Player requester = Bukkit.getPlayer(session.requesterId());
         if (requester != null) {
             startTeleportProcedure(requester, target, session.type());
+        } else {
+            target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
         }
 
         clearSession(target.getUniqueId());
@@ -102,7 +120,7 @@ public class TPAManager {
 
         Player requester = Bukkit.getPlayer(session.requesterId());
         if (requester != null) {
-            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>" + target.getName() + " denied your teleport request."));
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>" + esc(target.getName()) + " denied your teleport request."));
         }
         target.sendMessage(plugin.getMiniMessage().deserialize("<red>Request denied."));
 
@@ -142,7 +160,7 @@ public class TPAManager {
         Player requester = Bukkit.getPlayer(session.requesterId());
 
         if (target != null) target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request expired."));
-        if (requester != null) requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request to " + (target != null ? target.getName() : "player") + " expired."));
+        if (requester != null) requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request to " + (target != null ? esc(target.getName()) : "player") + " expired."));
     }
 
     private void clearSession(UUID targetId) {
@@ -162,6 +180,9 @@ public class TPAManager {
         Player destination = (type == RequestType.TPA) ? target : requester;
 
         long seconds = plugin.getTeleportConfig().getLong("tpa.counter.seconds", 3);
+        // Clamp like tpa.request_timeout above: negative/huge values must never
+        // leak into the scheduler delay or the displayed countdown.
+        seconds = Math.max(0, Math.min(30, seconds));
 
         if (!plugin.getTeleportConfig().getBoolean("tpa.counter.enabled", true) || seconds <= 0) {
             performTeleport(toTeleport, destination);
@@ -201,10 +222,13 @@ public class TPAManager {
     }
 
     public void cancelWarmup(Player p, String reason) {
+        if (p == null) return;
         ScheduledTask task = activeWarmups.remove(p.getUniqueId());
         if (task != null) {
             task.cancel();
-            p.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: " + reason));
+            if (p.isOnline()) {
+                p.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: " + reason));
+            }
         }
     }
 
@@ -212,9 +236,26 @@ public class TPAManager {
         for (ScheduledTask task : new ArrayList<>(activeWarmups.values())) {
             if (task != null) task.cancel();
         }
+        for (UUID uuid : new ArrayList<>(activeWarmups.keySet())) {
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && p.isOnline()) {
+                p.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: server reloading."));
+            }
+        }
         activeWarmups.clear();
-        for (TpaSession session : new ArrayList<>(activeSessions.values())) {
+        for (Map.Entry<UUID, TpaSession> entry : new ArrayList<>(activeSessions.entrySet())) {
+            TpaSession session = entry.getValue();
             if (session != null && session.timeoutTask() != null) session.timeoutTask().cancel();
+            Player target = Bukkit.getPlayer(entry.getKey());
+            if (target != null && target.isOnline()) {
+                target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: server reloading."));
+            }
+            if (session != null) {
+                Player requester = Bukkit.getPlayer(session.requesterId());
+                if (requester != null && requester.isOnline()) {
+                    requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: server reloading."));
+                }
+            }
         }
         activeSessions.clear();
     }
@@ -269,7 +310,7 @@ public class TPAManager {
 
             Player target = Bukkit.getPlayer(targetUUID);
             if (target != null) {
-                target.sendMessage(plugin.getMiniMessage().deserialize("<yellow>" + requester.getName() + " <gray>cancelled their teleport request."));
+                target.sendMessage(plugin.getMiniMessage().deserialize("<yellow>" + esc(requester.getName()) + " <gray>cancelled their teleport request."));
             }
         } else {
             requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any outgoing requests!"));
@@ -305,7 +346,7 @@ public class TPAManager {
             try {
                 config.save(file);
             } catch (IOException e) {
-                plugin.getLogger().severe("Could not save player data for " + uuid);
+                plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
             }
         });
     }

@@ -95,16 +95,17 @@ public class TeamCommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
         TeamManager teams = plugin.getTeamManager();
+        FileConfiguration teamConfig = plugin.getTeamConfig();
 
         if (!plugin.getConfig().getBoolean("modules.team", true)) {
             sender.sendMessage(mm("<red>This module is currently disabled."));
             return;
         }
-        if (!plugin.getTeamConfig().getBoolean("team.enabled", true) || teams == null) {
+        if (teams == null || teamConfig == null || !teamConfig.getBoolean("team.enabled", true)) {
             sender.sendMessage(mm("<red>The team system has been disabled."));
             return;
         }
-        if (!plugin.getTeamConfig().getBoolean("team.commands.team.enabled", true)) {
+        if (!teamConfig.getBoolean("team.commands.team.enabled", true)) {
             sender.sendMessage(mm("<red>This command has been disabled."));
             return;
         }
@@ -121,7 +122,7 @@ public class TeamCommand implements BasicCommand {
             return;
         }
         if (!checkPermission(sender, spec.permission())) return;
-        if (!plugin.getTeamConfig().getBoolean("team.commands." + spec.name() + ".enabled", true)) {
+        if (!teamConfig.getBoolean("team.commands." + spec.name() + ".enabled", true)) {
             sender.sendMessage(mm("<red>This command has been disabled."));
             return;
         }
@@ -221,7 +222,9 @@ public class TeamCommand implements BasicCommand {
      * so they can never inject MiniMessage formatting or click events.
      */
     private net.kyori.adventure.text.Component teamMsg(String key, String defaultText, String... placeholders) {
-        String raw = plugin.getTeamConfig().getString("messages." + key, defaultText);
+        FileConfiguration teamConfig = plugin.getTeamConfig();
+        String raw = teamConfig != null ? teamConfig.getString("messages." + key, defaultText) : defaultText;
+        if (raw == null) raw = defaultText;
         for (int i = 0; i + 1 < placeholders.length; i += 2) {
             String value = placeholders[i + 1] == null ? "" : placeholders[i + 1];
             raw = raw.replace("%" + placeholders[i] + "%", plugin.getMiniMessage().escapeTags(value));
@@ -252,6 +255,7 @@ public class TeamCommand implements BasicCommand {
         ActionSpec spec = ACTIONS.get(args[0].toLowerCase(Locale.ROOT));
         if (spec == null || !spec.teamScoped()) return List.of();
         if (!teamCfg.getBoolean("team.commands." + spec.name() + ".enabled", true)) return List.of();
+        if (!hasPermission(sender, spec.permission())) return List.of();
 
         if (args.length == 2) {
             String input = args[1].toLowerCase(Locale.ROOT);
@@ -259,11 +263,27 @@ public class TeamCommand implements BasicCommand {
                     .filter(id -> id.startsWith(input)).toList();
         }
         if (args.length == 3 && spec.hasPlayerArg()) {
+            if (spec.adminGated()) {
+                String teamId = args[1].toLowerCase(Locale.ROOT);
+                if (!teams.teamExists(teamId)) return List.of();
+                if (!teams.isTeamAdmin(sender, teamId)) return List.of();
+            }
             String input = args[2].toLowerCase(Locale.ROOT);
+            if (sender instanceof Player viewer && plugin.getVanishManager() != null) {
+                try {
+                    return Bukkit.getOnlinePlayers().stream()
+                            .filter(p -> plugin.getVanishManager().canSee(viewer, p))
+                            .map(Player::getName)
+                            .filter(n -> n.toLowerCase(Locale.ROOT).startsWith(input)).toList();
+                } catch (Exception e) {
+                    return List.of();
+                }
+            }
             return Bukkit.getOnlinePlayers().stream().map(Player::getName)
                     .filter(n -> n.toLowerCase(Locale.ROOT).startsWith(input)).toList();
         }
         if (args.length == 4 && spec.hasRoleArg()) {
+            if (!hasPermission(sender, spec.permission())) return List.of();
             String input = args[3].toLowerCase(Locale.ROOT);
             return Stream.of("member", "admin").filter(s -> s.startsWith(input)).toList();
         }

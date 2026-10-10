@@ -10,8 +10,8 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 /**
  * /kick <player> [reason] — only works on online players (kicks are not
@@ -81,9 +81,8 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         if (args.length <= 1) {
-            String input = args.length == 0 ? "" : args[0].toLowerCase();
-            return Bukkit.getOnlinePlayers().stream().map(Player::getName)
-                    .filter(n -> n.toLowerCase().startsWith(input)).collect(Collectors.toList());
+            String input = args.length == 0 ? "" : args[0];
+            return suggestOnlinePlayers(stack.getSender(), input, "plainbase.moderation.kick");
         }
         return List.of();
     }

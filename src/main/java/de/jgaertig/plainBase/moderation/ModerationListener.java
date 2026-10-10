@@ -1,6 +1,8 @@
 package de.jgaertig.plainBase.moderation;
 
 import de.jgaertig.plainBase.PlainBase;
+import net.kyori.adventure.text.Component;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
@@ -34,15 +36,38 @@ public class ModerationListener implements Listener {
         BanManager manager = plugin.getBanManager();
         if (manager == null) return;
 
-        // getAddress() can be null on some proxies/edge cases — never let a
-        // null address NPE into a fail-open bypass; skip only the IP-ban check.
-        String ip = event.getAddress() == null ? "unknown" : event.getAddress().getHostAddress();
+        // Fail-open: during /plainbase reload (stopModules() clears configs,
+        // setupModeration() re-loads them right after) getModerationConfig()
+        // can briefly be null — and this event runs async, so the reload can
+        // land mid-check. A missing config must allow the login, never NPE.
+        FileConfiguration modConfig = plugin.getModerationConfig();
+        if (modConfig == null) {
+            plugin.getLogger().warning("Moderation config unavailable during pre-login for "
+                    + Objects.toString(event.getName(), "?") + " — allowing login (fail-open).");
+            return;
+        }
+
+        // getAddress()/getHostAddress() can be null on some proxies/edge cases.
+        // Never persist the literal "unknown" (or null/blank) in the DB — it
+        // would later resolve via /banip <name> and ban a bogus address. Skip
+        // tracking AND the IP-ban check entirely when there is no real address;
+        // a missing address must never NPE into a fail-open bypass either.
+        String rawIp = event.getAddress() == null ? null : event.getAddress().getHostAddress();
+        String ip = (rawIp == null || rawIp.isBlank() || "unknown".equalsIgnoreCase(rawIp.trim())) ? null : rawIp;
 
         // Always record the IP (even for a player we're about to reject) so
-        // staff can /banip a name later even if this exact login is denied.
-        manager.trackPlayerIp(event.getUniqueId(), event.getName(), ip);
+        // staff can /banip a name later even if this exact login is denied —
+        // but only when there is a real address to record.
+        if (ip != null) {
+            try {
+                manager.trackPlayerIp(event.getUniqueId(), event.getName(), ip);
+            } catch (RuntimeException e) {
+                plugin.getLogger().warning("Could not track player IP for "
+                        + Objects.toString(event.getName(), "?") + ": " + e.getMessage());
+            }
+        }
 
-        if (!plugin.getModerationConfig().getBoolean("ban.enabled", true)) return;
+        if (!modConfig.getBoolean("ban.enabled", true)) return;
 
         try {
             BanRecord ban = manager.queryActiveBanNow(event.getUniqueId());
@@ -51,7 +76,7 @@ public class ModerationListener implements Listener {
                 return;
             }
 
-            if (!"unknown".equals(ip) && plugin.getModerationConfig().getBoolean("ip-ban.enabled", true)) {
+            if (ip != null && modConfig.getBoolean("ip-ban.enabled", true)) {
                 IpBanRecord ipBan = manager.queryActiveIpBanNow(ip);
                 if (ipBan != null) {
                     disallowForIpBan(event, ipBan);
@@ -68,8 +93,14 @@ public class ModerationListener implements Listener {
 
     private void disallowForBan(AsyncPlayerPreLoginEvent event, BanRecord ban) {
         long now = System.currentTimeMillis();
-        String template = Objects.toString(
-                plugin.getModerationConfig().getString(
+        // Re-read: a /plainbase reload racing this async event can null the
+        // config between the check in onPreLogin and here — fall back to a
+        // plain screen instead of NPE-ing (fail-open keeps the login allowed
+        // only via onPreLogin's guard; here we already decided to deny, so a
+        // fallback message is correct).
+        FileConfiguration modConfig = plugin.getModerationConfig();
+        String template = modConfig == null ? "<red>You are banned." : Objects.toString(
+                modConfig.getString(
                         ban.isPermanent() ? "messages.ban-screen" : "messages.tempban-screen",
                         "<red>You are banned."),
                 "<red>You are banned.");
@@ -83,13 +114,14 @@ public class ModerationListener implements Listener {
                 .replace("%staff%", staff)
                 .replace("%remaining%", DurationParser.format(ban.remainingMillis(now)));
 
-        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, plugin.getMiniMessage().deserialize(text));
+        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, kickMessage(text));
     }
 
     private void disallowForIpBan(AsyncPlayerPreLoginEvent event, IpBanRecord ban) {
         long now = System.currentTimeMillis();
-        String template = Objects.toString(
-                plugin.getModerationConfig().getString("messages.ipban-screen", "<red>Your IP address is banned."),
+        FileConfiguration modConfig = plugin.getModerationConfig();
+        String template = modConfig == null ? "<red>Your IP address is banned." : Objects.toString(
+                modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
                 "<red>Your IP address is banned.");
 
         String reason = plugin.getMiniMessage().escapeTags(Objects.toString(ban.reason(), ""));
@@ -99,6 +131,24 @@ public class ModerationListener implements Listener {
                 .replace("%staff%", staff)
                 .replace("%remaining%", DurationParser.format(ban.remainingMillis(now)));
 
-        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, plugin.getMiniMessage().deserialize(text));
+        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED, kickMessage(text));
+    }
+
+    /**
+     * MiniMessage with a plain-text fallback: a broken admin template must
+     * never turn a deny into an exception (which would fail open and let a
+     * banned player in).
+     */
+    private Component kickMessage(String text) {
+        try {
+            return plugin.getMiniMessage().deserialize(text);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Invalid ban-screen MiniMessage, using plain fallback: " + e.getMessage());
+            return Component.text(stripTags(text));
+        }
+    }
+
+    private static String stripTags(String text) {
+        return text == null ? "You are banned." : text.replaceAll("<[^>]*>", "");
     }
 }

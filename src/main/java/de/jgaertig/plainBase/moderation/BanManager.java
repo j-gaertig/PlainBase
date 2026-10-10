@@ -64,6 +64,14 @@ public class BanManager {
 
     private ScheduledTask refreshTask;
 
+    /**
+     * Blocking DB setup (connect + initial cache fill). Runs on the main thread
+     * from PlainBase#setupModeration, which fail-opens (module disabled with a
+     * severe log) when this throws — a broken/unreachable database must never
+     * crash startup. ModerationDatabase bounds the connect with short timeouts
+     * so this cannot hang the main thread indefinitely; the initial refresh is
+     * required before any command can answer from cache.
+     */
     public BanManager(PlainBase plugin) throws SQLException {
         this.plugin = plugin;
         this.db = new ModerationDatabase(plugin);
@@ -203,6 +211,10 @@ public class BanManager {
      * Blocking DB write — only call from an already-async context.
      */
     public void trackPlayerIp(UUID uuid, String name, String ip) {
+        // Defense-in-depth alongside ModerationListener: never persist a null,
+        // blank or literal-"unknown" address — it would later resolve via
+        // /banip <name> and ban a bogus address.
+        if (ip == null || ip.isBlank() || "unknown".equalsIgnoreCase(ip.trim())) return;
         try {
             db.trackPlayerIp(uuid, name, ip);
         } catch (SQLException e) {

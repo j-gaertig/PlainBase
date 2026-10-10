@@ -7,6 +7,7 @@ import net.kyori.adventure.text.format.TextColor;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -44,7 +45,13 @@ public class TeamManager {
 
     public record TeamDefinition(String id, String displayName, String color, NamedTextColor vanillaColor) {
         public Component renderDisplayName(PlainBase plugin) {
-            return plugin.getMiniMessage().deserialize(displayName);
+            // Admin-authored MiniMessage can be broken — never let a bad
+            // display-name throw into scoreboard/command rendering.
+            try {
+                return plugin.getMiniMessage().deserialize(displayName);
+            } catch (Exception e) {
+                return Component.text(displayName != null ? displayName : id);
+            }
         }
     }
 
@@ -68,10 +75,20 @@ public class TeamManager {
     // Per-player lock for invite/accept/deny/add/request check-then-act
     // sequences, so two concurrent actions for the same player cannot both
     // pass a check (e.g. max-teams) and then both mutate.
-    private final ConcurrentHashMap<UUID, Object> uuidLocks = new ConcurrentHashMap<>();
+    // Fixed-size stripe array — deliberately NOT one lock object per UUID in a
+    // map: a map would grow without bound (one entry per ever-seen player,
+    // never removed). Stripes bound memory to a constant; collisions between
+    // different players only reduce concurrency slightly, never correctness.
+    private final Object[] lockStripes = initStripes(64);
+
+    private static Object[] initStripes(int size) {
+        Object[] stripes = new Object[size];
+        for (int i = 0; i < size; i++) stripes[i] = new Object();
+        return stripes;
+    }
 
     private Object lockFor(UUID uuid) {
-        return uuidLocks.computeIfAbsent(uuid, k -> new Object());
+        return lockStripes[(uuid.hashCode() & 0x7fffffff) % lockStripes.length];
     }
 
     // Built-in defaults for message keys added after team.yml v1.1, so servers
@@ -100,9 +117,18 @@ public class TeamManager {
             plugin.getLogger().info("Team module: running on Folia, scoreboard-based team selectors (@a[team=pb_<id>]) are disabled "
                     + "because Folia's scoreboard API is currently unsupported. Team membership, roles, commands and placeholders are unaffected.");
         } else {
-            this.scoreboard = Bukkit.getScoreboardManager() != null ? Bukkit.getScoreboardManager().getMainScoreboard() : null;
-            syncScoreboardTeamDefinitions();
-            for (String teamId : memberships.keySet()) refreshScoreboardEntries(teamId);
+            // Scoreboard mirroring must never break setupTeam(): a broken
+            // Bukkit scoreboard, a bad color/prefix template or a duplicate
+            // team name disables only the selector mirror, not the module.
+            try {
+                this.scoreboard = Bukkit.getScoreboardManager() != null ? Bukkit.getScoreboardManager().getMainScoreboard() : null;
+                syncScoreboardTeamDefinitions();
+                for (String teamId : memberships.keySet()) refreshScoreboardEntries(teamId);
+            } catch (Exception e) {
+                plugin.getLogger().severe("Team module: scoreboard mirror disabled (" + e.getMessage()
+                        + "). Memberships, roles, commands and placeholders are unaffected.");
+                this.scoreboard = null;
+            }
         }
     }
 
@@ -127,21 +153,27 @@ public class TeamManager {
         if (section == null) return;
 
         for (String rawId : section.getKeys(false)) {
-            String id = rawId.toLowerCase(Locale.ROOT);
-            // Vanilla scoreboard names are capped at 16 chars ("pb_" + id), so
-            // ids longer than 12 chars could never be mirrored. Skip with a loud
-            // warning instead of silently truncating (truncation could map two
-            // different teams onto one scoreboard team).
-            if (id.length() > 12) {
-                plugin.getLogger().severe("Team '" + rawId + "' skipped: id is " + id.length()
-                        + " chars, max is 12 (vanilla scoreboard limit is 16 chars for \"pb_<id>\"). "
-                        + "Shorten the id in modules/team.yml.");
-                continue;
+            try {
+                String id = rawId.toLowerCase(Locale.ROOT);
+                // Vanilla scoreboard names are capped at 16 chars ("pb_" + id), so
+                // ids longer than 12 chars could never be mirrored. Skip with a loud
+                // warning instead of silently truncating (truncation could map two
+                // different teams onto one scoreboard team).
+                if (id.length() > 12) {
+                    plugin.getLogger().severe("Team '" + rawId + "' skipped: id is " + id.length()
+                            + " chars, max is 12 (vanilla scoreboard limit is 16 chars for \"pb_<id>\"). "
+                            + "Shorten the id in modules/team.yml.");
+                    continue;
+                }
+                String displayName = section.getString(rawId + ".display-name", id);
+                String color = section.getString(rawId + ".color", "<white>");
+                NamedTextColor vanillaColor = resolveVanillaColor(color);
+                teams.put(id, new TeamDefinition(id, displayName, color, vanillaColor));
+            } catch (Exception e) {
+                // One broken definition must never abort the whole parse —
+                // skip it loudly, keep the remaining teams.
+                plugin.getLogger().warning("Team '" + rawId + "' skipped: could not parse definition (" + e.getMessage() + ").");
             }
-            String displayName = section.getString(rawId + ".display-name", id);
-            String color = section.getString(rawId + ".color", "<white>");
-            NamedTextColor vanillaColor = resolveVanillaColor(color);
-            teams.put(id, new TeamDefinition(id, displayName, color, vanillaColor));
         }
     }
 
@@ -165,11 +197,11 @@ public class TeamManager {
     }
 
     public boolean teamExists(String id) {
-        return teams.containsKey(id.toLowerCase());
+        return teams.containsKey(id.toLowerCase(Locale.ROOT));
     }
 
     public TeamDefinition getTeam(String id) {
-        return teams.get(id.toLowerCase());
+        return teams.get(id.toLowerCase(Locale.ROOT));
     }
 
     public Collection<TeamDefinition> getTeams() {
@@ -177,7 +209,12 @@ public class TeamManager {
     }
 
     public int getMaxTeamsPerPlayer() {
-        return Math.max(1, plugin.getTeamConfig().getInt("team.max-teams-per-player", 1));
+        return maxTeamsOf(plugin.getTeamConfig());
+    }
+
+    private static int maxTeamsOf(FileConfiguration cfg) {
+        if (cfg == null) return 1;
+        return Math.max(1, cfg.getInt("team.max-teams-per-player", 1));
     }
 
     // ---------------------------------------------------------------
@@ -185,12 +222,12 @@ public class TeamManager {
     // ---------------------------------------------------------------
 
     public boolean isMember(UUID uuid, String teamId) {
-        Map<UUID, Role> members = memberships.get(teamId.toLowerCase());
+        Map<UUID, Role> members = memberships.get(teamId.toLowerCase(Locale.ROOT));
         return members != null && members.containsKey(uuid);
     }
 
     public Role getRole(UUID uuid, String teamId) {
-        Map<UUID, Role> members = memberships.get(teamId.toLowerCase());
+        Map<UUID, Role> members = memberships.get(teamId.toLowerCase(Locale.ROOT));
         return members != null ? members.get(uuid) : null;
     }
 
@@ -200,11 +237,17 @@ public class TeamManager {
      * ADMIN role in this specific team.
      */
     public boolean isTeamAdmin(CommandSender sender, String teamId) {
-        if (!(sender instanceof Player player)) return true; // console always allowed
+        // Permission holders first — applies to every sender type (a command
+        // block only passes here if it was explicitly granted the permission).
+        if (sender.hasPermission("plainbase.admin") || sender.hasPermission("plainbase.team.admin")) return true;
+        if (!(sender instanceof Player player)) {
+            // Console is always allowed; any other non-player sender (command
+            // block, ...) is NOT automatically admin.
+            return sender instanceof ConsoleCommandSender;
+        }
         if (player.isOp()) return true;
-        if (player.hasPermission("plainbase.admin") || player.hasPermission("plainbase.team.admin")) return true;
         if (teamId == null) return false;
-        return getRole(player.getUniqueId(), teamId.toLowerCase()) == Role.ADMIN;
+        return getRole(player.getUniqueId(), teamId.toLowerCase(Locale.ROOT)) == Role.ADMIN;
     }
 
     public Set<String> getPlayerTeams(UUID uuid) {
@@ -224,12 +267,12 @@ public class TeamManager {
     }
 
     public boolean isInvited(UUID uuid, String teamId) {
-        return invites.getOrDefault(uuid, Set.of()).contains(teamId.toLowerCase());
+        return invites.getOrDefault(uuid, Set.of()).contains(teamId.toLowerCase(Locale.ROOT));
     }
 
     /** Snapshot of a team's pending join requests (admin-facing). */
     public Set<UUID> getPendingRequests(String teamId) {
-        return Set.copyOf(requests.getOrDefault(teamId.toLowerCase(), Set.of()));
+        return Set.copyOf(requests.getOrDefault(teamId.toLowerCase(Locale.ROOT), Set.of()));
     }
 
     /** Snapshot of a player's own pending invites, across every team. */
@@ -243,29 +286,34 @@ public class TeamManager {
 
     public void invite(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
-        resolveTarget(staff, targetName, target -> {
+        // Snapshot the config at entry: the callback below may run later on
+        // another thread (async lookup -> region thread), where a concurrent
+        // /plainbase reload could have cleared getTeamConfig() to null.
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        final int maxTeams = maxTeamsOf(cfgSnapshot);
+        resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
                 if (isMember(uuid, id)) {
-                    staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
+                    staff.sendMessage(msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
                     return;
                 }
                 if (invites.getOrDefault(uuid, Set.of()).contains(id)) {
-                    staff.sendMessage(msg("invite-already-pending", "player", targetName, "team", id));
+                    staff.sendMessage(msg(cfgSnapshot, "invite-already-pending", "player", targetName, "team", id));
                     return;
                 }
-                if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-                    staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
+                if (getPlayerTeams(uuid).size() >= maxTeams) {
+                    staff.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
                     return;
                 }
 
                 invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
                 saveInvites();
-                staff.sendMessage(msg("invite-sent", "player", targetName, "team", id));
+                staff.sendMessage(msg(cfgSnapshot, "invite-sent", "player", targetName, "team", id));
 
                 Player online = Bukkit.getPlayer(uuid);
                 if (online != null) {
-                    online.sendMessage(msg("invite-received", "team", id));
+                    online.sendMessage(msg(cfgSnapshot, "invite-received", "team", id));
                 }
             }
         });
@@ -273,13 +321,15 @@ public class TeamManager {
 
     public void accept(Player player, String teamIdOrNull) {
         UUID uuid = player.getUniqueId();
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        final int maxTeams = maxTeamsOf(cfgSnapshot);
         synchronized (lockFor(uuid)) {
             Set<String> pending = invites.getOrDefault(uuid, Set.of());
-            String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
+            String id = resolveSingle(player, cfgSnapshot, pending, teamIdOrNull, "invite-not-found");
             if (id == null) return;
 
-            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-                player.sendMessage(msg("max-teams-reached", "player", player.getName(), "max", String.valueOf(getMaxTeamsPerPlayer())));
+            if (getPlayerTeams(uuid).size() >= maxTeams) {
+                player.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", player.getName(), "max", String.valueOf(maxTeams)));
                 return;
             }
 
@@ -289,15 +339,16 @@ public class TeamManager {
             });
             saveInvites();
             setMember(uuid, id, Role.MEMBER);
-            player.sendMessage(msg("invite-accepted", "team", id));
+            player.sendMessage(msg(cfgSnapshot, "invite-accepted", "team", id));
         }
     }
 
     public void deny(Player player, String teamIdOrNull) {
         UUID uuid = player.getUniqueId();
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         synchronized (lockFor(uuid)) {
             Set<String> pending = invites.getOrDefault(uuid, Set.of());
-            String id = resolveSingle(player, pending, teamIdOrNull, "invite-not-found");
+            String id = resolveSingle(player, cfgSnapshot, pending, teamIdOrNull, "invite-not-found");
             if (id == null) return;
 
             invites.computeIfPresent(uuid, (k, set) -> {
@@ -305,21 +356,23 @@ public class TeamManager {
                 return set.isEmpty() ? null : set;
             });
             saveInvites();
-            player.sendMessage(msg("invite-denied", "team", id));
+            player.sendMessage(msg(cfgSnapshot, "invite-denied", "team", id));
         }
     }
 
     public void add(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
-        resolveTarget(staff, targetName, target -> {
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        final int maxTeams = maxTeamsOf(cfgSnapshot);
+        resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
                 if (isMember(uuid, id)) {
-                    staff.sendMessage(msg("already-in-team", "player", targetName, "team", id));
+                    staff.sendMessage(msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
                     return;
                 }
-                if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-                    staff.sendMessage(msg("max-teams-reached", "player", targetName, "max", String.valueOf(getMaxTeamsPerPlayer())));
+                if (getPlayerTeams(uuid).size() >= maxTeams) {
+                    staff.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
                     return;
                 }
 
@@ -338,80 +391,87 @@ public class TeamManager {
                 if (assigned == Role.ADMIN) {
                     plugin.getLogger().info("Team '" + id + "': " + targetName + " added as ADMIN (team had no admins).");
                 }
-                staff.sendMessage(msg("add-success", "player", targetName, "team", id));
+                staff.sendMessage(msg(cfgSnapshot, "add-success", "player", targetName, "team", id));
 
                 Player online = Bukkit.getPlayer(uuid);
-                if (online != null) online.sendMessage(msg("add-success", "player", online.getName(), "team", id));
+                if (online != null) online.sendMessage(msg(cfgSnapshot, "add-success", "player", online.getName(), "team", id));
             }
         });
     }
 
     public void kick(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
-        resolveTarget(staff, targetName, target -> {
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
+            synchronized (lockFor(uuid)) {
+                if (!isMember(uuid, id)) {
+                    staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
+                    return;
+                }
+                if (denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
 
-            if (!isMember(uuid, id)) {
-                staff.sendMessage(msg("not-in-team", "team", id));
-                return;
+                removeMember(uuid, id);
+                staff.sendMessage(msg(cfgSnapshot, "kick-success", "player", targetName, "team", id));
+
+                Player online = Bukkit.getPlayer(uuid);
+                if (online != null) online.sendMessage(msg(cfgSnapshot, "kick-success", "player", online.getName(), "team", id));
             }
-            if (denyIfLastAdmin(staff, id, uuid)) return;
-
-            removeMember(uuid, id);
-            staff.sendMessage(msg("kick-success", "player", targetName, "team", id));
-
-            Player online = Bukkit.getPlayer(uuid);
-            if (online != null) online.sendMessage(msg("kick-success", "player", online.getName(), "team", id));
         });
     }
 
     public void leave(Player player, String teamIdOrNull) {
         UUID uuid = player.getUniqueId();
-        Set<String> memberOf = getPlayerTeams(uuid);
-        String id;
-        if (teamIdOrNull != null) {
-            id = teamIdOrNull.toLowerCase(Locale.ROOT);
-            if (!memberOf.contains(id)) {
-                player.sendMessage(msg("not-in-team", "team", id));
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        synchronized (lockFor(uuid)) {
+            Set<String> memberOf = getPlayerTeams(uuid);
+            String id;
+            if (teamIdOrNull != null) {
+                id = teamIdOrNull.toLowerCase(Locale.ROOT);
+                if (!memberOf.contains(id)) {
+                    player.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
+                    return;
+                }
+            } else if (memberOf.size() == 1) {
+                id = memberOf.iterator().next();
+            } else if (memberOf.isEmpty()) {
+                player.sendMessage(msg(cfgSnapshot, "not-in-team", "team", "?"));
+                return;
+            } else {
+                player.sendMessage(msg(cfgSnapshot, "leave-usage-multiple"));
                 return;
             }
-        } else if (memberOf.size() == 1) {
-            id = memberOf.iterator().next();
-        } else if (memberOf.isEmpty()) {
-            player.sendMessage(msg("not-in-team", "team", "?"));
-            return;
-        } else {
-            player.sendMessage(msg("leave-usage-multiple"));
-            return;
-        }
 
-        if (denyIfLastAdmin(player, id, uuid)) return;
-        removeMember(uuid, id);
-        player.sendMessage(msg("leave-success", "team", id));
+            if (denyIfLastAdmin(player, cfgSnapshot, id, uuid)) return;
+            removeMember(uuid, id);
+            player.sendMessage(msg(cfgSnapshot, "leave-success", "team", id));
+        }
     }
 
     public void request(Player player, String teamId) {
         String id = teamId.toLowerCase(Locale.ROOT);
         UUID uuid = player.getUniqueId();
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        final int maxTeams = maxTeamsOf(cfgSnapshot);
         synchronized (lockFor(uuid)) {
             if (isMember(uuid, id)) {
-                player.sendMessage(msg("already-member", "team", id));
+                player.sendMessage(msg(cfgSnapshot, "already-member", "team", id));
                 return;
             }
             if (requests.getOrDefault(id, Set.of()).contains(uuid)) {
-                player.sendMessage(msg("request-already-pending", "team", id));
+                player.sendMessage(msg(cfgSnapshot, "request-already-pending", "team", id));
                 return;
             }
-            if (getPlayerTeams(uuid).size() >= getMaxTeamsPerPlayer()) {
-                player.sendMessage(msg("max-teams-reached", "player", player.getName(), "max", String.valueOf(getMaxTeamsPerPlayer())));
+            if (getPlayerTeams(uuid).size() >= maxTeams) {
+                player.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", player.getName(), "max", String.valueOf(maxTeams)));
                 return;
             }
 
             requests.computeIfAbsent(id, k -> ConcurrentHashMap.newKeySet()).add(uuid);
             saveRequests();
-            player.sendMessage(msg("request-sent", "team", id));
+            player.sendMessage(msg(cfgSnapshot, "request-sent", "team", id));
 
-            Component notice = msg("request-received", "player", player.getName(), "team", id);
+            Component notice = msg(cfgSnapshot, "request-received", "player", player.getName(), "team", id);
             for (Map.Entry<UUID, Role> entry : getMembers(id).entrySet()) {
                 if (entry.getValue() != Role.ADMIN) continue;
                 Player admin = Bukkit.getPlayer(entry.getKey());
@@ -422,12 +482,13 @@ public class TeamManager {
 
     public void denyRequest(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
-        resolveTarget(staff, targetName, target -> {
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
                 Set<UUID> pending = requests.get(id);
                 if (pending == null || !pending.contains(uuid)) {
-                    staff.sendMessage(msg("request-not-found", "player", targetName, "team", id));
+                    staff.sendMessage(msg(cfgSnapshot, "request-not-found", "player", targetName, "team", id));
                     return;
                 }
                 requests.computeIfPresent(id, (k, set) -> {
@@ -435,49 +496,54 @@ public class TeamManager {
                     return set.isEmpty() ? null : set;
                 });
                 saveRequests();
-                staff.sendMessage(msg("request-reject-success", "player", targetName, "team", id));
+                staff.sendMessage(msg(cfgSnapshot, "request-reject-success", "player", targetName, "team", id));
 
                 Player online = Bukkit.getPlayer(uuid);
-                if (online != null) online.sendMessage(msg("request-rejected", "team", id));
+                if (online != null) online.sendMessage(msg(cfgSnapshot, "request-rejected", "team", id));
             }
         });
     }
 
     public void setRole(CommandSender staff, String teamId, String targetName, String roleStr) {
         String id = teamId.toLowerCase(Locale.ROOT);
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         Role role;
         try {
-            role = Role.valueOf(roleStr.toUpperCase());
+            role = Role.valueOf(roleStr.toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
-            staff.sendMessage(msg("invalid-role"));
+            staff.sendMessage(msg(cfgSnapshot, "invalid-role"));
             return;
         }
 
-        resolveTarget(staff, targetName, target -> {
+        resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
+            synchronized (lockFor(uuid)) {
+                if (!isMember(uuid, id)) {
+                    staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
+                    return;
+                }
+                // Demoting the last remaining admin would orphan the team.
+                if (role == Role.MEMBER && denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
 
-            if (!isMember(uuid, id)) {
-                staff.sendMessage(msg("not-in-team", "team", id));
-                return;
-            }
-            // Demoting the last remaining admin would orphan the team.
-            if (role == Role.MEMBER && denyIfLastAdmin(staff, id, uuid)) return;
+                setMember(uuid, id, role);
+                staff.sendMessage(msg(cfgSnapshot, "setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
 
-            setMember(uuid, id, role);
-            staff.sendMessage(msg("setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase()));
-
-            Player online = Bukkit.getPlayer(uuid);
-            if (online != null) {
-                online.sendMessage(msg("setrole-success", "player", online.getName(), "team", id, "role", role.name().toLowerCase()));
+                Player online = Bukkit.getPlayer(uuid);
+                if (online != null) {
+                    online.sendMessage(msg(cfgSnapshot, "setrole-success", "player", online.getName(), "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
+                }
             }
         });
     }
 
     public void listTeams(CommandSender sender) {
-        sender.sendMessage(msg("list-header"));
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        sender.sendMessage(msg(cfgSnapshot, "list-header"));
         for (TeamDefinition def : teams.values()) {
             int count = getMembers(def.id()).size();
-            String displayLegacy = plugin.getTeamConfig().getString("messages.list-entry", "%team-display% (%count% members)");
+            String fallback = "%team-display% (%count% members)";
+            String displayLegacy = cfgSnapshot != null ? cfgSnapshot.getString("messages.list-entry", fallback) : fallback;
+            if (displayLegacy == null) displayLegacy = fallback;
             String rendered = displayLegacy
                     .replace("%team-display%", def.color() + def.displayName())
                     .replace("%count%", String.valueOf(count));
@@ -486,28 +552,32 @@ public class TeamManager {
     }
 
     public void info(CommandSender sender, String teamId) {
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         if (teamId == null) {
-            sender.sendMessage(msg("unknown-team", "team", "?"));
+            sender.sendMessage(msg(cfgSnapshot, "unknown-team", "team", "?"));
             return;
         }
         TeamDefinition def = getTeam(teamId);
         if (def == null) {
-            sender.sendMessage(msg("unknown-team", "team", teamId));
+            sender.sendMessage(msg(cfgSnapshot, "unknown-team", "team", teamId));
             return;
         }
         Map<UUID, Role> members = getMembers(teamId.toLowerCase(Locale.ROOT));
 
-        String header = plugin.getTeamConfig().getString("messages.info-header", "--- %team-display% ---")
+        String fallbackHeader = "--- %team-display% ---";
+        String headerRaw = cfgSnapshot != null ? cfgSnapshot.getString("messages.info-header", fallbackHeader) : fallbackHeader;
+        if (headerRaw == null) headerRaw = fallbackHeader;
+        String header = headerRaw
                 .replace("%team-display%", def.color() + def.displayName());
         sender.sendMessage(safeDeserialize(header));
 
         if (members.isEmpty()) {
-            sender.sendMessage(msg("info-empty"));
+            sender.sendMessage(msg(cfgSnapshot, "info-empty"));
             return;
         }
         for (Map.Entry<UUID, Role> entry : members.entrySet()) {
-            String name = Optional.ofNullable(Bukkit.getOfflinePlayer(entry.getKey()).getName()).orElse(entry.getKey().toString());
-            sender.sendMessage(msg("info-member", "player", name, "role", entry.getValue().name().toLowerCase()));
+            String name = Optional.ofNullable(lookupName(entry.getKey())).orElse(entry.getKey().toString());
+            sender.sendMessage(msg(cfgSnapshot, "info-member", "player", name, "role", entry.getValue().name().toLowerCase(Locale.ROOT)));
         }
     }
 
@@ -516,43 +586,46 @@ public class TeamManager {
      * /team &lt;team&gt; request and are waiting on an admin to /team add them).
      */
     public void listRequests(CommandSender sender, String teamId) {
-        String id = teamId.toLowerCase();
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        String id = teamId.toLowerCase(Locale.ROOT);
         Set<UUID> pending = getPendingRequests(id);
-        sender.sendMessage(msg("requests-header", "team", id));
+        sender.sendMessage(msg(cfgSnapshot, "requests-header", "team", id));
         if (pending.isEmpty()) {
-            sender.sendMessage(msg("requests-empty", "team", id));
+            sender.sendMessage(msg(cfgSnapshot, "requests-empty", "team", id));
             return;
         }
         for (UUID uuid : pending) {
-            String name = Optional.ofNullable(Bukkit.getOfflinePlayer(uuid).getName()).orElse(uuid.toString());
-            sender.sendMessage(msg("requests-entry", "player", name));
+            String name = Optional.ofNullable(lookupName(uuid)).orElse(uuid.toString());
+            sender.sendMessage(msg(cfgSnapshot, "requests-entry", "player", name));
         }
     }
 
     /** Self-facing: list the invites a player is currently sitting on. */
     public void listInvites(Player player) {
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         Set<String> pending = getPendingInvites(player.getUniqueId());
-        player.sendMessage(msg("invites-header"));
+        player.sendMessage(msg(cfgSnapshot, "invites-header"));
         if (pending.isEmpty()) {
-            player.sendMessage(msg("invites-empty"));
+            player.sendMessage(msg(cfgSnapshot, "invites-empty"));
             return;
         }
         for (String teamId : pending) {
-            player.sendMessage(msg("invites-entry", "team", teamId));
+            player.sendMessage(msg(cfgSnapshot, "invites-entry", "team", teamId));
         }
     }
 
     /** Self-facing summary used by "/team info" with no team argument. */
     public void infoSelf(Player player) {
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         Set<String> memberOf = getPlayerTeams(player.getUniqueId());
-        player.sendMessage(msg("your-teams-header"));
+        player.sendMessage(msg(cfgSnapshot, "your-teams-header"));
         if (memberOf.isEmpty()) {
-            player.sendMessage(msg("your-teams-empty"));
+            player.sendMessage(msg(cfgSnapshot, "your-teams-empty"));
             return;
         }
         for (String teamId : memberOf) {
             Role role = getRole(player.getUniqueId(), teamId);
-            player.sendMessage(msg("your-teams-entry", "team", teamId, "role", role.name().toLowerCase()));
+            player.sendMessage(msg(cfgSnapshot, "your-teams-entry", "team", teamId, "role", role.name().toLowerCase(Locale.ROOT)));
         }
     }
 
@@ -561,10 +634,11 @@ public class TeamManager {
      * re-syncs this player's scoreboard entry under their current name.
      */
     public void handleJoin(Player player) {
+        final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         Set<String> pending = invites.get(player.getUniqueId());
         if (pending != null) {
             for (String teamId : pending) {
-                player.sendMessage(msg("invite-reminder-on-join", "team", teamId));
+                player.sendMessage(msg(cfgSnapshot, "invite-reminder-on-join", "team", teamId));
             }
         }
         resyncScoreboard(player);
@@ -586,21 +660,21 @@ public class TeamManager {
     // Internal helpers
     // ---------------------------------------------------------------
 
-    private String resolveSingle(Player player, Set<String> pending, String teamIdOrNull, String notFoundKey) {
+    private String resolveSingle(Player player, FileConfiguration cfgSnapshot, Set<String> pending, String teamIdOrNull, String notFoundKey) {
         if (teamIdOrNull != null) {
-            String id = teamIdOrNull.toLowerCase();
+            String id = teamIdOrNull.toLowerCase(Locale.ROOT);
             if (!pending.contains(id)) {
-                player.sendMessage(msg(notFoundKey, "team", id));
+                player.sendMessage(msg(cfgSnapshot, notFoundKey, "team", id));
                 return null;
             }
             return id;
         }
         if (pending.size() == 1) return pending.iterator().next();
         if (pending.isEmpty()) {
-            player.sendMessage(msg(notFoundKey, "team", "?"));
+            player.sendMessage(msg(cfgSnapshot, notFoundKey, "team", "?"));
             return null;
         }
-        player.sendMessage(msg("leave-usage-multiple"));
+        player.sendMessage(msg(cfgSnapshot, "leave-usage-multiple"));
         return null;
     }
 
@@ -614,6 +688,16 @@ public class TeamManager {
      * (same pattern as ModerationCommandBase#resolveTarget).
      */
     private void resolveTarget(CommandSender staff, String name, Consumer<OfflinePlayer> callback) {
+        resolveTarget(staff, name, plugin.getTeamConfig(), callback);
+    }
+
+    /**
+     * Snapshot-aware variant: the caller passes the config captured at entry
+     * so the async continuation never re-reads getTeamConfig() fresh (which
+     * could be null after a concurrent reload). Same pattern as TeamCommand,
+     * which snapshots its FileConfiguration once per execution.
+     */
+    private void resolveTarget(CommandSender staff, String name, FileConfiguration cfgSnapshot, Consumer<OfflinePlayer> callback) {
         Player online = Bukkit.getPlayer(name);
         if (online != null) {
             callback.accept(online);
@@ -631,12 +715,29 @@ public class TeamManager {
             OfflinePlayer resolved = Bukkit.getOfflinePlayer(name);
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                 if (resolved.getName() == null && !resolved.hasPlayedBefore()) {
-                    staff.sendMessage(msg("player-not-found", "player", name));
+                    staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", name));
                     return;
                 }
                 callback.accept(resolved);
             });
         });
+    }
+
+    /**
+     * Best-effort display name for a member UUID, safe to call synchronously in
+     * a loop over large teams: online players resolve with zero I/O, and the
+     * UUID-based offline lookup issues no Mojang request (unlike the deprecated
+     * name-based Bukkit#getOfflinePlayer(String), which resolveTarget() above
+     * already keeps off the calling thread). Returns null when unknown.
+     */
+    private static String lookupName(UUID uuid) {
+        Player online = Bukkit.getPlayer(uuid);
+        if (online != null) return online.getName();
+        try {
+            return Bukkit.getOfflinePlayer(uuid).getName();
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     private void setMember(UUID uuid, String teamId, Role role) {
@@ -656,13 +757,15 @@ public class TeamManager {
      * Last-admin guard: refuses to remove/demote the final ADMIN of a team.
      * Must be called BEFORE the mutation. Returns true when the action was
      * denied (caller must return immediately).
+     * Callers must hold synchronized(lockFor(targetUuid)) when invoking this,
+     * so the admin-count check and the following mutation are atomic.
      */
-    private boolean denyIfLastAdmin(CommandSender sender, String teamId, UUID targetUuid) {
+    private boolean denyIfLastAdmin(CommandSender sender, FileConfiguration cfgSnapshot, String teamId, UUID targetUuid) {
         Map<UUID, Role> members = memberships.get(teamId);
         if (members == null || members.get(targetUuid) != Role.ADMIN) return false;
         long admins = members.values().stream().filter(r -> r == Role.ADMIN).count();
         if (admins <= 1) {
-            sender.sendMessage(msg("last-admin", "team", teamId));
+            sender.sendMessage(msg(cfgSnapshot, "last-admin", "team", teamId));
             return true;
         }
         return false;
@@ -682,7 +785,13 @@ public class TeamManager {
     }
 
     private Component msg(String key, String... placeholders) {
-        String raw = plugin.getTeamConfig().getString("messages." + key, BUILTIN_DEFAULTS.getOrDefault(key, key));
+        return msg(plugin.getTeamConfig(), key, placeholders);
+    }
+
+    private Component msg(FileConfiguration cfg, String key, String... placeholders) {
+        String fallback = BUILTIN_DEFAULTS.getOrDefault(key, key);
+        String raw = cfg != null ? cfg.getString("messages." + key, fallback) : fallback;
+        if (raw == null) raw = fallback;
         for (int i = 0; i + 1 < placeholders.length; i += 2) {
             // Player/team inputs are untrusted — escape them so a name like
             // "<red>" can never inject MiniMessage formatting or click events.
@@ -717,11 +826,39 @@ public class TeamManager {
         for (TeamDefinition def : teams.values()) {
             String name = scoreboardName(def.id());
             validNames.add(name);
-            Team team = scoreboard.getTeam(name);
-            if (team == null) team = scoreboard.registerNewTeam(name);
+            Team team;
+            try {
+                team = scoreboard.getTeam(name);
+                if (team == null) team = scoreboard.registerNewTeam(name);
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                // Duplicate/stale registration or a broken scoreboard — skip
+                // this team loudly, keep syncing the rest.
+                plugin.getLogger().warning("Could not register scoreboard team '" + name + "': " + e.getMessage());
+                continue;
+            }
             ownedScoreboardTeams.add(name);
-            team.color(def.vanillaColor());
-            team.prefix(plugin.getMiniMessage().deserialize(def.color() + "[" + def.id() + "] <reset>"));
+            try {
+                team.color(def.vanillaColor());
+            } catch (Exception e) {
+                try {
+                    team.color(NamedTextColor.WHITE);
+                } catch (Exception ignored) {
+                }
+            }
+            // A broken admin color template must never abort the whole sync —
+            // fall back to a plain prefix for this team.
+            Component prefix;
+            try {
+                prefix = plugin.getMiniMessage().deserialize(def.color() + "[" + def.id() + "] <reset>");
+            } catch (Exception e) {
+                plugin.getLogger().warning("Invalid color template for team '" + def.id() + "', using plain prefix.");
+                prefix = Component.text("[" + def.id() + "] ");
+            }
+            try {
+                team.prefix(prefix);
+            } catch (Exception e) {
+                plugin.getLogger().warning("Could not set prefix for scoreboard team '" + name + "': " + e.getMessage());
+            }
         }
 
         for (Team team : new ArrayList<>(scoreboard.getTeams())) {
@@ -746,7 +883,7 @@ public class TeamManager {
             // Only the team currently assigned for selector purposes gets the entry
             // (a scoreboard entry can only be on one team at a time).
             if (!teamId.equals(scoreboardTeamOf.getOrDefault(uuid, teamId))) continue;
-            String name = Bukkit.getOfflinePlayer(uuid).getName();
+            String name = lookupName(uuid);
             if (name != null) team.addEntry(name);
         }
     }

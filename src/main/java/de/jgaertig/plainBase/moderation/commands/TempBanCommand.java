@@ -5,15 +5,14 @@ import de.jgaertig.plainBase.moderation.BanManager;
 import de.jgaertig.plainBase.moderation.DurationParser;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
-import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 /**
  * /tempban <player> <duration> [reason] — e.g. "1d", "2h30m", "7d".
@@ -121,11 +120,11 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         if (args.length <= 1) {
-            String input = args.length == 0 ? "" : args[0].toLowerCase();
-            return Bukkit.getOnlinePlayers().stream().map(Player::getName)
-                    .filter(n -> n.toLowerCase().startsWith(input)).collect(Collectors.toList());
+            String input = args.length == 0 ? "" : args[0];
+            return suggestOnlinePlayers(stack.getSender(), input, "plainbase.moderation.tempban");
         }
         if (args.length == 2) {
+            if (!hasSuggestPermission(stack.getSender(), "plainbase.moderation.tempban")) return List.of();
             return List.of("1d", "7d", "1h", "30m", "permanent");
         }
         return List.of();

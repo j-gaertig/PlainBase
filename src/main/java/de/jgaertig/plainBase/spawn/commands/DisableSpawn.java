@@ -40,7 +40,7 @@ public class DisableSpawn implements BasicCommand {
 
         var config = plugin.getSpawnConfig();
         config.set("spawn.enabled", false);
-        plugin.saveSpawnConfig();
+        plugin.saveSpawnConfigAsync();
 
         sender.sendMessage(plugin.getMiniMessage().deserialize("<green>Spawn has been disabled!"));
     }

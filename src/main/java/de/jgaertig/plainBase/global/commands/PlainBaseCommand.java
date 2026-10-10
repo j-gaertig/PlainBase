@@ -14,10 +14,12 @@ import org.jetbrains.annotations.NotNull;
 import org.jspecify.annotations.NonNull;
 
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Locale;
 import java.util.Scanner;
 import java.util.stream.Stream;
 
@@ -113,12 +115,18 @@ public class PlainBaseCommand implements BasicCommand {
 
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
+        // Module names and subcommands are admin-only — never leak them to unauthorized senders.
+        try {
+            if (!stack.getSender().hasPermission("plainbase.admin")) return List.of();
+        } catch (Exception e) {
+            return List.of();
+        }
         if (args.length == 0) {
             return List.of("toggle", "update", "reload");
         }
 
         if (args.length == 1) {
-            String input = args[0].toLowerCase();
+            String input = args[0].toLowerCase(Locale.ROOT);
             return Stream.of("toggle", "update", "reload")
                     .filter(s -> s.startsWith(input))
                     .toList();
@@ -127,7 +135,7 @@ public class PlainBaseCommand implements BasicCommand {
         if (args.length == 2 && args[0].equalsIgnoreCase("toggle")) {
             ConfigurationSection modules = plugin.getConfig().getConfigurationSection("modules");
             if (modules != null) {
-                String input = args[1].toLowerCase();
+                String input = args[1].toLowerCase(Locale.ROOT);
                 return modules.getKeys(false).stream()
                         .filter(s -> s.startsWith(input))
                         .toList();
@@ -144,7 +152,7 @@ public class PlainBaseCommand implements BasicCommand {
                     + "/version?game_versions=%5B%22" + encodedVersion
                     + "%22%5D&loaders=%5B%22paper%22%5D";
 
-            URL url = new URL(urlString);
+            URL url = URI.create(urlString).toURL();
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setRequestProperty("User-Agent", "j-gaertig/PlainBase/" + plugin.getPluginMeta().getVersion());

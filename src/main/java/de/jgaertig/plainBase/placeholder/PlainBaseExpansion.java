@@ -5,6 +5,8 @@ import me.clip.placeholderapi.expansion.PlaceholderExpansion;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.Locale;
+
 /**
  * PlaceholderAPI expansion providing %plainbase_*% placeholders.
  * Only loaded when PlaceholderAPI is installed (soft dependency).
@@ -39,7 +41,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
 
     @Override
     public String onPlaceholderRequest(Player player, @NotNull String params) {
-        return switch (params.toLowerCase()) {
+        return switch (params.toLowerCase(Locale.ROOT)) {
             case "version" -> plugin.getPluginMeta().getVersion();
             case "vanished" -> player != null && plugin.getVanishManager() != null
                     && plugin.getVanishManager().isVanished(player) ? "true" : "false";
@@ -83,7 +85,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
                     : "0";
 
             // Vanish module
-            case "vanish_cansee" -> player != null && player.hasPermission("plainbase.vanish.see") ? "true" : "false";
+            case "vanish_cansee" -> vanishCanSee(player);
 
             // Menu module
             case "menu_count" -> plugin.getMenuManager() != null
@@ -102,8 +104,13 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
                     ? String.valueOf(plugin.getTeamManager().getTeams().size()) : "0";
 
             // Team module (parameterized: %plainbase_team_role_<team>% / %plainbase_team_members_<team>%)
-            default -> handleTeamParameterized(player, params.toLowerCase());
+            default -> handleTeamParameterized(player, params.toLowerCase(Locale.ROOT));
         };
+    }
+
+    private String vanishCanSee(Player player) {
+        if (player == null || plugin.getVanishManager() == null) return "false";
+        return plugin.getVanishManager().canSeeVanished(player) ? "true" : "false";
     }
 
     private String handleTeamParameterized(Player player, String params) {
@@ -113,7 +120,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
             String teamId = params.substring("team_role_".length());
             if (player == null) return "none";
             var role = plugin.getTeamManager().getRole(player.getUniqueId(), teamId);
-            return role != null ? role.name().toLowerCase() : "none";
+            return role != null ? role.name().toLowerCase(Locale.ROOT) : "none";
         }
 
         if (params.startsWith("team_members_")) {

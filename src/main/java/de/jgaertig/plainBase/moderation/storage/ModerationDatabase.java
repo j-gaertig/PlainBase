@@ -55,7 +55,8 @@ public class ModerationDatabase {
             String database = plugin.getModerationConfig().getString("storage.mysql.database", "plainbase");
             boolean useSsl = plugin.getModerationConfig().getBoolean("storage.mysql.useSSL", false);
             config.setJdbcUrl("jdbc:mysql://" + host + ":" + port + "/" + database
-                    + "?useSSL=" + useSsl + "&characterEncoding=utf8&autoReconnect=true");
+                    + "?useSSL=" + useSsl + "&characterEncoding=utf8&autoReconnect=true"
+                    + "&connectTimeout=5000&socketTimeout=10000");
             config.setUsername(plugin.getModerationConfig().getString("storage.mysql.username", "root"));
             config.setPassword(plugin.getModerationConfig().getString("storage.mysql.password", ""));
             config.setMaximumPoolSize(Math.max(2, plugin.getModerationConfig().getInt("storage.mysql.pool-size", 5)));
@@ -77,19 +78,39 @@ public class ModerationDatabase {
         }
 
         config.setPoolName("PlainBase-Moderation");
+        // Bound all blocking setup I/O: BanManager is constructed on the main
+        // thread, so an unreachable MySQL host must fail fast instead of hanging
+        // startup (Hikari defaults to a 30s connection timeout). No new feature,
+        // just a fail-fast budget for the initial connect.
+        config.setConnectionTimeout(5000);
+        config.setValidationTimeout(3000);
+        config.setInitializationFailTimeout(5000);
         dataSource = new HikariDataSource(config);
 
-        try (Connection conn = dataSource.getConnection()) {
-            if (!mysql) {
-                // WAL + busy timeout reduce "database is locked" errors under
-                // concurrent load. Best-effort: failures must not break setup.
-                try (Statement st = conn.createStatement()) {
-                    st.execute("PRAGMA journal_mode=WAL");
-                    st.execute("PRAGMA busy_timeout=5000");
-                } catch (SQLException ignored) {
+        try {
+            try (Connection conn = dataSource.getConnection()) {
+                if (!mysql) {
+                    // WAL + busy timeout reduce "database is locked" errors under
+                    // concurrent load. Best-effort: failures must not break setup.
+                    try (Statement st = conn.createStatement()) {
+                        st.execute("PRAGMA journal_mode=WAL");
+                        st.execute("PRAGMA busy_timeout=5000");
+                    } catch (SQLException ignored) {
+                    }
                 }
+                createTables(conn);
             }
-            createTables(conn);
+        } catch (SQLException | RuntimeException e) {
+            // createTables()/getConnection() failed AFTER the pool was opened —
+            // close it again instead of leaking threads and connections on
+            // every failed (re)load. setupModeration() fail-opens on the throw.
+            try {
+                dataSource.close();
+            } catch (Exception closeEx) {
+                plugin.getLogger().warning("Could not close moderation pool after failed connect: " + closeEx.getMessage());
+            }
+            dataSource = null;
+            throw e;
         }
     }
 
@@ -307,7 +328,16 @@ public class ModerationDatabase {
         List<BanRecord> result = new ArrayList<>();
         String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM " + prefix() + "bans";
         try (Connection conn = dataSource.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            while (rs.next()) result.add(mapBan(rs));
+            while (rs.next()) {
+                try {
+                    result.add(mapBan(rs));
+                } catch (RuntimeException e) {
+                    // A single corrupt row (bad UUID, unexpected null) must never
+                    // discard the whole refresh — skip it loudly, keep the rest.
+                    // Genuine SQLExceptions still propagate and keep the old cache.
+                    plugin.getLogger().warning("Skipping corrupt row in " + prefix() + "bans: " + e.getMessage());
+                }
+            }
         }
         return result;
     }
@@ -317,8 +347,12 @@ public class ModerationDatabase {
         String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, kicked_at FROM " + prefix() + "kicks";
         try (Connection conn = dataSource.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
-                result.add(new KickRecord(rs.getInt(1), UUID.fromString(rs.getString(2)), rs.getString(3), rs.getString(4),
-                        nullableUuid(rs.getString(5)), rs.getString(6), rs.getLong(7)));
+                try {
+                    result.add(mapKick(rs));
+                } catch (RuntimeException e) {
+                    // Same row-skip policy as loadAllBans (see above).
+                    plugin.getLogger().warning("Skipping corrupt row in " + prefix() + "kicks: " + e.getMessage());
+                }
             }
         }
         return result;
@@ -328,7 +362,19 @@ public class ModerationDatabase {
         List<IpBanRecord> result = new ArrayList<>();
         String sql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM " + prefix() + "ip_bans";
         try (Connection conn = dataSource.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            while (rs.next()) result.add(mapIpBan(rs));
+            while (rs.next()) {
+                try {
+                    IpBanRecord record = mapIpBan(rs);
+                    if (record.ip() == null || record.ip().isBlank()) {
+                        plugin.getLogger().warning("Skipping " + prefix() + "ip_bans row with missing IP.");
+                        continue;
+                    }
+                    result.add(record);
+                } catch (RuntimeException e) {
+                    // Same row-skip policy as loadAllBans (see above).
+                    plugin.getLogger().warning("Skipping corrupt row in " + prefix() + "ip_bans: " + e.getMessage());
+                }
+            }
         }
         return result;
     }
@@ -367,6 +413,13 @@ public class ModerationDatabase {
                 rs.getInt(1), UUID.fromString(rs.getString(2)), rs.getString(3), rs.getString(4),
                 nullableUuid(rs.getString(5)), rs.getString(6), rs.getLong(7), rs.getLong(8),
                 rs.getBoolean(9), nullableUuid(rs.getString(10)), rs.getString(11), rs.getLong(12)
+        );
+    }
+
+    private KickRecord mapKick(ResultSet rs) throws SQLException {
+        return new KickRecord(
+                rs.getInt(1), UUID.fromString(rs.getString(2)), rs.getString(3), rs.getString(4),
+                nullableUuid(rs.getString(5)), rs.getString(6), rs.getLong(7)
         );
     }
 

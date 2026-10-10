@@ -4,14 +4,12 @@ import de.jgaertig.plainBase.PlainBase;
 import de.jgaertig.plainBase.moderation.BanManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
-import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.List;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 /**
  * /unban <player> — revokes the currently active ban, if any.
@@ -65,9 +63,8 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         if (args.length <= 1) {
-            String input = args.length == 0 ? "" : args[0].toLowerCase();
-            return Bukkit.getOnlinePlayers().stream().map(Player::getName)
-                    .filter(n -> n.toLowerCase().startsWith(input)).collect(Collectors.toList());
+            String input = args.length == 0 ? "" : args[0];
+            return suggestOnlinePlayers(stack.getSender(), input, "plainbase.moderation.unban");
         }
         return List.of();
     }

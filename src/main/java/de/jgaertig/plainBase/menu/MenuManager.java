@@ -29,7 +29,14 @@ public class MenuManager {
                                  Material fillMaterial, Map<Integer, ItemDefinition> items) {
 
         public Component buildTitle(PlainBase plugin, Player viewer) {
-            return plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(viewer, title));
+            String raw = title != null ? plugin.applyPlaceholders(viewer, title) : name;
+            if (raw == null) raw = name != null ? name : "";
+            try {
+                return plugin.getMiniMessage().deserialize(raw);
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to format title of menu '" + name + "', using plain text.");
+                return Component.text(raw);
+            }
         }
     }
 
@@ -97,9 +104,20 @@ public class MenuManager {
             Map<Integer, ItemDefinition> items = new LinkedHashMap<>();
             ConfigurationSection itemsSection = section.getConfigurationSection(key + ".items");
             if (itemsSection != null) {
+                // Slots are 0-indexed: a menu with size 27 uses slots 0-26.
+                // Out-of-range entries are skipped with a warning (a silent skip
+                // would leave admins staring at an empty menu, e.g. slot 54 in
+                // a size-27 menu from 1-indexed thinking).
+                int maxSlot = normalizeSize(size) - 1;
                 for (String slotKey : itemsSection.getKeys(false)) {
                     try {
                         int slot = Integer.parseInt(slotKey);
+                        if (slot < 0 || slot > maxSlot) {
+                            plugin.getLogger().warning("Slot '" + slotKey + "' in menu '" + key
+                                    + "' is out of range (size " + size + " allows 0-indexed slots 0-"
+                                    + maxSlot + "); item ignored.");
+                            continue;
+                        }
                         ItemDefinition def = parseItem(itemsSection, slotKey);
                         if (def != null) items.put(slot, def);
                     } catch (NumberFormatException ignored) {
@@ -158,12 +176,26 @@ public class MenuManager {
     }
 
     public boolean openMenu(Player player, String name) {
+        if (player == null || name == null) return false;
         MenuDefinition menu = menus.get(name);
         if (menu == null) return false;
 
         int size = normalizeSize(menu.size());
         MenuHolder holder = new MenuHolder(name);
-        Inventory inv = Bukkit.createInventory(holder, size, menu.buildTitle(plugin, player));
+        Component title;
+        try {
+            title = menu.buildTitle(plugin, player);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to build title for menu '" + name + "', using plain text.");
+            title = Component.text(name);
+        }
+        Inventory inv;
+        try {
+            inv = Bukkit.createInventory(holder, size, title);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to open menu '" + name + "' for " + player.getName() + ": " + e.getMessage());
+            return false;
+        }
         holder.setInventory(inv);
 
         // fill empty slots with fill material
@@ -179,9 +211,17 @@ public class MenuManager {
             }
         }
 
-        for (Map.Entry<Integer, ItemDefinition> entry : menu.items().entrySet()) {
-            if (entry.getKey() < 0 || entry.getKey() >= size) continue;
-            inv.setItem(entry.getKey(), buildItem(plugin, player, entry.getValue()));
+        Map<Integer, ItemDefinition> defs = menu.items();
+        if (defs != null) {
+            for (Map.Entry<Integer, ItemDefinition> entry : defs.entrySet()) {
+                if (entry == null || entry.getKey() == null) continue;
+                if (entry.getKey() < 0 || entry.getKey() >= size) continue;
+                try {
+                    inv.setItem(entry.getKey(), buildItem(plugin, player, entry.getValue()));
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to build item for menu '" + name + "', skipping slot " + entry.getKey() + ".");
+                }
+            }
         }
 
         player.openInventory(inv);
@@ -189,18 +229,36 @@ public class MenuManager {
     }
 
     private ItemStack buildItem(PlainBase plugin, Player viewer, ItemDefinition def) {
+        if (def == null || def.material() == null) return new ItemStack(Material.STONE);
         int amount = Math.min(Math.max(1, def.amount()), def.material().getMaxStackSize());
         ItemStack item = new ItemStack(def.material(), amount);
         ItemMeta meta = item.getItemMeta();
         if (meta == null) return item;
 
         if (def.name() != null && !def.name().isEmpty()) {
-            meta.displayName(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(viewer, def.name())));
+            String rawName = plugin.applyPlaceholders(viewer, def.name());
+            if (rawName == null) rawName = "";
+            try {
+                meta.displayName(plugin.getMiniMessage().deserialize(rawName));
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to format menu item name, using plain text.");
+                meta.displayName(Component.text(rawName));
+            }
         }
 
         List<Component> lore = new ArrayList<>();
-        for (String line : def.lore()) {
-            lore.add(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(viewer, line)));
+        if (def.lore() != null) {
+            for (String line : def.lore()) {
+                if (line == null) continue;
+                String raw = plugin.applyPlaceholders(viewer, line);
+                if (raw == null) raw = "";
+                try {
+                    lore.add(plugin.getMiniMessage().deserialize(raw));
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to format menu item lore line, using plain text.");
+                    lore.add(Component.text(raw));
+                }
+            }
         }
         if (!lore.isEmpty()) meta.lore(lore);
 
@@ -210,18 +268,29 @@ public class MenuManager {
 
     public void createMenu(String name) {
         FileConfiguration config = plugin.getMenuConfig();
+        if (config == null) {
+            plugin.getLogger().warning("Cannot create menu '" + name + "': menu.yml is not loaded.");
+            return;
+        }
         String path = "menus." + name;
         config.set(path + ".title", "<gray>" + name);
         config.set(path + ".size", 27);
         config.set(path + ".items", null);
-        plugin.saveMenuConfig();
+        // Async persist: the in-memory config is already updated, so the
+        // reloadMenus() below sees the change even before the disk write lands.
+        plugin.saveMenuConfigAsync();
         reloadMenus();
     }
 
     public void deleteMenu(String name) {
         FileConfiguration config = plugin.getMenuConfig();
+        if (config == null) {
+            plugin.getLogger().warning("Cannot delete menu '" + name + "': menu.yml is not loaded.");
+            return;
+        }
         config.set("menus." + name, null);
-        plugin.saveMenuConfig();
+        // Async persist (see createMenu): in-memory state is authoritative here.
+        plugin.saveMenuConfigAsync();
         reloadMenus();
     }
 

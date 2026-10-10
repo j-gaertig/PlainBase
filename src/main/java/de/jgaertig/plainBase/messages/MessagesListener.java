@@ -24,17 +24,23 @@ public class MessagesListener implements Listener {
         // Defense-in-depth: a vanished player must never get a join message,
         // even if this handler runs before VanishListener. (VanishListener on
         // HIGHEST is the primary guard, including the persist-on-rejoin case.)
+        // Explicit null-guards: a missing manager or config must simply skip
+        // this check, never rely on the catch below.
         try {
-            if (plugin.getVanishManager() != null
-                    && (plugin.getVanishManager().isVanished(player) || plugin.getVanishManager().hasPersistedVanish(player.getUniqueId()))
-                    && plugin.getVanishConfig().getBoolean("vanish.hide-join-quit-messages", true)) {
+            var vanishManager = plugin.getVanishManager();
+            var vanishConfig = plugin.getVanishConfig();
+            if (vanishManager != null && vanishConfig != null
+                    && (vanishManager.isVanished(player) || vanishManager.hasPersistedVanish(player.getUniqueId()))
+                    && vanishConfig.getBoolean("vanish.hide-join-quit-messages", true)) {
                 event.joinMessage(null);
                 return;
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check vanish join state for " + player.getName() + ": " + e.getMessage());
         }
 
         var config = plugin.getMessagesConfig();
+        if (config == null) return;
 
         // join message (empty string = disabled)
         String path = player.hasPlayedBefore() ? "messages.join" : "messages.first-join";
@@ -69,17 +75,22 @@ public class MessagesListener implements Listener {
         Player player = event.getPlayer();
 
         // Defense-in-depth, mirrors onJoin: vanished quits stay silent.
+        // Explicit null-guards, never rely on the catch below.
         try {
-            if (plugin.getVanishManager() != null
-                    && (plugin.getVanishManager().isVanished(player) || plugin.getVanishManager().hasPersistedVanish(player.getUniqueId()))
-                    && plugin.getVanishConfig().getBoolean("vanish.hide-join-quit-messages", true)) {
+            var vanishManager = plugin.getVanishManager();
+            var vanishConfig = plugin.getVanishConfig();
+            if (vanishManager != null && vanishConfig != null
+                    && (vanishManager.isVanished(player) || vanishManager.hasPersistedVanish(player.getUniqueId()))
+                    && vanishConfig.getBoolean("vanish.hide-join-quit-messages", true)) {
                 event.quitMessage(null);
                 return;
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check vanish quit state for " + player.getName() + ": " + e.getMessage());
         }
 
         var config = plugin.getMessagesConfig();
+        if (config == null) return;
         String raw = config.getString("messages.quit", "");
         if (raw == null || raw.isBlank()) {
             event.quitMessage(null);

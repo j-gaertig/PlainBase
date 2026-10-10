@@ -3,6 +3,7 @@ package de.jgaertig.plainBase.spawn.commands;
 import de.jgaertig.plainBase.PlainBase;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
+import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
@@ -65,7 +66,16 @@ public class Spawn implements BasicCommand {
 
         World world = Bukkit.getWorld(worldName);
         if (world == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn world '" + worldName + "' not found!"));
+            // worldName comes from config and may contain MiniMessage-looking
+            // characters ('<', '>'): escape it so a weird world name cannot
+            // break parsing (or inject formatting) into this message.
+            try {
+                String safeWorld = plugin.getMiniMessage().escapeTags(worldName);
+                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn world '" + safeWorld + "' not found!"));
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to format spawn message: " + e.getMessage());
+                sender.sendMessage(Component.text("Spawn world '" + worldName + "' not found!"));
+            }
             plugin.getLogger().warning("Spawn world '" + worldName + "' not found!");
             return;
         }

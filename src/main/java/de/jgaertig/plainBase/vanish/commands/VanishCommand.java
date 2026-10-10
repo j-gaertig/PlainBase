@@ -11,6 +11,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Stream;
 
 public class VanishCommand implements BasicCommand {
@@ -107,8 +108,15 @@ public class VanishCommand implements BasicCommand {
 
             boolean nowVanished = plugin.getVanishManager().toggleVanish(target);
             player.sendMessage(plugin.getMiniMessage().deserialize(
-                    "<gray>" + target.getName() + " is now " + (nowVanished ? "<green>vanished" : "<red>visible") + "<gray>."
+                    "<gray>" + plugin.getMiniMessage().escapeTags(target.getName()) + " is now " + (nowVanished ? "<green>vanished" : "<red>visible") + "<gray>."
             ));
+            return;
+        }
+
+        // More than one argument is never valid — without this, /vanish a b c
+        // would silently fall through to a self-vanish.
+        if (args.length > 1) {
+            player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/vanish [player|world|all]"));
             return;
         }
 
@@ -167,22 +175,62 @@ public class VanishCommand implements BasicCommand {
 
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
-        if (args.length <= 1) {
-            String input = args.length == 0 ? "" : args[0].toLowerCase();
+        // Mirror execute() guards: no suggestions when the module is off or unavailable.
+        try {
+            if (!plugin.getConfig().getBoolean("modules.vanish", true)) return List.of();
+        } catch (Exception e) {
+            return List.of();
+        }
+        if (plugin.getVanishConfig() == null || plugin.getVanishManager() == null) return List.of();
 
+        CommandSender sender = stack.getSender();
+        if (!hasAnyVanishPermission(sender)) return List.of();
+
+        if (args.length <= 1) {
+            String input = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
             List<String> literals = Stream.of("world", "all")
                     .filter(s -> s.startsWith(input))
+                    .filter(s -> hasVanishPermission(sender, s.equals("world") ? "plainbase.vanish.world" : "plainbase.vanish.all"))
                     .toList();
 
-            List<String> players = Bukkit.getOnlinePlayers().stream()
-                    .map(Player::getName)
-                    .filter(name -> name.toLowerCase().startsWith(input))
-                    .toList();
+            // Player names require vanish.other — self-vanish needs no target.
+            List<String> players;
+            if (!hasVanishPermission(sender, "plainbase.vanish.vanish.other")) {
+                players = List.of();
+            } else if (sender instanceof Player viewer) {
+                players = Bukkit.getOnlinePlayers().stream()
+                        .filter(viewer::canSee)
+                        .map(Player::getName)
+                        .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(input))
+                        .toList();
+            } else {
+                players = Bukkit.getOnlinePlayers().stream()
+                        .map(Player::getName)
+                        .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(input))
+                        .toList();
+            }
 
             return Stream.concat(literals.stream(), players.stream())
                     .distinct()
                     .toList();
         }
         return List.of();
+    }
+
+    private boolean hasVanishPermission(CommandSender sender, String permission) {
+        try {
+            return sender.hasPermission("plainbase.admin")
+                    || sender.hasPermission("plainbase.vanish.admin")
+                    || sender.hasPermission(permission);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean hasAnyVanishPermission(CommandSender sender) {
+        return hasVanishPermission(sender, "plainbase.vanish.vanish")
+                || hasVanishPermission(sender, "plainbase.vanish.vanish.other")
+                || hasVanishPermission(sender, "plainbase.vanish.world")
+                || hasVanishPermission(sender, "plainbase.vanish.all");
     }
 }

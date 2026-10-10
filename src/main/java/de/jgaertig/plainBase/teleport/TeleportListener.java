@@ -36,21 +36,24 @@ public class TeleportListener implements Listener {
             if (plugin.getTPAManager() != null) {
                 plugin.getTPAManager().handleQuit(player);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to handle teleport quit state for " + player.getName() + ": " + e.getMessage());
         }
         try {
             if (plugin.getRTPManager() != null) {
                 plugin.getRTPManager().cancelWarmup(player, "You left!");
                 try {
                     plugin.getRTPManager().cancelSearch(player);
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to cancel RTP search for " + player.getName() + ": " + e.getMessage());
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to cancel teleport warmup for " + player.getName() + ": " + e.getMessage());
         }
     }
 
-    @EventHandler
+    @EventHandler(ignoreCancelled = true)
     public void onMove(PlayerMoveEvent event) {
         Location from = event.getFrom();
         Location to = event.getTo();
@@ -64,7 +67,9 @@ public class TeleportListener implements Listener {
         checkAndCancel(event.getPlayer(), "move");
     }
 
-    @EventHandler
+    // A cancelled damage event means no damage was actually taken (spawn
+    // protection, god mode, other plugins) — it must not break the warmup.
+    @EventHandler(ignoreCancelled = true)
     public void onDamage(EntityDamageEvent event) {
         if (event.getEntity() instanceof Player p) {
             checkAndCancel(p, "damage");
@@ -76,9 +81,17 @@ public class TeleportListener implements Listener {
         checkAndCancel(event.getEntity(), "death");
     }
 
-    @EventHandler
+    @EventHandler(ignoreCancelled = true)
     public void onInteract(PlayerInteractEvent event) {
-        checkAndCancel(event.getPlayer(), "interact");
+        // Only real clicks break the warmup: PHYSICAL (pressure plates,
+        // farmland trampling) and cancelled interactions (other plugins,
+        // protection) must not cancel. Consistent with move/damage handling.
+        switch (event.getAction()) {
+            case RIGHT_CLICK_AIR, RIGHT_CLICK_BLOCK, LEFT_CLICK_AIR, LEFT_CLICK_BLOCK ->
+                    checkAndCancel(event.getPlayer(), "interact");
+            default -> {
+            }
+        }
     }
 
     private void checkAndCancel(Player p, String flag) {
@@ -93,7 +106,8 @@ public class TeleportListener implements Listener {
             if (rtpCancelFlags.contains(flag) && plugin.getRTPManager() != null) {
                 plugin.getRTPManager().cancelWarmup(p, generateReason(flag));
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check teleport cancel flag '" + flag + "' for " + p.getName() + ": " + e.getMessage());
         }
     }
 

@@ -41,7 +41,7 @@ public class SetSpawn implements BasicCommand {
         }
 
         if (!(sender instanceof Player player)) {
-            sender.sendMessage("This command can only be executed by players.");
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command can only be executed by players."));
             return;
         }
 
@@ -49,7 +49,7 @@ public class SetSpawn implements BasicCommand {
 
         if (args.length == 0) {
             loc = player.getLocation();
-        } else if (args.length >= 3) {
+        } else if (args.length == 3) {
             try {
                 double x = parseCoordinate(args[0], player.getLocation().getX());
                 double y = parseCoordinate(args[1], player.getLocation().getY());
@@ -59,6 +59,9 @@ public class SetSpawn implements BasicCommand {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>Invalid coordinates!"));
                 return;
             }
+        } else {
+            player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/setspawn [x y z]"));
+            return;
         }
 
         if (!(loc == null)) {
@@ -86,6 +89,6 @@ public class SetSpawn implements BasicCommand {
         config.set("spawn.location.yaw", (double) loc.getYaw());
         config.set("spawn.location.pitch", (double) loc.getPitch());
         config.set("spawn.enabled", true);
-        plugin.saveSpawnConfig();
+        plugin.saveSpawnConfigAsync();
     }
 }

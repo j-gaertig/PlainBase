@@ -31,8 +31,12 @@ public class VanishManager {
         return vanishedPlayers.contains(uuid);
     }
 
+    /**
+     * Unmodifiable snapshot copy — callers can never mutate (or observe live
+     * mutations of) internal vanish state.
+     */
     public Set<UUID> getVanishedPlayers() {
-        return vanishedPlayers;
+        return Set.copyOf(vanishedPlayers);
     }
 
     /**
@@ -71,7 +75,7 @@ public class VanishManager {
                 }
             }
         } catch (Exception e) {
-            plugin.getLogger().warning("Failed to de-target mobs for vanished player " + player.getName());
+            plugin.getLogger().warning("Failed to de-target mobs for vanished player " + player.getName() + ": " + e.getMessage());
         }
 
         savePlayerData(player.getUniqueId(), true);
@@ -110,11 +114,23 @@ public class VanishManager {
      * Used by the async load and by the join handler, where the decision must
      * be made synchronously (the join message is broadcast right after the
      * event, so it cannot be changed from an async continuation).
+     * <p>
+     * NOTE on sync file I/O: this reads one tiny per-player file from the
+     * join path. That is deliberate — the alternative (async read) cannot
+     * suppress the join message in time. The read is guarded (missing file
+     * returns false without I/O beyond an exists check) and can never throw:
+     * any I/O or parse failure logs a warning and returns false, so no
+     * exception can ever escape into the join event.
      */
     public boolean hasPersistedVanish(UUID uuid) {
-        File file = getPlayerDataFile(uuid);
-        if (!file.exists()) return false;
-        return YamlConfiguration.loadConfiguration(file).getBoolean("vanished", false);
+        try {
+            File file = getPlayerDataFile(uuid);
+            if (!file.isFile()) return false;
+            return YamlConfiguration.loadConfiguration(file).getBoolean("vanished", false);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to read persisted vanish state for " + uuid + ": " + e.getMessage());
+            return false;
+        }
     }
 
     public void loadPlayerData(Player player) {
@@ -168,7 +184,7 @@ public class VanishManager {
             try {
                 config.save(file);
             } catch (IOException e) {
-                plugin.getLogger().severe("Could not save player data for " + uuid);
+                plugin.getLogger().severe("Could not save player data for " + uuid + ": " + e.getMessage());
             }
         });
     }
@@ -179,12 +195,43 @@ public class VanishManager {
         return new File(folder, uuid.toString() + ".yml");
     }
 
-    private boolean canSee(Player viewer, Player target) {
+    /**
+     * Quit cleanup: with persist-on-rejoin=false the in-memory entry must not
+     * outlive the session, otherwise vanishedPlayers would grow without bound
+     * (one stale UUID per ever-vanished player). With persist enabled the
+     * entry is intentionally kept so a rejoin stays vanished.
+     */
+    public void handleQuit(Player player) {
+        if (player == null) return;
+        FileConfiguration cfg = plugin.getVanishConfig();
+        boolean persist = cfg != null && cfg.getBoolean("vanish.persist-on-rejoin", true);
+        if (!persist) {
+            vanishedPlayers.remove(player.getUniqueId());
+        }
+    }
+
+    public boolean canSee(Player viewer, Player target) {
         try {
             if (viewer.equals(target)) return true;
             if (viewer.hasPermission("plainbase.vanish.see")) return true;
             if (plugin.getVanishConfig() != null && plugin.getVanishConfig().getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
             return isVanished(viewer); // Staff who is vanished can see other vanished players
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * General capability check: can this viewer see vanished players at all
+     * (permission, op-see or vanished-sees-vanished)? Used by tab-completion
+     * gating and the vanish_cansee placeholder where no specific target exists.
+     */
+    public boolean canSeeVanished(Player viewer) {
+        try {
+            if (viewer == null) return false;
+            if (viewer.hasPermission("plainbase.vanish.see")) return true;
+            if (plugin.getVanishConfig() != null && plugin.getVanishConfig().getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
+            return isVanished(viewer);
         } catch (Exception e) {
             return false;
         }
@@ -229,9 +276,16 @@ public class VanishManager {
      * Applies the player's own vanish state (visibility, collision, sounds).
      */
     private void applySelfState(Player player) {
-        FileConfiguration config = plugin.getVanishConfig();
+        // Snapshot for the synchronous part; the scheduler body re-reads the
+        // config with a null-guard because stopModules() may have cleared it
+        // between scheduling and execution (next tick) — the captured reference
+        // alone would NPE when the module was reloaded/disabled in between.
+        final FileConfiguration snapshot = plugin.getVanishConfig();
 
         player.getScheduler().run(plugin, (t) -> {
+            FileConfiguration config = plugin.getVanishConfig();
+            if (config == null) config = snapshot;
+            if (config == null) return;
             if (config.getBoolean("vanish.no-collision", true)) {
                 player.setCollidable(false);
             }
@@ -261,19 +315,22 @@ public class VanishManager {
                     vanishedPlayers.remove(uuid);
                     try {
                         resetSelfState(player);
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to reset vanish state for " + uuid + ": " + e.getMessage());
                     }
                     try {
                         for (Player viewer : Bukkit.getOnlinePlayers()) {
                             if (viewer.equals(player)) continue;
                             showTo(viewer, player);
                         }
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to reveal vanished player " + uuid + ": " + e.getMessage());
                     }
                 } else {
                     vanishedPlayers.remove(uuid);
                 }
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to reset vanished player " + uuid + ": " + e.getMessage());
             }
         }
     }

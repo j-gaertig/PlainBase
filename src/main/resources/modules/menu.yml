@@ -11,7 +11,8 @@ menu:
 # shipped example from cluttering /menu list on a fresh install until you've
 # reviewed/customized it. Items are placed by slot index. Titles, names and
 # lore support MiniMessage and PlaceholderAPI placeholders (if PlaceholderAPI
-# is installed).
+# is installed). Slots are 0-indexed: a menu with "size: 27" uses slots 0-26
+# (slot 54 does NOT exist there — out-of-range slots are ignored with a warning).
 menus:
   example:
     enabled: false

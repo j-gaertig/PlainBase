@@ -1,6 +1,9 @@
 package de.jgaertig.plainBase.menu;
 
 import de.jgaertig.plainBase.PlainBase;
+import net.kyori.adventure.text.Component;
+import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
 import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -11,6 +14,7 @@ import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.inventory.Inventory;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 public class MenuListener implements Listener {
@@ -63,17 +67,27 @@ public class MenuListener implements Listener {
 
         String sound = def.sound();
         if (sound != null && !sound.isEmpty()) {
-            try {
-                Sound s = Sound.valueOf(sound.toUpperCase());
+            Sound s = resolveSound(sound.trim());
+            if (s != null) {
                 player.playSound(player.getLocation(), s, 1.0f, 1.0f);
-            } catch (IllegalArgumentException e) {
+            } else {
                 plugin.getLogger().warning("Invalid sound '" + sound + "' in menu '" + menu.name() + "'");
             }
         }
 
         String message = def.message();
         if (message != null && !message.isEmpty()) {
-            player.sendMessage(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(player, message)));
+            // A broken admin message template (bad MiniMessage) must never
+            // break the click handler — fall back to plain text.
+            try {
+                player.sendMessage(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(player, message)));
+            } catch (Exception e) {
+                plugin.getLogger().warning("Invalid message '" + message + "' in menu '" + menu.name() + "': " + e.getMessage());
+                try {
+                    player.sendMessage(Component.text(message));
+                } catch (Exception ignored) {
+                }
+            }
         }
 
         List<String> commands = def.commands();
@@ -87,6 +101,53 @@ public class MenuListener implements Listener {
                 player.performCommand(finalCmd);
             }
         }
+    }
+
+    /**
+     * Resolves a configured sound name without any deprecated-for-removal API
+     * ({@code Sound.valueOf}, {@code Registry#match}, {@code OldEnum#name()}).
+     * Prefers the {@link Registry#SOUNDS} lookup via
+     * {@link Registry#get(NamespacedKey)} so registry keys
+     * ({@code minecraft:entity.player.levelup} or {@code entity.player.levelup})
+     * keep working across Paper updates, with a fallback to legacy Bukkit
+     * enum names ({@code ENTITY_PLAYER_LEVELUP}) for existing menu.yml files.
+     * The fallback compares normalized registry keys ('.' and '_' treated as
+     * equal, e.g. {@code BLOCK_NOTE_BLOCK_PLING} matches
+     * {@code minecraft:block.note_block.pling}) and never touches deprecated APIs.
+     *
+     * @return the sound, or null when the name matches neither form
+     */
+    private Sound resolveSound(String input) {
+        if (input == null) return null;
+        String trimmed = input.trim();
+        if (trimmed.isEmpty()) return null;
+
+        // 1. Direct registry-key lookup (mirrors the old Registry#match
+        // normalization: lowercase + whitespace to underscore, minecraft
+        // namespace by default via NamespacedKey#fromString).
+        try {
+            String filtered = trimmed.toLowerCase(Locale.ROOT).replaceAll("\\s+", "_");
+            NamespacedKey key = NamespacedKey.fromString(filtered);
+            if (key != null) {
+                Sound direct = Registry.SOUNDS.get(key);
+                if (direct != null) return direct;
+            }
+        } catch (Exception ignored) {
+            // Fall through to the legacy-name scan below.
+        }
+
+        // 2. Legacy Bukkit enum names without deprecated OldEnum#name():
+        // compare against registry keys with '.' and '_' normalized.
+        String normalized = trimmed.toLowerCase(Locale.ROOT).replace('.', '_');
+        int colon = normalized.lastIndexOf(':');
+        if (colon >= 0) normalized = normalized.substring(colon + 1);
+        for (Sound s : Registry.SOUNDS) {
+            NamespacedKey k = Registry.SOUNDS.getKey(s);
+            if (k == null) continue;
+            String candidate = k.getKey().replace('.', '_');
+            if (candidate.equalsIgnoreCase(normalized)) return s;
+        }
+        return null;
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)

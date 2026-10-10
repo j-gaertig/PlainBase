@@ -20,7 +20,9 @@ public class BroadcastManager {
     }
 
     public void startBroadcasts() {
-        ConfigurationSection section = plugin.getMessagesConfig().getConfigurationSection("broadcasts");
+        var messagesConfig = plugin.getMessagesConfig();
+        if (messagesConfig == null) return;
+        ConfigurationSection section = messagesConfig.getConfigurationSection("broadcasts");
         if (section == null || !section.getBoolean("enabled", false)) return;
 
         for (String key : section.getKeys(false)) {
@@ -32,7 +34,9 @@ public class BroadcastManager {
                 continue;
             }
 
-            long cooldownSeconds = Math.max(5, section.getLong(key + ".cooldown", 60));
+            // Clamp like tpa.request_timeout: negative/huge values must never
+            // leak into the scheduler delay (huge values could overflow ticks).
+            long cooldownSeconds = Math.max(5, Math.min(86400, section.getLong(key + ".cooldown", 60)));
             long ticks = cooldownSeconds * 20L; // Mindestens 5 Sekunden Cooldown
 
             final String broadcastKey = key;

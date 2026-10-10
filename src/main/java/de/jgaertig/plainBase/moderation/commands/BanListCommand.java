@@ -44,12 +44,12 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
         if (active.isEmpty()) {
             sender.sendMessage(plugin.getMiniMessage().deserialize(message("banlist-empty", "<gray>There are currently no active bans.")));
         } else {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("banlist-header", "<gray>--- Active bans (%count%) ---").replace("%count%", String.valueOf(active.size()))));
-
             int from = (page - 1) * PAGE_SIZE;
-            int to = Math.min(from + PAGE_SIZE, active.size());
             if (from < active.size()) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("banlist-header", "<gray>--- Active bans (%count%) ---").replace("%count%", String.valueOf(active.size()))));
+
+                int to = Math.min(from + PAGE_SIZE, active.size());
                 for (BanRecord record : active.subList(from, to)) {
                     String duration = record.isPermanent() ? "permanent" : DurationParser.format(record.remainingMillis(now)) + " left";
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
@@ -58,17 +58,20 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                                     .replace("%reason%", esc(record.reason()))
                                     .replace("%duration%", duration)));
                 }
+            } else {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("banlist-empty-page", "<gray>There are no entries on this page (page %page%).").replace("%page%", String.valueOf(page))));
             }
         }
 
         List<IpBanRecord> activeIps = plugin.getBanManager().getActiveIpBans();
         if (!activeIps.isEmpty()) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("banlist-ip-header", "<gray>--- Active IP bans (%count%) ---").replace("%count%", String.valueOf(activeIps.size()))));
-
             int from = (page - 1) * PAGE_SIZE;
-            int to = Math.min(from + PAGE_SIZE, activeIps.size());
             if (from < activeIps.size()) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("banlist-ip-header", "<gray>--- Active IP bans (%count%) ---").replace("%count%", String.valueOf(activeIps.size()))));
+
+                int to = Math.min(from + PAGE_SIZE, activeIps.size());
                 for (IpBanRecord record : activeIps.subList(from, to)) {
                     String duration = record.isPermanent() ? "permanent" : DurationParser.format(record.remainingMillis(now)) + " left";
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
@@ -77,6 +80,9 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
                                     .replace("%reason%", esc(record.reason()))
                                     .replace("%duration%", duration)));
                 }
+            } else {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("banlist-ip-empty-page", "<gray>There are no IP bans on this page (page %page%).").replace("%page%", String.valueOf(page))));
             }
         }
     }

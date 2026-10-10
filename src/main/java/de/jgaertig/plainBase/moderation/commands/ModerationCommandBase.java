@@ -5,12 +5,16 @@ import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * Shared helpers for the moderation commands (ban/tempban/unban/kick/banip/unbanip/
@@ -57,7 +61,40 @@ abstract class ModerationCommandBase {
     }
 
     protected String message(String key, String fallback) {
-        return plugin.getModerationConfig().getString("messages." + key, fallback);
+        // getModerationConfig() is briefly null during /plainbase reload
+        // (stopModules() clears configs, setupModeration() re-loads them) —
+        // async callbacks (baninfo IP lookup, banip/ban/unban results) that
+        // re-read the config after the hop would NPE without this guard.
+        try {
+            FileConfiguration cfg = plugin.getModerationConfig();
+            if (cfg == null) return fallback;
+            String value = cfg.getString("messages." + key, fallback);
+            return value != null ? value : fallback;
+        } catch (RuntimeException e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * MiniMessage with a plain-text fallback: a broken admin template must
+     * never break an async result callback with an exception.
+     */
+    protected Component render(String raw) {
+        String text = raw == null ? "" : raw;
+        try {
+            return plugin.getMiniMessage().deserialize(text);
+        } catch (Exception e) {
+            return Component.text(text);
+        }
+    }
+
+    /**
+     * True when a player sender is no longer around to receive a delayed
+     * async answer (logged off during the DB hop). Console/command blocks
+     * are never "gone".
+     */
+    protected static boolean isGone(CommandSender sender) {
+        return sender instanceof Player player && !player.isOnline();
     }
 
     /**
@@ -166,10 +203,13 @@ abstract class ModerationCommandBase {
 
     protected void broadcast(String message) {
         if (message == null || message.isEmpty()) return;
-        if (!plugin.getModerationConfig().getBoolean("broadcast.enabled", true)) return;
+        // Same reload race as message(): a null config keeps defaults
+        // (broadcasts on, staff-only off) instead of NPE-ing the callback.
+        FileConfiguration cfg = plugin.getModerationConfig();
+        if (cfg != null && !cfg.getBoolean("broadcast.enabled", true)) return;
 
-        boolean staffOnly = plugin.getModerationConfig().getBoolean("broadcast.staff-only", false);
-        Component component = plugin.getMiniMessage().deserialize(message);
+        boolean staffOnly = cfg != null && cfg.getBoolean("broadcast.staff-only", false);
+        Component component = render(message);
 
         for (Player p : Bukkit.getOnlinePlayers()) {
             if (staffOnly && !p.hasPermission("plainbase.moderation.notify")
@@ -179,5 +219,59 @@ abstract class ModerationCommandBase {
             p.sendMessage(component);
         }
         Bukkit.getConsoleSender().sendMessage(component);
+    }
+
+    /**
+     * Silent permission gate for tab-completion: mirrors
+     * {@link #checkPreconditions}' permission logic without sending messages.
+     */
+    protected boolean hasSuggestPermission(CommandSender sender, String permissionNode) {
+        try {
+            return sender.hasPermission("plainbase.admin")
+                    || sender.hasPermission("plainbase.moderation.admin")
+                    || sender.hasPermission(permissionNode);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Vanish-aware visibility for tab-completion: a player sender must not be
+     * offered names they cannot see. Delegates to VanishManager.canSee() when
+     * the vanish module is active; when the manager is null (module off) no
+     * filtering is applied. Console/non-player senders always see everyone.
+     */
+    protected boolean isSuggestVisible(CommandSender sender, Player target) {
+        if (target == null) return false;
+        if (!(sender instanceof Player viewer)) return true;
+        try {
+            if (plugin.getVanishManager() != null) {
+                return plugin.getVanishManager().canSee(viewer, target);
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Gated online-player name suggestions: empty when the sender lacks the
+     * command permission, the module is disabled, or the manager is reloading.
+     * Otherwise vanished players invisible to the sender are filtered out.
+     */
+    protected List<String> suggestOnlinePlayers(CommandSender sender, String input, String permissionNode) {
+        if (!hasSuggestPermission(sender, permissionNode)) return List.of();
+        try {
+            if (!plugin.getConfig().getBoolean("modules.moderation", true)) return List.of();
+        } catch (Exception e) {
+            return List.of();
+        }
+        if (plugin.getModerationConfig() == null || plugin.getBanManager() == null) return List.of();
+        String prefix = input == null ? "" : input.toLowerCase(Locale.ROOT);
+        return Bukkit.getOnlinePlayers().stream()
+                .filter(target -> isSuggestVisible(sender, target))
+                .map(Player::getName)
+                .filter(n -> n != null && n.toLowerCase(Locale.ROOT).startsWith(prefix))
+                .collect(Collectors.toList());
     }
 }

@@ -9,6 +9,7 @@ import org.bukkit.World;
 import org.bukkit.entity.Player;
 
 import java.util.ArrayList;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -46,9 +47,17 @@ public class RTPManager {
         Location spawnLoc = world.getSpawnLocation().clone();
         Location originLoc = player.getLocation().clone();
 
-        Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
-            tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, 0);
-        });
+        try {
+            Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
+                tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, 0);
+            });
+        } catch (Exception e) {
+            // Scheduler rejected (e.g. plugin disabling): never leak the
+            // searching entry or a cooldown for a search that never ran.
+            searching.remove(uuid);
+            cooldowns.remove(uuid);
+            plugin.getLogger().warning("Could not start RTP search for " + player.getName() + ": " + e.getMessage());
+        }
     }
 
     private void tryNextAttempt(Player player, World world, double centerX, double centerZ,
@@ -59,13 +68,19 @@ public class RTPManager {
         if (attempt >= maxAttempts) {
             // A failed search must not punish with a cooldown.
             cooldowns.remove(uuid);
-            player.getScheduler().run(plugin, (t) -> {
-                if (!searching.contains(uuid)) return;
+            try {
+                player.getScheduler().run(plugin, (t) -> {
+                    if (!searching.contains(uuid)) return;
+                    searching.remove(uuid);
+                    if (player.isOnline()) {
+                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not find a safe location. Try again later!"));
+                    }
+                }, null);
+            } catch (Exception e) {
+                // Scheduler rejected (player gone / plugin disabling):
+                // still release the searching entry so it can never leak.
                 searching.remove(uuid);
-                if (player.isOnline()) {
-                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not find a safe location. Try again later!"));
-                }
-            }, null);
+            }
             return;
         }
 
@@ -77,79 +92,128 @@ public class RTPManager {
         int chunkZ = finalZ >> 4;
         final int nextAttempt = attempt + 1;
 
-        Bukkit.getRegionScheduler().execute(plugin, world, chunkX, chunkZ, () -> {
-            if (!player.isOnline()) {
-                searching.remove(uuid);
-                return;
-            }
-
-            int y;
-            try {
-                y = world.getHighestBlockYAt(finalX, finalZ);
-            } catch (Exception e) {
-                Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                        tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
-                return;
-            }
-
-            if (y <= world.getMinHeight() || y + 1 >= world.getMaxHeight() - 2) {
-                Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                        tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
-                return;
-            }
-
-            Location loc = new Location(world, finalX + 0.5, y, finalZ + 0.5);
-
-            if (spawnLoc != null && spawnLoc.getWorld() != null && spawnLoc.getWorld().equals(world)) {
-                double dx = (finalX + 0.5) - spawnLoc.getX();
-                double dz = (finalZ + 0.5) - spawnLoc.getZ();
-                if (dx * dx + dz * dz < 256 * 256) {
-                    Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                            tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
-                    return;
-                }
-            }
-
-            if (originLoc != null && originLoc.getWorld() != null && originLoc.getWorld().equals(world)) {
-                double dx = (finalX + 0.5) - originLoc.getX();
-                double dz = (finalZ + 0.5) - originLoc.getZ();
-                if (dx * dx + dz * dz < 500 * 500) {
-                    Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                            tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
-                    return;
-                }
-            }
-
-            boolean safe;
-            try {
-                safe = isLocationSafe(loc);
-            } catch (Exception e) {
-                safe = false;
-            }
-
-            if (safe) {
-                Location dest = loc.clone();
-                player.getScheduler().run(plugin, (t) -> {
+        // RegionScheduler#execute is called from an async thread and may throw
+        // synchronously (e.g. plugin disabling) — that must never leak the
+        // searching entry or a cooldown for a search that never ran.
+        try {
+            Bukkit.getRegionScheduler().execute(plugin, world, chunkX, chunkZ, () -> {
+                try {
+                    runAttemptOnRegion(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, uuid, finalX, finalZ, nextAttempt);
+                } catch (Exception e) {
+                    // Unexpected failure on the region thread: retry once via
+                    // async unless the search already ended or attempts are up.
+                    if (!searching.contains(uuid)) return;
                     try {
-                        if (!searching.contains(uuid)) return;
-                        if (!player.isOnline()) return;
-                        proceedToWarmup(player, dest);
-                    } finally {
+                        Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
+                                tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+                    } catch (Exception ignored) {
                         searching.remove(uuid);
+                        cooldowns.remove(uuid);
+                    }
+                }
+            });
+        } catch (Exception e) {
+            searching.remove(uuid);
+            cooldowns.remove(uuid);
+            plugin.getLogger().warning("Could not continue RTP search for " + player.getName() + ": " + e.getMessage());
+            try {
+                player.getScheduler().run(plugin, (t) -> {
+                    if (player.isOnline()) {
+                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP search failed. Try again later!"));
                     }
                 }, null);
-            } else {
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void runAttemptOnRegion(Player player, World world, double centerX, double centerZ,
+                                    double halfSize, Location spawnLoc, Location originLoc,
+                                    UUID uuid, int finalX, int finalZ, int nextAttempt) {
+        if (!player.isOnline()) {
+            searching.remove(uuid);
+            return;
+        }
+
+        int y;
+        try {
+            y = world.getHighestBlockYAt(finalX, finalZ);
+        } catch (Exception e) {
+            Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
+                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+            return;
+        }
+
+        if (y <= world.getMinHeight() || y + 1 >= world.getMaxHeight() - 2) {
+            Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
+                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+            return;
+        }
+
+        Location loc = new Location(world, finalX + 0.5, y, finalZ + 0.5);
+
+        if (spawnLoc != null && spawnLoc.getWorld() != null && spawnLoc.getWorld().equals(world)) {
+            double dx = (finalX + 0.5) - spawnLoc.getX();
+            double dz = (finalZ + 0.5) - spawnLoc.getZ();
+            if (dx * dx + dz * dz < 256 * 256) {
                 Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
                         tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+                return;
             }
-        });
+        }
+
+        if (originLoc != null && originLoc.getWorld() != null && originLoc.getWorld().equals(world)) {
+            double dx = (finalX + 0.5) - originLoc.getX();
+            double dz = (finalZ + 0.5) - originLoc.getZ();
+            if (dx * dx + dz * dz < 500 * 500) {
+                Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
+                        tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+                return;
+            }
+        }
+
+        boolean safe;
+        try {
+            safe = isLocationSafe(loc);
+        } catch (Exception e) {
+            safe = false;
+        }
+
+        if (safe) {
+            Location dest = loc.clone();
+            player.getScheduler().run(plugin, (t) -> {
+                try {
+                    if (!searching.contains(uuid)) return;
+                    if (!player.isOnline()) return;
+                    proceedToWarmup(player, dest);
+                } finally {
+                    searching.remove(uuid);
+                }
+            }, null);
+        } else {
+            Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
+                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+        }
     }
 
     private void proceedToWarmup(Player player, Location foundLoc) {
-        if (!player.isOnline()) return;
+        if (player == null || !player.isOnline()) return;
 
-        long seconds = plugin.getTeleportConfig().getLong("rtp.counter.seconds", 3);
-        if (!plugin.getTeleportConfig().getBoolean("rtp.counter.enabled", true) || seconds <= 0) {
+        // Snapshot: this runs at the end of an async -> region -> player-thread
+        // chain, so stopModules() may have cleared teleport.yml in between.
+        // Never deref fresh or abort silently — tell the player.
+        org.bukkit.configuration.file.FileConfiguration teleportConfig = plugin.getTeleportConfig();
+        if (teleportConfig == null) {
+            cooldowns.remove(player.getUniqueId());
+            player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
+            return;
+        }
+
+        long seconds = teleportConfig.getLong("rtp.counter.seconds", 3);
+        // Clamp like tpa.counter.seconds: negative/huge values must never
+        // leak into the scheduler delay or the displayed countdown.
+        seconds = Math.max(0, Math.min(30, seconds));
+        if (!teleportConfig.getBoolean("rtp.counter.enabled", true) || seconds <= 0) {
             executeTeleport(player, foundLoc);
             return;
         }
@@ -178,16 +242,17 @@ public class RTPManager {
     }
 
     private boolean isLocationSafe(Location loc) {
-        boolean blacklistEnabled = plugin.getTeleportConfig().getBoolean("rtp.blacklist.enabled", true);
+        org.bukkit.configuration.file.FileConfiguration teleportConfig = plugin.getTeleportConfig();
+        boolean blacklistEnabled = teleportConfig != null && teleportConfig.getBoolean("rtp.blacklist.enabled", true);
 
         if (blacklistEnabled) {
-            java.util.List<String> blacklistedBiomes = plugin.getTeleportConfig().getStringList("rtp.blacklist.biomes");
-            String biomeKey = loc.getBlock().getBiome().getKey().getKey().toLowerCase();
+            java.util.List<String> blacklistedBiomes = teleportConfig.getStringList("rtp.blacklist.biomes");
+            String biomeKey = loc.getBlock().getBiome().getKey().getKey().toLowerCase(Locale.ROOT);
             for (String b : blacklistedBiomes) {
-                if (b != null && !b.isEmpty() && biomeKey.contains(b.toLowerCase())) return false;
+                if (b != null && !b.isEmpty() && biomeKey.contains(b.toLowerCase(Locale.ROOT))) return false;
             }
 
-            java.util.List<String> blacklist = plugin.getTeleportConfig().getStringList("rtp.blacklist.blocks");
+            java.util.List<String> blacklist = teleportConfig.getStringList("rtp.blacklist.blocks");
             if (blacklist.contains(loc.getBlock().getType().name())) return false;
         }
 
@@ -213,23 +278,45 @@ public class RTPManager {
     }
 
     private boolean isOnCooldown(Player player) {
-        if (!cooldowns.containsKey(player.getUniqueId())) return false;
-        long timeLeft = (cooldowns.get(player.getUniqueId()) - System.currentTimeMillis()) / 1000;
+        Long expiry = cooldowns.get(player.getUniqueId());
+        if (expiry == null) return false;
+        long timeLeft = (expiry - System.currentTimeMillis()) / 1000;
         if (timeLeft > 0) {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Wait " + timeLeft + "s before using RTP again."));
             return true;
         }
+        // Expired entries are purged on read so the map cannot grow without bounds.
+        cooldowns.remove(player.getUniqueId(), expiry);
         return false;
     }
 
     private void setCooldown(Player player) {
-        long seconds = plugin.getTeleportConfig().getLong("rtp.cooldown", 60);
+        org.bukkit.configuration.file.FileConfiguration teleportConfig = plugin.getTeleportConfig();
+        if (teleportConfig == null) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
+        long seconds = teleportConfig.getLong("rtp.cooldown", 60);
+        // Clamp: negative values must not create an instantly-expired (leaked)
+        // entry, huge values must not lock players out forever.
+        seconds = Math.max(0, Math.min(86400, seconds));
+        if (seconds <= 0) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
         cooldowns.put(player.getUniqueId(), System.currentTimeMillis() + (seconds * 1000));
     }
 
     public void cancelSearch(Player player) {
         if (player == null) return;
         searching.remove(player.getUniqueId());
+        // Opportunistic purge of this player's entry on quit/cancel so stale
+        // entries of players who never come back cannot accumulate. Only
+        // expired entries are removed — an active cooldown is never deleted.
+        Long expiry = cooldowns.get(player.getUniqueId());
+        if (expiry != null && expiry <= System.currentTimeMillis()) {
+            cooldowns.remove(player.getUniqueId(), expiry);
+        }
     }
 
     public void cancelWarmup(Player player, String reason) {

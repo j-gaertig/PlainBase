@@ -28,24 +28,27 @@ public class VanishListener implements Listener {
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         FileConfiguration config = plugin.getVanishConfig();
+        var vanishManager = plugin.getVanishManager();
 
         // A vanished player should not announce their join (persist-on-rejoin).
         // Done synchronously because the join message is broadcast right after
         // the event — the single read source is VanishManager.hasPersistedVanish
         // (file is tiny; the actual vanish state application stays async).
         // HIGHEST so this runs after MessagesListener and cannot be overwritten.
+        // Null-guards first: manager, then config, then the (file-IO) check last
+        // so no disk read happens when it is not needed.
         try {
-            if (config.getBoolean("vanish.hide-join-quit-messages", true)
-                    && plugin.getVanishManager() != null
-                    && plugin.getVanishManager().hasPersistedVanish(player.getUniqueId())) {
+            if (vanishManager != null && config != null
+                    && config.getBoolean("vanish.hide-join-quit-messages", true)
+                    && vanishManager.hasPersistedVanish(player.getUniqueId())) {
                 event.joinMessage(null);
             }
         } catch (Exception e) {
-            plugin.getLogger().warning("Failed to handle vanish join state for " + player.getName());
+            plugin.getLogger().warning("Failed to handle vanish join state for " + player.getName() + ": " + e.getMessage());
         }
 
-        if (plugin.getVanishManager() != null) {
-            plugin.getVanishManager().applyOnJoin(player);
+        if (vanishManager != null) {
+            vanishManager.applyOnJoin(player);
         }
     }
 
@@ -61,7 +64,16 @@ public class VanishListener implements Listener {
                     && plugin.getVanishConfig().getBoolean("vanish.hide-join-quit-messages", true)) {
                 event.quitMessage(null);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to handle vanish quit state for " + player.getName() + ": " + e.getMessage());
+        }
+
+        try {
+            if (plugin.getVanishManager() != null) {
+                plugin.getVanishManager().handleQuit(player);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to purge vanish state for " + player.getName() + ": " + e.getMessage());
         }
     }
 
@@ -73,7 +85,8 @@ public class VanishListener implements Listener {
                     && plugin.getVanishManager().isVanished(event.getEntity())) {
                 event.deathMessage(null);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to handle vanish death state for " + event.getEntity().getName() + ": " + e.getMessage());
         }
     }
 
@@ -85,7 +98,8 @@ public class VanishListener implements Listener {
                     && plugin.getVanishManager().isVanished(event.getPlayer())) {
                 event.message(null);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to handle vanish advancement state for " + event.getPlayer().getName() + ": " + e.getMessage());
         }
     }
 

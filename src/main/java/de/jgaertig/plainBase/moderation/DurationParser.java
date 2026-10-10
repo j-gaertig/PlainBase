@@ -1,5 +1,6 @@
 package de.jgaertig.plainBase.moderation;
 
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -21,7 +22,7 @@ public final class DurationParser {
      */
     public static long parse(String input) {
         if (input == null) throw new IllegalArgumentException("Duration is null");
-        String trimmed = input.trim().toLowerCase();
+        String trimmed = input.trim().toLowerCase(Locale.ROOT);
 
         if (trimmed.equals("permanent") || trimmed.equals("perm") || trimmed.equals("-1") || trimmed.equals("forever")) {
             return -1;
@@ -34,7 +35,7 @@ public final class DurationParser {
         while (matcher.find()) {
             matchedChars += matcher.group().length();
             long amount = Long.parseLong(matcher.group(1));
-            String unit = matcher.group(2).toLowerCase();
+            String unit = matcher.group(2).toLowerCase(Locale.ROOT);
             try {
                 totalMillis = Math.addExact(totalMillis, Math.multiplyExact(amount, unitMillis(unit)));
             } catch (ArithmeticException e) {

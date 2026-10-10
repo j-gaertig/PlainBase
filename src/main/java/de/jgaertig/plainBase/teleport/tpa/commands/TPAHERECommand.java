@@ -11,6 +11,7 @@ import org.checkerframework.checker.nullness.qual.NonNull;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.List;
+import java.util.Locale;
 
 public class TPAHERECommand implements BasicCommand {
 
@@ -76,11 +77,6 @@ public class TPAHERECommand implements BasicCommand {
             return;
         }
 
-        if (plugin.getTPAManager() == null) {
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA is currently unavailable."));
-            return;
-        }
-
         plugin.getTPAManager().sendRequest(player, target, TPAManager.RequestType.TPAHERE);
 
     }
@@ -88,18 +84,18 @@ public class TPAHERECommand implements BasicCommand {
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
         if (args.length <= 1) {
-            String prefix = args.length == 0 ? "" : args[0].toLowerCase();
+            String prefix = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
             CommandSender sender = stack.getSender();
             if (sender instanceof Player player) {
                 return Bukkit.getOnlinePlayers().stream()
                         .filter(player::canSee)
                         .map(Player::getName)
-                        .filter(name -> name.toLowerCase().startsWith(prefix))
+                        .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
                         .toList();
             }
             return Bukkit.getOnlinePlayers().stream()
                     .map(Player::getName)
-                    .filter(name -> name.toLowerCase().startsWith(prefix))
+                    .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
                     .toList();
         }
         return List.of();

@@ -89,6 +89,6 @@ public class SetFirstSpawn implements BasicCommand {
         config.set("first-spawn.location.yaw", (double) loc.getYaw());
         config.set("first-spawn.location.pitch", (double) loc.getPitch());
         config.set("first-spawn.enabled", true);
-        plugin.saveSpawnConfig();
+        plugin.saveSpawnConfigAsync();
     }
 }

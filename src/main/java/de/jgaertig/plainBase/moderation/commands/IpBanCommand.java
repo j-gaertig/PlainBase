@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.moderation.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.moderation.BanManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
@@ -12,7 +13,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
+import java.net.InetAddress;
 
 /**
  * /banip <ip-or-player> [reason] — bans a raw IP address, or resolves a
@@ -53,22 +54,32 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
 
+        // Captured once: a /plainbase reload racing the async hops below can
+        // null plugin.getBanManager() mid-chain — a stale local reference
+        // keeps the callback working instead of NPE-ing.
+        BanManager manager = plugin.getBanManager();
+
         resolveIp(target, ip -> {
+            if (isGone(sender)) return;
+            if (manager == null) {
+                sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
+                return;
+            }
             if (ip == null) {
                 if (isIpLike(target)) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("invalid-ip", "<red>Invalid IP address: %ip%").replace("%ip%", esc(target))));
                 } else {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("ip-not-found", "<red>Could not resolve an IP for %player%.").replace("%player%", esc(target))));
                 }
                 return;
             }
 
             // Self-IP warning: banning your own address locks YOU out on next login.
-            if (sender instanceof Player self && self.getAddress() != null
-                    && ip.equals(self.getAddress().getAddress().getHostAddress())) {
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+            String selfIp = (sender instanceof Player self) ? addressIp(self) : null;
+            if (selfIp != null && ip.equals(selfIp)) {
+                sender.sendMessage(render(
                         message("self-ip-warning", "<yellow>Warning: this is your own IP address — you will lock yourself out.")));
             }
 
@@ -78,15 +89,16 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
             if (!isAdmin(sender)) {
                 boolean protectedOwner = false;
                 for (Player online : Bukkit.getOnlinePlayers()) {
-                    if (online.getAddress() != null
-                            && ip.equals(online.getAddress().getAddress().getHostAddress())
+                    String onlineIp = addressIp(online);
+                    if (onlineIp != null
+                            && ip.equals(onlineIp)
                             && isProtectedTarget(online, sender)) {
                         protectedOwner = true;
                         break;
                     }
                 }
                 if (protectedOwner) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("exempt", "<red>You cannot punish this player.")));
                     return;
                 }
@@ -94,24 +106,25 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
                         + " without full exempt/admin check (offline owners cannot be verified).");
             }
 
-            plugin.getBanManager().tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, result -> {
+            manager.tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, result -> {
+                if (isGone(sender)) return;
                 if (result.isEmpty()) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
+                    sender.sendMessage(render(
                             message("ip-already-banned", "<red>%ip% is already banned.").replace("%ip%", esc(ip))));
                     return;
                 }
 
                 // Kick any currently-online player connecting from this IP.
                 for (Player online : Bukkit.getOnlinePlayers()) {
-                    if (ip.equals(online.getAddress() != null ? online.getAddress().getAddress().getHostAddress() : null)) {
-                        kickSafely(online, plugin.getMiniMessage().deserialize(
+                    if (ip.equals(addressIp(online))) {
+                        kickSafely(online, render(
                                 message("ipban-screen", "<red>Your IP address is banned.\n<gray>Reason: %reason%")
                                         .replace("%reason%", esc(reason)).replace("%staff%", esc(staffName))
                                         .replace("%remaining%", "permanent")));
                     }
                 }
 
-                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                sender.sendMessage(render(
                         message("banip-success", "<green>%ip% has been banned. <gray>(%reason%)")
                                 .replace("%ip%", esc(ip)).replace("%reason%", esc(reason))));
 
@@ -136,18 +149,50 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
         }
 
         Player online = Bukkit.getPlayer(arg);
-        if (online != null && online.getAddress() != null) {
-            callback.accept(online.getAddress().getAddress().getHostAddress());
-            return;
+        if (online != null) {
+            String onlineIp = addressIp(online);
+            if (onlineIp != null) {
+                callback.accept(onlineIp);
+                return;
+            }
+            // Online but the address is currently unavailable (e.g. unresolved)
+            // — fall through to the DB lookup instead of NPE-ing or resolving
+            // garbage.
         }
 
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            String lastIp = plugin.getBanManager().findLastIpByName(arg);
+            // Reload race: the manager can be gone by the time this async
+            // task runs — resolve to "not found" instead of NPE-ing.
+            BanManager manager = plugin.getBanManager();
+            String lastIp = manager == null ? null : manager.findLastIpByName(arg);
             // Stored IPs were recorded via getHostAddress() already, but
-            // normalize defensively so legacy rows still match.
-            String normalized = lastIp == null ? null : normalizeIp(lastIp);
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(normalized != null ? normalized : lastIp));
+            // normalize defensively so legacy rows still match. A missing,
+            // blank, literal-"unknown" (legacy rows from before the listener
+            // skipped null addresses) or otherwise unparseable value resolves
+            // to null so the caller takes the ip-not-found path — it must
+            // NEVER be passed on as a bannable address.
+            String resolved = isUsableStoredIp(lastIp) ? normalizeIp(lastIp) : null;
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(resolved));
         });
+    }
+
+    /**
+     * Null-safe extraction of a player's current IP. Both levels can be null:
+     * Player#getAddress() (no address yet) and InetSocketAddress#getAddress()
+     * (unresolved address) — dereferencing either blindly NPEs.
+     */
+    private static String addressIp(Player player) {
+        if (player.getAddress() == null) return null;
+        try {
+            InetAddress inner = player.getAddress().getAddress();
+            return inner == null ? null : inner.getHostAddress();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static boolean isUsableStoredIp(String stored) {
+        return stored != null && !stored.isBlank() && !"unknown".equalsIgnoreCase(stored.trim());
     }
 
     private static boolean isIpLike(String arg) {
@@ -157,9 +202,8 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         if (args.length <= 1) {
-            String input = args.length == 0 ? "" : args[0].toLowerCase();
-            return Bukkit.getOnlinePlayers().stream().map(Player::getName)
-                    .filter(n -> n.toLowerCase().startsWith(input)).collect(Collectors.toList());
+            String input = args.length == 0 ? "" : args[0];
+            return suggestOnlinePlayers(stack.getSender(), input, "plainbase.moderation.banip");
         }
         return List.of();
     }

@@ -10,6 +10,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -55,14 +56,14 @@ public class MenuCommand implements BasicCommand {
             return;
         }
 
-        switch (args[0].toLowerCase()) {
+        switch (args[0].toLowerCase(Locale.ROOT)) {
             case "new" -> {
                 if (!checkPermission(player, "plainbase.menu.new")) return;
                 if (args.length < 2) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/menu new <name>"));
                     return;
                 }
-                String name = args[1].toLowerCase();
+                String name = args[1].toLowerCase(Locale.ROOT);
                 if (!name.matches("[a-z0-9_-]+")) {
                     player.sendMessage(plugin.getMiniMessage().deserialize(
                             "<red>Invalid menu name! Use only <yellow>a-z, 0-9, - and _<red>."
@@ -84,7 +85,7 @@ public class MenuCommand implements BasicCommand {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/menu delete <name>"));
                     return;
                 }
-                String name = args[1].toLowerCase();
+                String name = args[1].toLowerCase(Locale.ROOT);
                 if (!plugin.getMenuManager().hasMenu(name)) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<red>Menu not found!"));
                     return;
@@ -100,7 +101,7 @@ public class MenuCommand implements BasicCommand {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/menu open <name>"));
                     return;
                 }
-                String name = args[1].toLowerCase();
+                String name = args[1].toLowerCase(Locale.ROOT);
                 if (!plugin.getMenuManager().openMenu(player, name)) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<red>Menu not found!"));
                 }
@@ -137,26 +138,72 @@ public class MenuCommand implements BasicCommand {
         return true;
     }
 
+    private boolean hasMenuPermission(CommandSender sender, String permission) {
+        try {
+            return sender.hasPermission("plainbase.admin")
+                    || sender.hasPermission("plainbase.menu.admin")
+                    || sender.hasPermission(permission);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static String permissionFor(String sub) {
+        return switch (sub) {
+            case "new" -> "plainbase.menu.new";
+            case "delete" -> "plainbase.menu.delete";
+            case "open" -> "plainbase.menu.open";
+            case "list" -> "plainbase.menu.list";
+            default -> null;
+        };
+    }
+
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
+        // Mirror execute() guards: no suggestions when the module is off or unavailable.
+        try {
+            if (!plugin.getConfig().getBoolean("modules.menu", true)) return List.of();
+        } catch (Exception e) {
+            return List.of();
+        }
+        if (plugin.getMenuConfig() == null || plugin.getMenuManager() == null) return List.of();
+        try {
+            if (!plugin.getMenuConfig().getBoolean("menu.enabled", true)) return List.of();
+            if (!plugin.getMenuConfig().getBoolean("menu.commands.menu.enabled", true)) return List.of();
+        } catch (Exception e) {
+            return List.of();
+        }
+        CommandSender sender = stack.getSender();
+
         if (args.length == 0) {
-            return List.of("new", "delete", "open", "list");
+            return Stream.of("new", "delete", "open", "list")
+                    .filter(s -> {
+                        String perm = permissionFor(s);
+                        return perm != null && hasMenuPermission(sender, perm);
+                    })
+                    .toList();
         }
 
         if (args.length == 1) {
-            String input = args[0].toLowerCase();
+            String input = args[0].toLowerCase(Locale.ROOT);
             return Stream.of("new", "delete", "open", "list")
                     .filter(s -> s.startsWith(input))
+                    .filter(s -> {
+                        String perm = permissionFor(s);
+                        return perm != null && hasMenuPermission(sender, perm);
+                    })
                     .toList();
         }
 
         if (args.length == 2) {
-            String sub = args[0].toLowerCase();
+            String sub = args[0].toLowerCase(Locale.ROOT);
             if (sub.equals("delete") || sub.equals("open")) {
+                String perm = permissionFor(sub);
+                if (perm == null || !hasMenuPermission(sender, perm)) return List.of();
                 if (plugin.getMenuManager() == null) return List.of();
-                String input = args[1].toLowerCase();
+                String input = args[1].toLowerCase(Locale.ROOT);
                 return new ArrayList<>(plugin.getMenuManager().getMenuNames()).stream()
-                        .filter(n -> n.toLowerCase().startsWith(input))
+                        .filter(n -> n.toLowerCase(Locale.ROOT).startsWith(input))
                         .toList();
             }
         }

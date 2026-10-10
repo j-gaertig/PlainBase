@@ -6,14 +6,11 @@ import de.jgaertig.plainBase.moderation.BanRecord;
 import de.jgaertig.plainBase.moderation.DurationParser;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
-import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
-import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.List;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 /**
  * /baninfo <player> — current ban status + total ban/kick counts + last ban
@@ -40,6 +37,11 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
         String targetName = args[0];
 
         resolveTarget(targetName, offlinePlayer -> {
+            // Async hop (uncached names resolve off-thread): the sender may
+            // have logged off while we waited — skip instead of messaging
+            // a stale/gone sender.
+            if (isGone(sender)) return;
+
             if (offlinePlayer == null) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
@@ -85,15 +87,24 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             // findLastIpByName() does blocking JDBC I/O — never call it directly
             // on this main/region thread. Hop to the async scheduler, then back.
             org.bukkit.Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-                String lastIp = manager.findLastIpByName(name);
+                String lastIp;
+                try {
+                    lastIp = manager.findLastIpByName(name);
+                } catch (RuntimeException e) {
+                    plugin.getLogger().warning("Could not look up last IP for " + name + ": " + e.getMessage());
+                    return;
+                }
                 if (lastIp == null) return;
 
                 long now = System.currentTimeMillis();
                 boolean ipBanned = manager.getActiveIpBans().stream().anyMatch(r -> r.ip().equals(lastIp) && r.isActive(now));
                 if (!ipBanned) return;
 
-                org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> sender.sendMessage(plugin.getMiniMessage().deserialize(
-                        message("baninfo-ip-banned", "<gray>Note: their last known IP address is currently banned too."))));
+                org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                    if (isGone(sender)) return;
+                    sender.sendMessage(render(
+                            message("baninfo-ip-banned", "<gray>Note: their last known IP address is currently banned too.")));
+                });
             });
         });
     }
@@ -101,9 +112,8 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         if (args.length <= 1) {
-            String input = args.length == 0 ? "" : args[0].toLowerCase();
-            return Bukkit.getOnlinePlayers().stream().map(Player::getName)
-                    .filter(n -> n.toLowerCase().startsWith(input)).collect(Collectors.toList());
+            String input = args.length == 0 ? "" : args[0];
+            return suggestOnlinePlayers(stack.getSender(), input, "plainbase.moderation.baninfo");
         }
         return List.of();
     }
