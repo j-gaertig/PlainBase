@@ -1,10 +1,12 @@
 package de.jgaertig.plainBase.vanish.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.vanish.VanishManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.jetbrains.annotations.NotNull;
@@ -26,17 +28,21 @@ public class VanishCommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.vanish", true)) {
+        if (!plugin.getConfig().getBoolean("modules.vanish", false)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
 
-        if (plugin.getVanishConfig() == null || plugin.getVanishManager() == null) {
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        // Captured once: a /plainbase reload racing this command can null
+        // the manager between the guard below and later use.
+        VanishManager vanishManager = plugin.getVanishManager();
+        if (vanishConfig == null || vanishManager == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Vanish is currently unavailable."));
             return;
         }
 
-        if (!plugin.getVanishConfig().getBoolean("vanish.enabled", true)) {
+        if (!vanishConfig.getBoolean("vanish.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Vanish has been disabled."));
             return;
         }
@@ -49,11 +55,11 @@ public class VanishCommand implements BasicCommand {
         // /vanish world — vanish all players in the sender's world
         if (args.length == 1 && args[0].equalsIgnoreCase("world")) {
             if (!checkPermission(player, "plainbase.vanish.world")) return;
-            if (!plugin.getVanishConfig().getBoolean("vanish.world.enabled", true)) {
+            if (!vanishConfig.getBoolean("vanish.world.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
-            if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
+            if (!vanishConfig.getBoolean("vanish.commands.vanish.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
@@ -71,11 +77,11 @@ public class VanishCommand implements BasicCommand {
         // /vanish all — vanish all online players (including the executor)
         if (args.length == 1 && args[0].equalsIgnoreCase("all")) {
             if (!checkPermission(player, "plainbase.vanish.all")) return;
-            if (!plugin.getVanishConfig().getBoolean("vanish.all.enabled", true)) {
+            if (!vanishConfig.getBoolean("vanish.all.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
-            if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
+            if (!vanishConfig.getBoolean("vanish.commands.vanish.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
@@ -91,7 +97,7 @@ public class VanishCommand implements BasicCommand {
         // /vanish <player> — vanish a specific player
         if (args.length == 1) {
             if (!checkPermission(player, "plainbase.vanish.vanish.other")) return;
-            if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
+            if (!vanishConfig.getBoolean("vanish.commands.vanish.enabled", true)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
                 return;
             }
@@ -106,7 +112,7 @@ public class VanishCommand implements BasicCommand {
                 return;
             }
 
-            boolean nowVanished = plugin.getVanishManager().toggleVanish(target);
+            boolean nowVanished = vanishManager.toggleVanish(target);
             player.sendMessage(plugin.getMiniMessage().deserialize(
                     "<gray>" + plugin.getMiniMessage().escapeTags(target.getName()) + " is now " + (nowVanished ? "<green>vanished" : "<red>visible") + "<gray>."
             ));
@@ -122,12 +128,12 @@ public class VanishCommand implements BasicCommand {
 
         // /vanish — vanish/unvanish self
         if (!checkPermission(player, "plainbase.vanish.vanish")) return;
-        if (!plugin.getVanishConfig().getBoolean("vanish.commands.vanish.enabled", true)) {
+        if (!vanishConfig.getBoolean("vanish.commands.vanish.enabled", true)) {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }
 
-        boolean nowVanished = plugin.getVanishManager().toggleVanish(player);
+        boolean nowVanished = vanishManager.toggleVanish(player);
         player.sendMessage(plugin.getMiniMessage().deserialize(
                 nowVanished ? "<green>You are now vanished!" : "<gray>You are no longer vanished."
         ));
@@ -148,20 +154,24 @@ public class VanishCommand implements BasicCommand {
         // individually: if anyone is still visible, vanish everyone —
         // otherwise reveal everyone. Per-player toggling would leave a
         // mixed group in the exact same mixed state (no-op with noise).
-        boolean anyVisible = targets.stream().anyMatch(p -> !plugin.getVanishManager().isVanished(p));
+        // Captured once: a /plainbase reload racing this loop can null
+        // the manager between calls.
+        VanishManager vanishManager = plugin.getVanishManager();
+        if (vanishManager == null) return;
+        boolean anyVisible = targets.stream().anyMatch(p -> !vanishManager.isVanished(p));
 
         int vanished = 0;
         int revealed = 0;
         for (Player target : targets) {
-            boolean isVanished = plugin.getVanishManager().isVanished(target);
+            boolean isVanished = vanishManager.isVanished(target);
             if (anyVisible && !isVanished) {
-                plugin.getVanishManager().vanish(target);
+                vanishManager.vanish(target);
                 vanished++;
                 if (!target.equals(executor)) {
                     target.sendMessage(plugin.getMiniMessage().deserialize("<green>You are now vanished!"));
                 }
             } else if (!anyVisible && isVanished) {
-                plugin.getVanishManager().unvanish(target);
+                vanishManager.unvanish(target);
                 revealed++;
                 if (!target.equals(executor)) {
                     target.sendMessage(plugin.getMiniMessage().deserialize("<gray>You are no longer vanished."));
@@ -177,11 +187,13 @@ public class VanishCommand implements BasicCommand {
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
         // Mirror execute() guards: no suggestions when the module is off or unavailable.
         try {
-            if (!plugin.getConfig().getBoolean("modules.vanish", true)) return List.of();
+            if (!plugin.getConfig().getBoolean("modules.vanish", false)) return List.of();
         } catch (Exception e) {
             return List.of();
         }
         if (plugin.getVanishConfig() == null || plugin.getVanishManager() == null) return List.of();
+        VanishManager vanishManager = plugin.getVanishManager();
+        if (vanishManager == null) return List.of();
 
         CommandSender sender = stack.getSender();
         if (!hasAnyVanishPermission(sender)) return List.of();
@@ -199,7 +211,7 @@ public class VanishCommand implements BasicCommand {
                 players = List.of();
             } else if (sender instanceof Player viewer) {
                 players = Bukkit.getOnlinePlayers().stream()
-                        .filter(p -> plugin.getVanishManager().canSee(viewer, p))
+                        .filter(p -> vanishManager.canSee(viewer, p))
                         .map(Player::getName)
                         .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(input))
                         .toList();

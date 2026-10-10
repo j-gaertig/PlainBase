@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.moderation.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.moderation.BanManager;
 import de.jgaertig.plainBase.moderation.BanRecord;
 import de.jgaertig.plainBase.moderation.DurationParser;
 import de.jgaertig.plainBase.moderation.IpBanRecord;
@@ -29,6 +30,15 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
 
         if (!checkPreconditions(sender, "plainbase.moderation.banlist", "banlist")) return;
 
+        // Captured once: a /plainbase reload racing this command can null
+        // plugin.getBanManager() between checkPreconditions and use — a stale
+        // local reference keeps working instead of NPE-ing.
+        BanManager banManager = plugin.getBanManager();
+        if (banManager == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            return;
+        }
+
         int page = 1;
         if (args.length >= 1) {
             try {
@@ -42,7 +52,7 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
             }
         }
 
-        List<BanRecord> active = plugin.getBanManager().getActiveBans();
+        List<BanRecord> active = banManager.getActiveBans();
         long now = System.currentTimeMillis();
 
         if (active.isEmpty()) {
@@ -56,7 +66,11 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
 
                 int to = Math.min(from + PAGE_SIZE, active.size());
                 for (BanRecord record : active.subList(from, to)) {
-                    String duration = record.isPermanent() ? "permanent" : DurationParser.format(record.remainingMillis(now)) + " left";
+                    // remaining <= 0: expired between the active check and this
+                    // render — show "expired", never "expired left".
+                    String duration = record.isPermanent() ? "permanent"
+                            : (record.remainingMillis(now) <= 0 ? "expired"
+                                    : DurationParser.format(record.remainingMillis(now)) + " left");
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("banlist-entry", "<yellow>%player% <gray>- %reason% (%duration%)")
                                     .replace("%player%", esc(record.name()))
@@ -69,7 +83,7 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
             }
         }
 
-        List<IpBanRecord> activeIps = plugin.getBanManager().getActiveIpBans();
+        List<IpBanRecord> activeIps = banManager.getActiveIpBans();
         if (!activeIps.isEmpty()) {
             long fromLong = ((long) page - 1L) * (long) PAGE_SIZE;
             int from = (int) Math.min(fromLong, Integer.MAX_VALUE);
@@ -79,7 +93,9 @@ public class BanListCommand extends ModerationCommandBase implements BasicComman
 
                 int to = Math.min(from + PAGE_SIZE, activeIps.size());
                 for (IpBanRecord record : activeIps.subList(from, to)) {
-                    String duration = record.isPermanent() ? "permanent" : DurationParser.format(record.remainingMillis(now)) + " left";
+                    String duration = record.isPermanent() ? "permanent"
+                            : (record.remainingMillis(now) <= 0 ? "expired"
+                                    : DurationParser.format(record.remainingMillis(now)) + " left");
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("banlist-ip-entry", "<yellow>%ip% <gray>- %reason% (%duration%)")
                                     .replace("%ip%", esc(record.ip()))

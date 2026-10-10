@@ -31,7 +31,13 @@ public class TeamCommand implements BasicCommand {
     /**
      * @param name          subcommand literal, also the config key under {@code team.commands.<name>.enabled}
      * @param usage         argument hint shown after the action name in /team's help output
-     * @param permission    permission node required to even attempt this action
+     * @param permission    permission node required to even attempt this action.
+     *                      T8 note: invite/add/kick/setrole/reject/requests default to TRUE —
+     *                      the permission alone does NOT restrict these to team admins.
+     *                      The real admin gate is {@link TeamManager#isTeamAdmin},
+     *                      enforced via adminGated below. Do not "fix" by flipping
+     *                      defaults to OP (breaking change).
+     * @param requiresPlayer true if only a real player (not console) may run this
      * @param requiresPlayer true if only a real player (not console) may run this
      * @param teamScoped    true if this action takes a team id as its first argument
      * @param teamRequired  only meaningful if teamScoped: false = team id may be omitted (self-service actions
@@ -97,7 +103,7 @@ public class TeamCommand implements BasicCommand {
         TeamManager teams = plugin.getTeamManager();
         FileConfiguration teamConfig = plugin.getTeamConfig();
 
-        if (!plugin.getConfig().getBoolean("modules.team", true)) {
+        if (!plugin.getConfig().getBoolean("modules.team", false)) {
             sender.sendMessage(mm("<red>This module is currently disabled."));
             return;
         }
@@ -236,7 +242,7 @@ public class TeamCommand implements BasicCommand {
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         TeamManager teams = plugin.getTeamManager();
         if (teams == null) return List.of();
-        if (!plugin.getConfig().getBoolean("modules.team", true)) return List.of();
+        if (!plugin.getConfig().getBoolean("modules.team", false)) return List.of();
         FileConfiguration teamCfg = plugin.getTeamConfig();
         if (teamCfg == null || !teamCfg.getBoolean("team.enabled", true)) return List.of();
         if (!teamCfg.getBoolean("team.commands.team.enabled", true)) return List.of();

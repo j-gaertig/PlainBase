@@ -10,6 +10,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCreativeEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.inventory.Inventory;
 
@@ -47,7 +48,10 @@ public class MenuListener implements Listener {
         // menu definition was deleted or reloaded in the meantime.
         event.setCancelled(true);
 
-        MenuManager.MenuDefinition menu = plugin.getMenuManager().getMenu(holder.getMenuName());
+        MenuManager mgr = plugin.getMenuManager();
+        if (mgr == null) return;
+
+        MenuManager.MenuDefinition menu = mgr.getMenu(holder.getMenuName());
         if (menu == null) return;
 
         int rawSlot = event.getRawSlot();
@@ -164,6 +168,22 @@ public class MenuListener implements Listener {
 
         // Dragging inside or into our menu is always cancelled — the bottom
         // inventory is locked too, so nothing can move in or out of the menu.
+        event.setCancelled(true);
+    }
+
+    /**
+     * M1 creative-inventory guard (mirrors JoinItemsListener#onCreativeClick):
+     * without this, creative-mode clicks bypass onClick and can take menu
+     * items out of the GUI.
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onCreative(InventoryCreativeEvent event) {
+        if (!(event.getWhoClicked() instanceof Player)) return;
+
+        Inventory top = event.getView().getTopInventory();
+        MenuManager.MenuHolder holder = getMenuHolder(top);
+        if (holder == null) return;
+
         event.setCancelled(true);
     }
 }

@@ -24,7 +24,7 @@ public class Spawn implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.spawn", true)) {
+        if (!plugin.getConfig().getBoolean("modules.spawn", false)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
@@ -39,7 +39,17 @@ public class Spawn implements BasicCommand {
             return;
         }
 
-        if (!plugin.getSpawnConfig().getBoolean("commands.spawn.enabled", true)) {
+        // Snapshot + locked read: writers mutate under synchronized(config).
+        FileConfiguration spawnConfig = plugin.getSpawnConfig();
+        if (spawnConfig == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+            return;
+        }
+        boolean commandEnabled;
+        synchronized (spawnConfig) {
+            commandEnabled = spawnConfig.getBoolean("commands.spawn.enabled", true);
+        }
+        if (!commandEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }
@@ -49,15 +59,38 @@ public class Spawn implements BasicCommand {
             return;
         }
 
-        if (!plugin.getSpawnConfig().getBoolean("spawn.enabled", true)) {
+        boolean spawnEnabled;
+        synchronized (spawnConfig) {
+            spawnEnabled = spawnConfig.getBoolean("spawn.enabled", true);
+        }
+        if (!spawnEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn position has been disabled."));
             return;
         }
 
         String path = "spawn.location";
 
-        FileConfiguration config = plugin.getSpawnConfig();
-        String worldName = config.getString(path + ".world");
+        // Consistent snapshot: writers (SetSpawn/saveToSpawnConfig) mutate
+        // under synchronized(config), so reads must lock the same monitor to
+        // never mix half-written coordinates. Only plain values are copied
+        // under the lock — world lookup and teleport happen outside it.
+        // Reuses the spawnConfig snapshot above (never re-fetched: a reload
+        // between the checks could otherwise hand back null).
+        FileConfiguration config = spawnConfig;
+        final String worldName;
+        final double rawX;
+        final double rawY;
+        final double rawZ;
+        final double rawYaw;
+        final double rawPitch;
+        synchronized (config) {
+            worldName = config.getString(path + ".world");
+            rawX = config.getDouble(path + ".x");
+            rawY = config.getDouble(path + ".y");
+            rawZ = config.getDouble(path + ".z");
+            rawYaw = config.getDouble(path + ".yaw");
+            rawPitch = config.getDouble(path + ".pitch");
+        }
         if (worldName == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is not set correctly. Contact an admin."));
             plugin.getLogger().warning("Spawn location world is missing in spawn.yml!");
@@ -80,16 +113,11 @@ public class Spawn implements BasicCommand {
             return;
         }
 
-        double rawX = config.getDouble(path + ".x");
-        double rawY = config.getDouble(path + ".y");
-        double rawZ = config.getDouble(path + ".z");
         if (!Double.isFinite(rawX) || !Double.isFinite(rawY) || !Double.isFinite(rawZ)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is not set correctly. Contact an admin."));
             plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": non-finite coordinates in spawn.yml!");
             return;
         }
-        double rawYaw = config.getDouble(path + ".yaw");
-        double rawPitch = config.getDouble(path + ".pitch");
         float yaw = Double.isFinite(rawYaw) ? (float) rawYaw : 0f;
         float pitch = Double.isFinite(rawPitch) ? (float) rawPitch : 0f;
 

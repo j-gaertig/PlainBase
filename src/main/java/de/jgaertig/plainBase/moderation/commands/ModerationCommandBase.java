@@ -19,8 +19,12 @@ import java.util.stream.Collectors;
  * banlist/baninfo): module/permission/command-enabled checks (repo check-order
  * convention), async offline-player resolution, Folia-safe entity kicks, and
  * broadcast handling. Not a command itself.
+ *
+ * <p>Public (not package-private) on purpose: ModerationListener and BanManager
+ * reuse {@link #normalizeIp}/{@link #isIpLike} so login tracking, login checks
+ * and /banip all compare the same canonical IP form.
  */
-abstract class ModerationCommandBase {
+public abstract class ModerationCommandBase {
 
     protected final PlainBase plugin;
 
@@ -32,7 +36,7 @@ abstract class ModerationCommandBase {
      * @return true if the command may proceed, false if it already sent a rejection message.
      */
     protected boolean checkPreconditions(CommandSender sender, String permissionNode, String commandKey) {
-        if (!plugin.getConfig().getBoolean("modules.moderation", true)) {
+        if (!plugin.getConfig().getBoolean("modules.moderation", false)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return false;
         }
@@ -143,7 +147,7 @@ abstract class ModerationCommandBase {
      * {@code ::ffff:a.b.c.d} addresses are unmapped to plain IPv4, and
      * zone IDs ({@code %eth0}) are rejected.
      */
-    protected static String normalizeIp(String ip) {
+    public static String normalizeIp(String ip) {
         try {
             return normalizeIpLiteral(ip);
         } catch (RuntimeException e) {
@@ -157,7 +161,7 @@ abstract class ModerationCommandBase {
      * from "looks like a player name". Must stay in sync with
      * IpBanCommand's gate.
      */
-    protected static boolean isIpLike(String arg) {
+    public static boolean isIpLike(String arg) {
         if (arg == null) return false;
         if (!IP_LIKE.matcher(arg).matches()) return false;
         return arg.contains(".") || arg.contains(":");
@@ -320,15 +324,33 @@ abstract class ModerationCommandBase {
     }
 
     /**
+     * Online-player lookup that prefers an exact name match: Bukkit#getPlayer
+     * does prefix matching ("Alex" also matches "Alexander"), which could ban
+     * or kick the wrong player on a typo. Exact first, fuzzy only as fallback.
+     */
+    protected static Player onlinePlayerExactFirst(String name) {
+        if (name == null) return null;
+        Player exact = Bukkit.getPlayerExact(name);
+        if (exact != null) return exact;
+        return Bukkit.getPlayer(name);
+    }
+
+    /**
      * Resolves a target by name: online players resolve instantly, Paper's cached
      * offline-player lookup resolves instantly too. Only an uncached, never-joined
      * name falls back to Bukkit#getOfflinePlayer(String), which can block on a
      * Mojang lookup — so that call always runs on the async scheduler, and the
      * callback is always dispatched back onto the main/region thread afterwards
      * (same pattern as PlainBaseCommand's Modrinth update check).
+     * <p>
+     * Phantom-UUID guard: a name with neither a profile name nor any playtime
+     * resolves to null (→ "player-not-found" in every caller) instead of a
+     * phantom UUID that would collect typo-bans. The hasPlayedBefore() check
+     * runs INSIDE the async task above (never on the region thread), so no
+     * disk I/O lands on the main thread.
      */
     protected void resolveTarget(String name, Consumer<OfflinePlayer> callback) {
-        Player online = Bukkit.getPlayer(name);
+        Player online = onlinePlayerExactFirst(name);
         if (online != null) {
             callback.accept(online);
             return;
@@ -342,7 +364,11 @@ abstract class ModerationCommandBase {
 
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             OfflinePlayer resolved = Bukkit.getOfflinePlayer(name);
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(resolved));
+            if (resolved.getName() == null && !resolved.hasPlayedBefore()) {
+                resolved = null;
+            }
+            OfflinePlayer finalResolved = resolved;
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(finalResolved));
         });
     }
 
@@ -434,7 +460,7 @@ abstract class ModerationCommandBase {
     protected List<String> suggestOnlinePlayers(CommandSender sender, String input, String permissionNode) {
         if (!hasSuggestPermission(sender, permissionNode)) return List.of();
         try {
-            if (!plugin.getConfig().getBoolean("modules.moderation", true)) return List.of();
+            if (!plugin.getConfig().getBoolean("modules.moderation", false)) return List.of();
         } catch (Exception e) {
             return List.of();
         }

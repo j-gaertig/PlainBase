@@ -5,6 +5,7 @@ import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Location;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -20,7 +21,7 @@ public class SetFirstSpawn implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.spawn", true)) {
+        if (!plugin.getConfig().getBoolean("modules.spawn", false)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
@@ -35,7 +36,17 @@ public class SetFirstSpawn implements BasicCommand {
             return;
         }
 
-        if (!plugin.getSpawnConfig().getBoolean("commands.setfirstspawn.enabled", true)) {
+        // Snapshot + locked read: writers mutate under synchronized(config).
+        FileConfiguration firstSpawnConfig = plugin.getSpawnConfig();
+        if (firstSpawnConfig == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+            return;
+        }
+        boolean commandEnabled;
+        synchronized (firstSpawnConfig) {
+            commandEnabled = firstSpawnConfig.getBoolean("commands.setfirstspawn.enabled", true);
+        }
+        if (!commandEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }

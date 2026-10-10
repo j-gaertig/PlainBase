@@ -9,6 +9,14 @@ import org.bukkit.entity.Player;
  * extends) — the PAPI reference is only resolved when apply() actually runs
  * behind the "is PlaceholderAPI installed?" guard, so a missing PlaceholderAPI
  * can never cause a NoClassDefFoundError on this plugin.
+ * <p>
+ * P3 note: the PlaceholderAPI expansion instance cache deliberately lives in
+ * {@link PlainBaseExpansion} (which already links PAPI), NOT here — caching it
+ * here would force this bridge to reference PAPI types and break the isolation
+ * above. Use {@link PlainBaseExpansion#unregisterCached()} to unregister the
+ * same instance that was registered (null-guarded); PlainBase currently
+ * unregisters via a fresh instance, which works (unregister is by identifier)
+ * but is more fragile.
  */
 public final class PlaceholderBridge {
 

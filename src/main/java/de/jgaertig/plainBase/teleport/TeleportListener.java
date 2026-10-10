@@ -7,9 +7,11 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.entity.Player;
 
 import java.util.List;
@@ -40,7 +42,7 @@ public class TeleportListener implements Listener {
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        if (!plugin.getConfig().getBoolean("modules.teleport", true)) return;
+        if (!plugin.getConfig().getBoolean("modules.teleport", false)) return;
         Player player = event.getPlayer();
         try {
             if (plugin.getTPAManager() != null) {
@@ -74,6 +76,22 @@ public class TeleportListener implements Listener {
         }
         if (from.distanceSquared(to) < 0.01) return;
 
+        checkAndCancel(event.getPlayer(), "move");
+    }
+
+    // A world change without a move delta (portal, /world hop, end gate) must
+    // break the warmup just like movement does. No new config key: reuses the
+    // "move" cancel flag.
+    @EventHandler
+    public void onWorldChange(PlayerChangedWorldEvent event) {
+        checkAndCancel(event.getPlayer(), "move");
+    }
+
+    // Any teleport (ender pearl, chorus, other plugins) breaks the warmup.
+    // Always cancels, including PLUGIN cause: our own teleports only fire
+    // after the warmup entry was already removed, so this is a no-op for them.
+    @EventHandler(ignoreCancelled = true)
+    public void onTeleport(PlayerTeleportEvent event) {
         checkAndCancel(event.getPlayer(), "move");
     }
 

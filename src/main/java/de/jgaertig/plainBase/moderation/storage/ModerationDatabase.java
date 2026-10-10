@@ -6,6 +6,7 @@ import de.jgaertig.plainBase.PlainBase;
 import de.jgaertig.plainBase.moderation.BanRecord;
 import de.jgaertig.plainBase.moderation.IpBanRecord;
 import de.jgaertig.plainBase.moderation.KickRecord;
+import org.bukkit.configuration.file.FileConfiguration;
 
 import java.io.File;
 import java.sql.Connection;
@@ -38,7 +39,10 @@ public class ModerationDatabase {
 
     public ModerationDatabase(PlainBase plugin) {
         this.plugin = plugin;
-        this.mysql = "mysql".equalsIgnoreCase(plugin.getModerationConfig().getString("storage.type", "sqlite"));
+        // Snapshot with null-guard: a missing config fails safe to sqlite
+        // (the default backend) instead of NPE-ing the constructor.
+        FileConfiguration cfg = plugin.getModerationConfig();
+        this.mysql = cfg != null && "mysql".equalsIgnoreCase(cfg.getString("storage.type", "sqlite"));
     }
 
     /**
@@ -49,11 +53,19 @@ public class ModerationDatabase {
     public void connect() throws SQLException {
         HikariConfig config = new HikariConfig();
 
+        // Snapshot with null-guard: a /plainbase reload racing startup can
+        // leave the config briefly null — fail with a clear error (the caller
+        // fail-opens) instead of NPE-ing mid-connect.
+        FileConfiguration modCfg = plugin.getModerationConfig();
+        if (modCfg == null) {
+            throw new SQLException("Moderation config is not loaded.");
+        }
+
         if (mysql) {
-            String host = plugin.getModerationConfig().getString("storage.mysql.host", "localhost");
-            int port = plugin.getModerationConfig().getInt("storage.mysql.port", 3306);
-            String database = plugin.getModerationConfig().getString("storage.mysql.database", "plainbase");
-            boolean useSsl = plugin.getModerationConfig().getBoolean("storage.mysql.useSSL", false);
+            String host = modCfg.getString("storage.mysql.host", "localhost");
+            int port = modCfg.getInt("storage.mysql.port", 3306);
+            String database = modCfg.getString("storage.mysql.database", "plainbase");
+            boolean useSsl = modCfg.getBoolean("storage.mysql.useSSL", false);
             if (host == null || !(host.matches("[A-Za-z0-9._-]+") || host.matches("\\[[0-9a-fA-F:.]+\\]"))) {
                 plugin.getLogger().warning("Invalid storage.mysql.host '" + host + "', falling back to localhost");
                 host = "localhost";
@@ -67,44 +79,67 @@ public class ModerationDatabase {
                 port = 3306;
             }
             config.setJdbcUrl("jdbc:mysql://" + host + ":" + port + "/" + database
-                    + "?useSSL=" + useSsl + "&characterEncoding=utf8"
+                    + "?useSSL=" + useSsl + "&characterEncoding=utf8mb4"
                     + "&connectTimeout=5000&socketTimeout=10000");
-            config.setUsername(plugin.getModerationConfig().getString("storage.mysql.username", "root"));
-            config.setPassword(plugin.getModerationConfig().getString("storage.mysql.password", ""));
-            config.setMaximumPoolSize(Math.max(2, plugin.getModerationConfig().getInt("storage.mysql.pool-size", 5)));
+            config.setUsername(modCfg.getString("storage.mysql.username", "root"));
+            config.setPassword(modCfg.getString("storage.mysql.password", ""));
+            config.setMaximumPoolSize(Math.min(10, Math.max(2, modCfg.getInt("storage.mysql.pool-size", 5))));
             config.setDriverClassName("com.mysql.cj.jdbc.Driver");
+            // Statement-cache tunables are Connector/J (MySQL) only — setting
+            // them globally is a no-op on SQLite and only misleading there.
+            config.addDataSourceProperty("cachePrepStmts", "true");
+            config.addDataSourceProperty("prepStmtCacheSize", "250");
+            config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
         } else {
             File dataDir = new File(plugin.getDataFolder(), "data");
-            dataDir.mkdirs();
-            String fileName = plugin.getModerationConfig().getString("storage.sqlite.file", "moderation.db");
+            if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+                throw new SQLException("Could not create moderation data directory: " + dataDir.getAbsolutePath());
+            }
+            String fileName = modCfg.getString("storage.sqlite.file", "moderation.db");
             if (fileName == null || !fileName.matches("[A-Za-z0-9_.-]+\\.db")) {
                 plugin.getLogger().warning("Invalid storage.sqlite.file '" + fileName + "', falling back to moderation.db");
                 fileName = "moderation.db";
             }
             File dbFile = new File(dataDir, fileName);
             config.setJdbcUrl("jdbc:sqlite:" + dbFile.getAbsolutePath());
-            // SQLite has no real concurrent-writer story — a single pooled
-            // connection avoids "database is locked" errors under load.
-            config.setMaximumPoolSize(1);
+            // Small pool instead of a single connection: WAL mode (enabled
+            // below) allows concurrent readers, writes stay short and are
+            // serialized app-side via BanManager's mutationLock, and
+            // busy_timeout (see connectionInitSql) absorbs transient locks.
+            config.setMaximumPoolSize(3);
+            // Per-CONNECTION init: busy_timeout is a per-connection PRAGMA, so
+            // setting it once on an arbitrary pooled connection is lost as soon
+            // as the pool recycles that connection — init SQL re-applies it to
+            // EVERY new connection for the pool's whole lifetime.
+            config.setConnectionInitSql("PRAGMA busy_timeout=5000");
             config.setDriverClassName("org.sqlite.JDBC");
         }
 
         config.setPoolName("PlainBase-Moderation");
         // Bound all blocking setup I/O: BanManager is constructed on the main
         // thread, so an unreachable MySQL host must fail fast instead of hanging
-        // startup (Hikari defaults to a 30s connection timeout). No new feature,
-        // just a fail-fast budget for the initial connect.
+        // startup (Hikari defaults to a 30s connection timeout). The short
+        // connection timeout ALSO protects the login path: every
+        // queryActive*Now check runs with this budget and fail-opens
+        // (allows the login) on timeout instead of stalling logins. No new
+        // feature, just a fail-fast budget for connect and login checks.
         config.setConnectionTimeout(5000);
         config.setValidationTimeout(3000);
         config.setInitializationFailTimeout(5000);
-        // Pool hardening: recycle connections before typical MySQL wait_timeout
-        // (8h) / NAT timeouts, probe idle ones, cap idle retention.
-        config.setMaxLifetime(280000);
-        config.setKeepaliveTime(30000);
-        config.setIdleTimeout(60000);
-        config.addDataSourceProperty("cachePrepStmts", "true");
-        config.addDataSourceProperty("prepStmtCacheSize", "250");
-        config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+        if (mysql) {
+            // Pool hardening: recycle connections before typical MySQL wait_timeout
+            // (8h) / NAT timeouts, probe idle ones, cap idle retention.
+            config.setMaxLifetime(280000);
+            config.setKeepaliveTime(30000);
+            config.setIdleTimeout(60000);
+        } else {
+            // SQLite connections are cheap local file handles — never recycle
+            // them on a timer (0 = disabled), so WAL state and PRAGMAs survive
+            // indefinitely and no recycled connection can lose its settings.
+            config.setMaxLifetime(0);
+            config.setKeepaliveTime(0);
+            config.setIdleTimeout(0);
+        }
         dataSource = new HikariDataSource(config);
 
         try {
@@ -119,6 +154,7 @@ public class ModerationDatabase {
                     }
                 }
                 createTables(conn);
+                normalizeUuidCase(conn);
             }
         } catch (SQLException | RuntimeException e) {
             // createTables()/getConnection() failed AFTER the pool was opened —
@@ -139,7 +175,10 @@ public class ModerationDatabase {
     }
 
     private String prefix() {
-        String p = mysql ? plugin.getModerationConfig().getString("storage.mysql.table-prefix", "pb_") : "pb_";
+        // Snapshot with null-guard: fails safe to the default prefix instead
+        // of NPE-ing SQL construction mid-reload.
+        FileConfiguration modCfg = plugin.getModerationConfig();
+        String p = mysql && modCfg != null ? modCfg.getString("storage.mysql.table-prefix", "pb_") : "pb_";
         if (p == null) p = "pb_";
         // Table prefix is concatenated into SQL — never allow anything that
         // could break out of the identifier (SQL injection via config).
@@ -210,6 +249,37 @@ public class ModerationDatabase {
                     "last_seen BIGINT NOT NULL, " +
                     "PRIMARY KEY (uuid))");
             createIndexIfMissing(st, p + "player_ips_name_idx", p + "player_ips", "name");
+        }
+    }
+
+    /**
+     * One-time, idempotent case normalization: all WRITES already store
+     * lowercase UUIDs, but legacy rows may contain mixed case — and reads must
+     * use an exact {@code uuid = ?} comparison so the index is used (wrapping
+     * the column in {@code LOWER()} disables the index on every login check).
+     * Each UPDATE only touches rows that actually differ (no-op otherwise) and
+     * failures are logged, never fatal: setup must not break over legacy data.
+     * Rows created from now on are already lowercase, so this converges to a
+     * no-op on the second start.
+     */
+    private void normalizeUuidCase(Connection conn) {
+        String p = prefix();
+        String[] statements = {
+                "UPDATE " + p + "bans SET uuid = lower(uuid) WHERE uuid != lower(uuid)",
+                "UPDATE " + p + "bans SET staff_uuid = lower(staff_uuid) WHERE staff_uuid IS NOT NULL AND staff_uuid != lower(staff_uuid)",
+                "UPDATE " + p + "bans SET unbanned_by_uuid = lower(unbanned_by_uuid) WHERE unbanned_by_uuid IS NOT NULL AND unbanned_by_uuid != lower(unbanned_by_uuid)",
+                "UPDATE " + p + "kicks SET uuid = lower(uuid) WHERE uuid != lower(uuid)",
+                "UPDATE " + p + "kicks SET staff_uuid = lower(staff_uuid) WHERE staff_uuid IS NOT NULL AND staff_uuid != lower(staff_uuid)",
+                "UPDATE " + p + "ip_bans SET staff_uuid = lower(staff_uuid) WHERE staff_uuid IS NOT NULL AND staff_uuid != lower(staff_uuid)",
+                "UPDATE " + p + "ip_bans SET unbanned_by_uuid = lower(unbanned_by_uuid) WHERE unbanned_by_uuid IS NOT NULL AND unbanned_by_uuid != lower(unbanned_by_uuid)",
+                "UPDATE " + p + "player_ips SET uuid = lower(uuid) WHERE uuid != lower(uuid)",
+        };
+        for (String sql : statements) {
+            try (Statement st = conn.createStatement()) {
+                st.executeUpdate(sql);
+            } catch (SQLException e) {
+                plugin.getLogger().warning("Could not normalize UUID case (" + sql + "): " + e.getMessage());
+            }
         }
     }
 
@@ -457,9 +527,11 @@ public class ModerationDatabase {
     public BanRecord findActiveBan(UUID uuid, long now) throws SQLException {
         // Overflow-free expiry check: (? - banned_at < duration) never adds
         // two large longs (banned_at + duration could wrap for huge tempbans).
-        // LOWER() on both sides keeps legacy mixed-case UUID rows readable.
+        // Exact uuid = ? comparison (no LOWER() on the column): all writes
+        // store lowercase UUIDs and connect() normalizes legacy rows, so the
+        // index on uuid is actually used on every login check.
         String sql = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at " +
-                "FROM " + prefix() + "bans WHERE LOWER(uuid) = LOWER(?) AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 1";
+                "FROM " + prefix() + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 1";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
             ps.setLong(2, now);

@@ -15,8 +15,33 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
 
     private final PlainBase plugin;
 
+    /**
+     * P3: cache of the last constructed expansion instance. PlainBase#onDisable
+     * currently unregisters via {@code new PlainBaseExpansion(this).unregister()}
+     * (works because PlaceholderAPI unregisters by identifier, but same-instance
+     * unregister is more robust). This field keeps the live instance so future
+     * code can unregister exactly the registered object; the static helper below
+     * is null-guarded and never throws.
+     */
+    private static volatile PlainBaseExpansion lastInstance;
+
     public PlainBaseExpansion(PlainBase plugin) {
         this.plugin = plugin;
+        lastInstance = this;
+    }
+
+    /**
+     * Unregisters the cached instance when present. Null-guarded: returns false
+     * when nothing was registered. Prefer this over {@code new ...unregister()}.
+     */
+    public static boolean unregisterCached() {
+        PlainBaseExpansion cached = lastInstance;
+        if (cached == null) return false;
+        try {
+            return cached.unregister();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Override
@@ -94,11 +119,14 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
 
             // Team module (static placeholders)
             case "team_names" -> player != null && plugin.getTeamManager() != null
-                    ? String.join(", ", plugin.getTeamManager().getPlayerTeams(player.getUniqueId())) : "";
+                    // P2: sorted for determinism (getPlayerTeams order is not stable with max-teams>1).
+                    ? String.join(", ", plugin.getTeamManager().getPlayerTeams(player.getUniqueId()).stream().sorted().toList()) : "";
             case "team_count" -> player != null && plugin.getTeamManager() != null
                     ? String.valueOf(plugin.getTeamManager().getPlayerTeams(player.getUniqueId()).size()) : "0";
             case "team_primary" -> player != null && plugin.getTeamManager() != null
-                    ? plugin.getTeamManager().getPlayerTeams(player.getUniqueId()).stream().findFirst().orElse("") : "";
+                    // P2: never stream().findFirst() on the raw set — its iteration order is
+                    // non-deterministic (backed by ConcurrentHashMap); sort by team id first.
+                    ? plugin.getTeamManager().getPlayerTeams(player.getUniqueId()).stream().sorted().findFirst().orElse("") : "";
             case "team_pending_invites" -> player != null && plugin.getTeamManager() != null
                     ? String.valueOf(plugin.getTeamManager().getPendingInvites(player.getUniqueId()).size()) : "0";
             case "teams_count" -> plugin.getTeamManager() != null

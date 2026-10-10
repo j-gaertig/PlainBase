@@ -1,10 +1,12 @@
 package de.jgaertig.plainBase.moderation.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.moderation.BanManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -29,7 +31,17 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
 
         if (!checkPreconditions(sender, "plainbase.moderation.kick", "kick")) return;
 
-        if (!plugin.getModerationConfig().getBoolean("kick.enabled", true)) {
+        // Captured once: a /plainbase reload racing this command can null
+        // the manager/config between checkPreconditions and use — stale
+        // locals keep working instead of NPE-ing.
+        FileConfiguration moderationConfig = plugin.getModerationConfig();
+        BanManager banManager = plugin.getBanManager();
+        if (moderationConfig == null || banManager == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            return;
+        }
+
+        if (!moderationConfig.getBoolean("kick.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Kicking is currently disabled."));
             return;
         }
@@ -39,7 +51,9 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
             return;
         }
 
-        Player target = Bukkit.getPlayer(args[0]);
+        // Exact name first: Bukkit#getPlayer does prefix matching and could
+        // kick the wrong player on a typo ("Alex" also matches "Alexander").
+        Player target = onlinePlayerExactFirst(args[0]);
         if (target == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize(
                     message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(args[0]))));
@@ -60,14 +74,22 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
         String targetName = target.getName();
         UUID targetUuid = target.getUniqueId();
 
-        plugin.getBanManager().recordKickAsync(targetUuid, targetName, reason, staffUuid, staffName, () -> {
+        banManager.recordKickAsync(targetUuid, targetName, reason, staffUuid, staffName, () -> {
+            // Re-check AFTER the DB write: the target may have logged off
+            // during the async hop. A kick that never landed must not report
+            // success — tell staff the player left instead (the kick is still
+            // recorded in history, but no broadcast goes out for a kick that
+            // never happened).
             Player stillOnline = Bukkit.getPlayer(targetUuid);
-            if (stillOnline != null) {
-                kickSafely(stillOnline, plugin.getMiniMessage().deserialize(
-                        message("kick-screen", "<red>You have been kicked.\n<gray>Reason: %reason%")
-                                .replace("%reason%", esc(reason))
-                                .replace("%staff%", esc(staffName))));
+            if (stillOnline == null) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                        message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(targetName))));
+                return;
             }
+            kickSafely(stillOnline, plugin.getMiniMessage().deserialize(
+                    message("kick-screen", "<red>You have been kicked.\n<gray>Reason: %reason%")
+                            .replace("%reason%", esc(reason))
+                            .replace("%staff%", esc(staffName))));
 
             sender.sendMessage(plugin.getMiniMessage().deserialize(
                     message("kick-success", "<green>%player% has been kicked. <gray>(%reason%)")

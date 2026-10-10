@@ -49,9 +49,11 @@ public class BroadcastManager {
                 try {
                     // Placeholders are resolved per recipient so player-specific
                     // placeholders (e.g. %player%) are correct for everyone.
+                    // B2: name escaped before deserialize (see MessagesListener),
+                    // so a name like "<red>" cannot inject MiniMessage.
                     for (Player player : Bukkit.getOnlinePlayers()) {
                         Component message = plugin.getMiniMessage()
-                                .deserialize(plugin.applyPlaceholders(player, broadcastText));
+                                .deserialize(applyPlaceholdersSafe(player, broadcastText));
                         player.sendMessage(message);
                     }
                 } catch (Exception e) {
@@ -68,5 +70,17 @@ public class BroadcastManager {
             task.cancel();
         }
         activeTasks.clear();
+    }
+
+    /**
+     * B2 MiniMessage-injection guard (pattern from MenuManager): escape the
+     * recipient's own name BEFORE PlaceholderAPI runs.
+     */
+    private String applyPlaceholdersSafe(Player player, String template) {
+        if (template == null) return null;
+        String pre = player != null
+                ? template.replace("%player%", plugin.getMiniMessage().escapeTags(player.getName()))
+                : template;
+        return plugin.applyPlaceholders(player, pre);
     }
 }

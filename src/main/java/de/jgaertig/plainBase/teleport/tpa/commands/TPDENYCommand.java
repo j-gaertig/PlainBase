@@ -19,7 +19,7 @@ public class TPDENYCommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.teleport", true)) {
+        if (!plugin.getConfig().getBoolean("modules.teleport", false)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
@@ -51,6 +51,11 @@ public class TPDENYCommand implements BasicCommand {
 
         if (plugin.getTPAManager() == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA is currently unavailable."));
+            return;
+        }
+
+        if (args.length != 0) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/tpdeny"));
             return;
         }
 

@@ -67,8 +67,16 @@ public class RTPManager {
 
     private void tryNextAttempt(Player player, World world, double centerX, double centerZ,
                                 double halfSize, Location spawnLoc, Location originLoc, int attempt) {
-        int maxAttempts = 20;
+        if (player == null) return;
         UUID uuid = player.getUniqueId();
+        // Stale async chain: the search was cancelled (quit, TPA start,
+        // cancelAll) while this attempt was queued — never continue.
+        if (!searching.contains(uuid)) return;
+        if (!player.isOnline()) {
+            searching.remove(uuid);
+            return;
+        }
+        int maxAttempts = 20;
 
         if (attempt >= maxAttempts) {
             // A failed search must not punish with a cooldown.
@@ -137,6 +145,28 @@ public class RTPManager {
                                     UUID uuid, int finalX, int finalZ, int nextAttempt) {
         if (!player.isOnline()) {
             searching.remove(uuid);
+            return;
+        }
+        // The world was snapshotted at search start; the player may have
+        // changed worlds while attempts were queued. Never teleport across
+        // the stale snapshot — abort with a cooldown refund.
+        try {
+            if (world == null || !player.getWorld().equals(world)) {
+                searching.remove(uuid);
+                cooldowns.remove(uuid);
+                try {
+                    player.getScheduler().run(plugin, (t) -> {
+                        if (player.isOnline()) {
+                            player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
+                        }
+                    }, null);
+                } catch (Exception ignored) {
+                }
+                return;
+            }
+        } catch (Exception e) {
+            searching.remove(uuid);
+            cooldowns.remove(uuid);
             return;
         }
 
@@ -217,13 +247,38 @@ public class RTPManager {
         // Double-warmup guard (RTP side): a pending TPA warmup for the same player
         // must not fire after this RTP teleport. cancelWarmup is a no-op with no
         // message when no TPA warmup exists. Mirror direction (TPA start cancels
-        // RTP) lives in TPAManager, owned elsewhere — see open points.
+        // RTP) lives in TPAManager.
+        // Priority: a running warmup wins. If a TPA warmup is already pending,
+        // the new RTP search aborts (with a cooldown refund) instead of
+        // killing the TPA warmup.
+        try {
+            if (plugin.getTPAManager() != null && plugin.getTPAManager().hasWarmup(player)) {
+                cooldowns.remove(player.getUniqueId());
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: a teleport is already in progress."));
+                return;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check TPA warmup for " + player.getName() + ": " + e.getMessage());
+        }
         try {
             if (plugin.getTPAManager() != null) {
                 plugin.getTPAManager().cancelWarmup(player, "RTP started.");
             }
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to cancel TPA warmup for " + player.getName() + ": " + e.getMessage());
+        }
+
+        // World re-check: the player may have changed worlds during the async
+        // search. Never warm up towards a stale world snapshot.
+        try {
+            if (foundLoc == null || foundLoc.getWorld() == null || !player.getWorld().equals(foundLoc.getWorld())) {
+                cooldowns.remove(player.getUniqueId());
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
+                return;
+            }
+        } catch (Exception e) {
+            cooldowns.remove(player.getUniqueId());
+            return;
         }
 
         long seconds = teleportConfig.getLong("rtp.counter.seconds", 3);
@@ -246,14 +301,64 @@ public class RTPManager {
             executeTeleport(player, foundLoc);
         }, null, seconds * 20L);
 
-        activeWarmups.put(player.getUniqueId(), warmupTask);
+        // Atomic reservation: a concurrent TPA warmup for the same player may
+        // have been registered after the remove() above — putIfAbsent lets the
+        // already-running warmup win instead of overwriting it (TOCTOU with
+        // TPAManager.startTeleportProcedure, which mirrors this). Cooldown is
+        // refunded, same as the TPA-warmup-present abort above.
+        if (activeWarmups.putIfAbsent(player.getUniqueId(), warmupTask) != null) {
+            warmupTask.cancel();
+            cooldowns.remove(player.getUniqueId());
+            player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: a teleport is already in progress."));
+            return;
+        }
     }
 
     private void executeTeleport(Player player, Location loc) {
         if (player == null || !player.isOnline()) return;
-        player.teleportAsync(loc.clone().add(0, 1, 0)).thenAccept(success -> {
-            if (success) {
+        // Runs on the entity thread: re-validate world and safety — the spot
+        // was checked seconds ago at search time and the terrain or the
+        // player's world may have changed during the warmup.
+        Location dest = loc.clone();
+        try {
+            if (dest.getWorld() == null || !player.getWorld().equals(dest.getWorld())) {
+                cooldowns.remove(player.getUniqueId());
+                if (player.isOnline()) {
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
+                }
+                return;
+            }
+        } catch (Exception e) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
+        boolean safe;
+        try {
+            safe = isLocationSafe(dest);
+        } catch (Exception e) {
+            safe = false;
+        }
+        if (!safe) {
+            cooldowns.remove(player.getUniqueId());
+            if (player.isOnline()) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer safe. Try again!"));
+            }
+            return;
+        }
+        UUID uuid = player.getUniqueId();
+        player.teleportAsync(dest.clone().add(0, 1, 0)).thenAccept(success -> {
+            if (Boolean.TRUE.equals(success)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleported to a safe random location!"));
+            } else {
+                // A failed teleport must not consume the cooldown.
+                cooldowns.remove(uuid);
+                if (player.isOnline()) {
+                    try {
+                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to notify RTP teleport failure for " + player.getName() + ": " + e.getMessage());
+                    }
+                }
             }
         });
     }
@@ -284,12 +389,25 @@ public class RTPManager {
         org.bukkit.block.Block b1 = loc.getBlock().getRelative(0, 1, 0);
         org.bukkit.block.Block b2 = loc.getBlock().getRelative(0, 2, 0);
         if (!b1.isPassable() || !b2.isPassable()) return false;
-        Material head1 = b1.getType();
-        Material head2 = b2.getType();
-        if (head1 == Material.LAVA || head1 == Material.WATER || head1 == Material.FIRE
-                || head1 == Material.CACTUS || head1 == Material.MAGMA_BLOCK) return false;
-        if (head2 == Material.LAVA || head2 == Material.WATER || head2 == Material.FIRE
-                || head2 == Material.CACTUS || head2 == Material.MAGMA_BLOCK) return false;
+        // Headroom uses the same configured block blacklist as the ground
+        // check above (plus passability). AIR/CAVE_AIR/VOID_AIR entries in
+        // that list can never match here — headroom blocks at a candidate
+        // spot are real blocks — so they are simply never hit, no special
+        // handling needed.
+        String head1Name = b1.getType().name();
+        String head2Name = b2.getType().name();
+        if (head1Name.contains("LEAVES") || head2Name.contains("LEAVES")) return false;
+        if (blacklistEnabled) {
+            java.util.List<String> blacklist = teleportConfig.getStringList("rtp.blacklist.blocks");
+            if (blacklist.contains(head1Name) || blacklist.contains(head2Name)) return false;
+        } else {
+            Material head1 = b1.getType();
+            Material head2 = b2.getType();
+            if (head1 == Material.LAVA || head1 == Material.WATER || head1 == Material.FIRE
+                    || head1 == Material.CACTUS || head1 == Material.MAGMA_BLOCK) return false;
+            if (head2 == Material.LAVA || head2 == Material.WATER || head2 == Material.FIRE
+                    || head2 == Material.CACTUS || head2 == Material.MAGMA_BLOCK) return false;
+        }
 
         return true;
     }
@@ -336,6 +454,17 @@ public class RTPManager {
         }
     }
 
+    /**
+     * Removes the RTP cooldown unconditionally. Called by
+     * TPAManager.startTeleportProcedure after cancelSearch(): a search
+     * cancelled in favour of a TPA teleport must refund the cooldown, mirroring
+     * the reverse direction (RTP start aborts with a cooldown refund).
+     */
+    public void refundCooldown(UUID uuid) {
+        if (uuid == null) return;
+        cooldowns.remove(uuid);
+    }
+
     public void cancelWarmup(Player player, String reason) {
         if (player == null) return;
         ScheduledTask task = activeWarmups.remove(player.getUniqueId());
@@ -348,10 +477,35 @@ public class RTPManager {
     }
 
     public void cancelAll() {
+        java.util.Set<UUID> hadWarmup = new java.util.HashSet<>(activeWarmups.keySet());
         for (ScheduledTask task : new ArrayList<>(activeWarmups.values())) {
             if (task != null) task.cancel();
         }
+        for (UUID uuid : hadWarmup) {
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && p.isOnline()) {
+                try {
+                    p.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: server reloading."));
+                } catch (Exception ignored) {
+                }
+            }
+        }
         activeWarmups.clear();
+        // A stuck search must not vanish silently: notify every searcher and
+        // refund the cooldown when the search never reached a warmup — same
+        // as TPAManager.cancelAll notifies both sides of pending sessions.
+        for (UUID uuid : new ArrayList<>(searching)) {
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && p.isOnline()) {
+                try {
+                    p.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: server reloading."));
+                } catch (Exception ignored) {
+                }
+            }
+            if (!hadWarmup.contains(uuid)) {
+                cooldowns.remove(uuid);
+            }
+        }
         searching.clear();
     }
 }

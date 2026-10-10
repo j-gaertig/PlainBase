@@ -47,7 +47,7 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
         } catch (IllegalArgumentException e) {
             String detail = e.getMessage() != null ? " (" + esc(e.getMessage()) + ")" : "";
             sender.sendMessage(plugin.getMiniMessage().deserialize(
-                    message("invalid-duration", "<red>Invalid duration. Use e.g. 1d, 2h30m, 7d or permanent.") + detail));
+                    message("invalid-duration", "<red>Invalid duration. Use e.g. 1d, 2h30m, 7d, permanent or forever.") + detail));
             return;
         }
 

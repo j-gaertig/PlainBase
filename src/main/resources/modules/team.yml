@@ -45,6 +45,14 @@ team:
 # requests.yml) and have NO expiry by design — they survive restarts and wait
 # until they are accepted/denied (adding a player directly clears both).
 #
+# NOTE: there is no friendly-fire, collision-rule or damage protection per
+# default — team membership alone never blocks PvP between teammates. Use a
+# dedicated protection plugin if you need that (no such keys are added here
+# on purpose: new protection toggles would be features, not bugfixes).
+#
+# NOTE: team ids are case-insensitive — "Red" and "red" map to the same team.
+# If both are defined, the second is skipped with an error in the console.
+#
 # "color" is a MiniMessage string used for the team's display name wherever
 # PlainBase shows it (chat, /team list|info, PAPI placeholders) — full
 # gradients and <rainbow> are supported there.

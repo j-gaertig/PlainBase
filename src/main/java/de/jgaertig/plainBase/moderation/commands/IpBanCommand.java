@@ -13,6 +13,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.net.InetAddress;
+import java.sql.SQLException;
+import java.util.function.BiConsumer;
 
 /**
  * /banip <ip-or-player> [reason] — bans a raw IP address, or resolves a
@@ -54,10 +56,15 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
         // keeps the callback working instead of NPE-ing.
         BanManager manager = plugin.getBanManager();
 
-        resolveIp(target, ip -> {
+        resolveIp(target, (ip, dbError) -> {
             if (isGone(sender)) return;
             if (manager == null) {
                 sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
+                return;
+            }
+            if (dbError) {
+                sender.sendMessage(render(
+                        message("db-error", "<red>Database error, please try again later.")));
                 return;
             }
             if (ip == null) {
@@ -72,7 +79,8 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
             }
 
             // Self-IP warning: banning your own address locks YOU out on next login.
-            String selfIp = (sender instanceof Player self) ? addressIp(self) : null;
+            // Both sides are canonical (normalizeIp), never raw spellings.
+            String selfIp = (sender instanceof Player self) ? normalizeIp(addressIp(self)) : null;
             if (selfIp != null && ip.equals(selfIp)) {
                 sender.sendMessage(render(
                         message("self-ip-warning", "<yellow>Warning: this is your own IP address — you will lock yourself out.")));
@@ -87,7 +95,9 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
                 boolean protectedOwner = false;
                 boolean anyOnlineOnIp = false;
                 for (Player online : Bukkit.getOnlinePlayers()) {
-                    String onlineIp = addressIp(online);
+                    // Canonical comparison: a raw spelling must never dodge
+                    // (or accidentally match) the stored ban address.
+                    String onlineIp = normalizeIp(addressIp(online));
                     if (onlineIp != null && ip.equals(onlineIp)) {
                         anyOnlineOnIp = true;
                         if (isProtectedTarget(online, sender)) {
@@ -117,8 +127,9 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
                 }
 
                 // Kick any currently-online player connecting from this IP.
+                // Canonical comparison (see above): raw spellings included.
                 for (Player online : Bukkit.getOnlinePlayers()) {
-                    if (ip.equals(addressIp(online))) {
+                    if (ip.equals(normalizeIp(addressIp(online)))) {
                         kickSafely(online, render(
                                 message("ipban-screen", "<red>Your IP address is banned.\n<gray>Reason: %reason%")
                                         .replace("%reason%", esc(reason)).replace("%staff%", esc(staffName))
@@ -141,20 +152,27 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
      * treats it as a player name: tries the online player's current address
      * first, then falls back to the database's last-known IP for that name
      * (async — the DB lookup can block, same pattern as offline name resolution).
+     * <p>
+     * The boolean handed to the callback is true when the DB lookup itself
+     * failed: the caller must then report a database error, never a misleading
+     * "ip-not-found" (a SQLException resolving to null would otherwise claim
+     * the player simply never joined).
      */
-    private void resolveIp(String arg, java.util.function.Consumer<String> callback) {
+    private void resolveIp(String arg, BiConsumer<String, Boolean> callback) {
         if (isIpLike(arg)) {
             // Normalize ("::ffff:1.2.3.4", leading zeros, ...) to canonical
             // form so stored, cached and checked values always compare equal.
-            callback.accept(normalizeIp(arg));
+            callback.accept(normalizeIp(arg), false);
             return;
         }
 
-        Player online = Bukkit.getPlayer(arg);
+        // Exact name first: Bukkit#getPlayer does prefix matching and could
+        // resolve (and ban the IP of) the wrong player on a typo.
+        Player online = onlinePlayerExactFirst(arg);
         if (online != null) {
-            String onlineIp = addressIp(online);
+            String onlineIp = normalizeIp(addressIp(online));
             if (onlineIp != null) {
-                callback.accept(onlineIp);
+                callback.accept(onlineIp, false);
                 return;
             }
             // Online but the address is currently unavailable (e.g. unresolved)
@@ -166,15 +184,27 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
             // Reload race: the manager can be gone by the time this async
             // task runs — resolve to "not found" instead of NPE-ing.
             BanManager manager = plugin.getBanManager();
-            String lastIp = manager == null ? null : manager.findLastIpByName(arg);
+            String lastIp = null;
+            boolean dbError = false;
+            if (manager == null) {
+                lastIp = null;
+            } else {
+                try {
+                    lastIp = manager.findLastIpByNameStrict(arg);
+                } catch (SQLException e) {
+                    plugin.getLogger().warning("Could not look up last IP for " + arg + ": " + e.getMessage());
+                    dbError = true;
+                }
+            }
             // Stored IPs were recorded via getHostAddress() already, but
             // normalize defensively so legacy rows still match. A missing,
             // blank, literal-"unknown" (legacy rows from before the listener
             // skipped null addresses) or otherwise unparseable value resolves
             // to null so the caller takes the ip-not-found path — it must
             // NEVER be passed on as a bannable address.
-            String resolved = isUsableStoredIp(lastIp) ? normalizeIp(lastIp) : null;
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(resolved));
+            String resolved = (!dbError && isUsableStoredIp(lastIp)) ? normalizeIp(lastIp) : null;
+            boolean finalDbError = dbError;
+            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(resolved, finalDbError));
         });
     }
 

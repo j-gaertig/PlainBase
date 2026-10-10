@@ -22,6 +22,7 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -101,6 +102,29 @@ public class TeamManager {
         return lockStripes[(uuid.hashCode() & 0x7fffffff) % lockStripes.length];
     }
 
+    // T2 team-scoped locks: the per-player stripes above cannot protect a
+    // team-level invariant (two parallel kick/leave on DIFFERENT targets would
+    // each hold a different player lock and both pass denyIfLastAdmin, leaving
+    // 0 admins). Every denyIfLastAdmin + mutation pair additionally holds the
+    // stripe for its teamId, so all admin-count checks on one team serialize.
+    // Acquisition order is always player-lock THEN team-lock — never the
+    // reverse — so no deadlock is possible.
+    private final Object[] teamLockStripes = initStripes(64);
+
+    private Object teamLockFor(String teamId) {
+        String key = teamId == null ? "" : teamId.toLowerCase(Locale.ROOT);
+        return teamLockStripes[(key.hashCode() & 0x7fffffff) % teamLockStripes.length];
+    }
+
+    // T3 stale-overwrite guard: each manager instance gets a monotonically
+    // increasing generation at construction. Queued async saves of a PREVIOUS
+    // instance (e.g. after /plainbase reload) snapshot that instance's own
+    // maps and would otherwise overwrite the fresh file — they now skip with
+    // a log line. Never use AsyncScheduler#cancelTasks here: that would also
+    // cancel the NEW instance's tasks (same plugin reference).
+    private static final AtomicLong GENERATION = new AtomicLong(0);
+    private final long generation = GENERATION.incrementAndGet();
+
     // Built-in defaults for message keys added after team.yml v1.1, so servers
     // still running an older team.yml get sensible text instead of the raw key.
     private static final Map<String, String> BUILTIN_DEFAULTS = Map.of(
@@ -167,6 +191,14 @@ public class TeamManager {
         for (String rawId : section.getKeys(false)) {
             try {
                 String id = rawId.toLowerCase(Locale.ROOT);
+                // T6 case-collision guard: two ids that normalize to the same
+                // key (e.g. "Red" + "red") would otherwise silently overwrite
+                // each other — warn loudly and skip the second one.
+                if (fresh.containsKey(id)) {
+                    plugin.getLogger().severe("Team '" + rawId + "' skipped: normalized id '" + id
+                            + "' collides with another team (ids are case-insensitive). Rename one of them in modules/team.yml.");
+                    continue;
+                }
                 // Vanilla scoreboard names are capped at 16 chars ("pb_" + id), so
                 // ids longer than 12 chars could never be mirrored. Skip with a loud
                 // warning instead of silently truncating (truncation could map two
@@ -250,19 +282,27 @@ public class TeamManager {
 
     /**
      * True if the sender is allowed to perform admin actions on this team:
-     * server console, OP, plainbase.team.admin bypass, or an actual stored
-     * ADMIN role in this specific team.
+     * server console, plainbase.admin / plainbase.team.admin bypass, or an
+     * actual stored ADMIN role in this specific team.
+     * <p>
+     * T8 note: the permission nodes plainbase.team.invite/add/kick/setrole/...
+     * intentionally default to TRUE — the permission alone does NOT gate team
+     * admin actions. The real protection lives here in code (isTeamAdmin),
+     * checked via adminGated in TeamCommand. Do NOT "fix" this by flipping
+     * permission defaults to OP (would be breaking for existing servers).
      */
     public boolean isTeamAdmin(CommandSender sender, String teamId) {
         // Permission holders first — applies to every sender type (a command
         // block only passes here if it was explicitly granted the permission).
+        // NOTE: intentionally NO player.isOp() shortcut here — hasPermission()
+        // already returns true for OPs via PermissionDefault.OP, while a bare
+        // isOp() check would defeat an explicit negation (-plainbase.team.admin).
         if (sender.hasPermission("plainbase.admin") || sender.hasPermission("plainbase.team.admin")) return true;
         if (!(sender instanceof Player player)) {
             // Console is always allowed; any other non-player sender (command
             // block, ...) is NOT automatically admin.
             return sender instanceof ConsoleCommandSender;
         }
-        if (player.isOp()) return true;
         if (teamId == null) return false;
         return getRole(player.getUniqueId(), teamId.toLowerCase(Locale.ROOT)) == Role.ADMIN;
     }
@@ -301,6 +341,91 @@ public class TeamManager {
     // Actions (send their own feedback messages, matching TPAManager/VanishManager style)
     // ---------------------------------------------------------------
 
+    /**
+     * V4 oracle guard: invite/add resolve a target by name. Without this, a
+     * staff member without vanish-see could probe for vanished players
+     * ("invited" vs "not found" leaks existence). When the named player is
+     * online, vanished and invisible to the staff viewer, pretend the player
+     * does not exist — using the existing vanishManager, no new API.
+     * Returns true when the caller must abort with "player not found".
+     */
+    private boolean denyVanishedOracle(CommandSender staff, String targetName, FileConfiguration cfgSnapshot) {
+        try {
+            if (!(staff instanceof Player viewer)) return false;
+            var vanishManager = plugin.getVanishManager();
+            if (vanishManager == null) return false;
+            Player maybe = Bukkit.getPlayer(targetName);
+            if (maybe != null && vanishManager.isVanished(maybe) && !vanishManager.canSee(viewer, maybe)) {
+                staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", targetName));
+                return true;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed vanish-oracle check for '" + targetName + "': " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Same oracle check for the already-resolved target (covers the race where
+     * the target vanished between the pre-check and the async callback).
+     */
+    private boolean denyVanishedOracleResolved(CommandSender staff, OfflinePlayer target, String targetName, FileConfiguration cfgSnapshot) {
+        try {
+            if (!(staff instanceof Player viewer)) return false;
+            var vanishManager = plugin.getVanishManager();
+            if (vanishManager == null) return false;
+            if (target instanceof Player targetPlayer
+                    && vanishManager.isVanished(targetPlayer)
+                    && !vanishManager.canSee(viewer, targetPlayer)) {
+                staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", targetName));
+                return true;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed vanish-oracle check for resolved target: " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * T1 ghost-team guard: runtime state may reference a team id that no
+     * longer exists in modules/team.yml (deleted definition). Accepting or
+     * mutating such an id would create ghost memberships. Returns true when
+     * the id is unknown (caller must abort); also purges the stale pending
+     * entry so it cannot linger.
+     */
+    private boolean denyUnknownTeam(Player player, FileConfiguration cfgSnapshot, String id, UUID ownerUuid, boolean isInvitePending) {
+        if (id != null && teamExists(id)) return false;
+        player.sendMessage(msg(cfgSnapshot, "unknown-team", "team", String.valueOf(id)));
+        try {
+            if (ownerUuid != null && id != null) {
+                if (isInvitePending) {
+                    Set<String> set = invites.get(ownerUuid);
+                    if (set != null) {
+                        set.remove(id);
+                        if (set.isEmpty()) invites.remove(ownerUuid);
+                        saveInvites();
+                    }
+                } else {
+                    Set<UUID> set = requests.get(id);
+                    if (set != null) {
+                        set.remove(ownerUuid);
+                        if (set.isEmpty()) requests.remove(id);
+                        saveRequests();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to purge stale pending for unknown team '" + id + "': " + e.getMessage());
+        }
+        return true;
+    }
+
+    private boolean denyUnknownTeamStaff(CommandSender staff, FileConfiguration cfgSnapshot, String id) {
+        if (id != null && teamExists(id)) return false;
+        staff.sendMessage(msg(cfgSnapshot, "unknown-team", "team", String.valueOf(id)));
+        return true;
+    }
+
     public void invite(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
         // Snapshot the config at entry: the callback below may run later on
@@ -308,7 +433,12 @@ public class TeamManager {
         // /plainbase reload could have cleared getTeamConfig() to null.
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         final int maxTeams = maxTeamsOf(cfgSnapshot);
+        // T1: inviting to a deleted team must not create ghost state.
+        if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
+        // V4: never reveal a vanished player's existence via invite probing.
+        if (denyVanishedOracle(staff, targetName, cfgSnapshot)) return;
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
+            if (denyVanishedOracleResolved(staff, target, targetName, cfgSnapshot)) return;
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
                 if (isMember(uuid, id)) {
@@ -344,6 +474,8 @@ public class TeamManager {
             Set<String> pending = invites.getOrDefault(uuid, Set.of());
             String id = resolveSingle(player, cfgSnapshot, pending, teamIdOrNull, "invite-not-found");
             if (id == null) return;
+            // T1: pending invite for a deleted team — purge + unknown-team, never create ghost membership.
+            if (denyUnknownTeam(player, cfgSnapshot, id, uuid, true)) return;
 
             if (getPlayerTeams(uuid).size() >= maxTeams) {
                 player.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", player.getName(), "max", String.valueOf(maxTeams)));
@@ -367,6 +499,8 @@ public class TeamManager {
             Set<String> pending = invites.getOrDefault(uuid, Set.of());
             String id = resolveSingle(player, cfgSnapshot, pending, teamIdOrNull, "invite-not-found");
             if (id == null) return;
+            // T1: same ghost purge as accept.
+            if (denyUnknownTeam(player, cfgSnapshot, id, uuid, true)) return;
 
             invites.computeIfPresent(uuid, (k, set) -> {
                 set.remove(id);
@@ -381,37 +515,42 @@ public class TeamManager {
         String id = teamId.toLowerCase(Locale.ROOT);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         final int maxTeams = maxTeamsOf(cfgSnapshot);
+        if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
+        if (denyVanishedOracle(staff, targetName, cfgSnapshot)) return;
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
+            if (denyVanishedOracleResolved(staff, target, targetName, cfgSnapshot)) return;
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
-                if (isMember(uuid, id)) {
-                    staff.sendMessage(msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
-                    return;
-                }
-                if (getPlayerTeams(uuid).size() >= maxTeams) {
-                    staff.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
-                    return;
-                }
+                synchronized (teamLockFor(id)) {
+                    if (isMember(uuid, id)) {
+                        staff.sendMessage(msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
+                        return;
+                    }
+                    if (getPlayerTeams(uuid).size() >= maxTeams) {
+                        staff.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
+                        return;
+                    }
 
-                // Adding directly also clears any pending invite/request for this team.
-                Set<String> pendingInvites = invites.get(uuid);
-                if (pendingInvites != null) pendingInvites.remove(id);
-                Set<UUID> pendingRequests = requests.get(id);
-                if (pendingRequests != null) pendingRequests.remove(uuid);
-                saveInvites();
-                saveRequests();
+                    // Adding directly also clears any pending invite/request for this team.
+                    Set<String> pendingInvites = invites.get(uuid);
+                    if (pendingInvites != null) pendingInvites.remove(id);
+                    Set<UUID> pendingRequests = requests.get(id);
+                    if (pendingRequests != null) pendingRequests.remove(uuid);
+                    saveInvites();
+                    saveRequests();
 
-                // Founder rule: a team with no admins yet gains one — the first
-                // member added becomes ADMIN so the team stays manageable.
-                Role assigned = countAdmins(id) == 0 ? Role.ADMIN : Role.MEMBER;
-                setMember(uuid, id, assigned);
-                if (assigned == Role.ADMIN) {
-                    plugin.getLogger().info("Team '" + id + "': " + targetName + " added as ADMIN (team had no admins).");
+                    // Founder rule: a team with no admins yet gains one — the first
+                    // member added becomes ADMIN so the team stays manageable.
+                    Role assigned = countAdmins(id) == 0 ? Role.ADMIN : Role.MEMBER;
+                    setMember(uuid, id, assigned);
+                    if (assigned == Role.ADMIN) {
+                        plugin.getLogger().info("Team '" + id + "': " + targetName + " added as ADMIN (team had no admins).");
+                    }
+                    staff.sendMessage(msg(cfgSnapshot, "add-success", "player", targetName, "team", id));
+
+                    Player online = Bukkit.getPlayer(uuid);
+                    if (online != null) online.sendMessage(msg(cfgSnapshot, "add-success", "player", online.getName(), "team", id));
                 }
-                staff.sendMessage(msg(cfgSnapshot, "add-success", "player", targetName, "team", id));
-
-                Player online = Bukkit.getPlayer(uuid);
-                if (online != null) online.sendMessage(msg(cfgSnapshot, "add-success", "player", online.getName(), "team", id));
             }
         });
     }
@@ -419,20 +558,23 @@ public class TeamManager {
     public void kick(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
-                if (!isMember(uuid, id)) {
-                    staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
-                    return;
+                synchronized (teamLockFor(id)) {
+                    if (!isMember(uuid, id)) {
+                        staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
+                        return;
+                    }
+                    if (denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
+
+                    removeMember(uuid, id);
+                    staff.sendMessage(msg(cfgSnapshot, "kick-success", "player", targetName, "team", id));
+
+                    Player online = Bukkit.getPlayer(uuid);
+                    if (online != null) online.sendMessage(msg(cfgSnapshot, "kick-success", "player", online.getName(), "team", id));
                 }
-                if (denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
-
-                removeMember(uuid, id);
-                staff.sendMessage(msg(cfgSnapshot, "kick-success", "player", targetName, "team", id));
-
-                Player online = Bukkit.getPlayer(uuid);
-                if (online != null) online.sendMessage(msg(cfgSnapshot, "kick-success", "player", online.getName(), "team", id));
             }
         });
     }
@@ -445,6 +587,10 @@ public class TeamManager {
             String id;
             if (teamIdOrNull != null) {
                 id = teamIdOrNull.toLowerCase(Locale.ROOT);
+                if (!teamExists(id)) {
+                    player.sendMessage(msg(cfgSnapshot, "unknown-team", "team", teamIdOrNull));
+                    return;
+                }
                 if (!memberOf.contains(id)) {
                     player.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
                     return;
@@ -459,8 +605,11 @@ public class TeamManager {
                 return;
             }
 
-            if (denyIfLastAdmin(player, cfgSnapshot, id, uuid)) return;
-            removeMember(uuid, id);
+            // T2: team-scoped lock around last-admin check + mutation.
+            synchronized (teamLockFor(id)) {
+                if (denyIfLastAdmin(player, cfgSnapshot, id, uuid)) return;
+                removeMember(uuid, id);
+            }
             player.sendMessage(msg(cfgSnapshot, "leave-success", "team", id));
         }
     }
@@ -471,6 +620,11 @@ public class TeamManager {
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         final int maxTeams = maxTeamsOf(cfgSnapshot);
         synchronized (lockFor(uuid)) {
+            // T1: requesting a deleted team must not create ghost requests.
+            if (!teamExists(id)) {
+                player.sendMessage(msg(cfgSnapshot, "unknown-team", "team", teamId));
+                return;
+            }
             if (isMember(uuid, id)) {
                 player.sendMessage(msg(cfgSnapshot, "already-member", "team", id));
                 return;
@@ -500,6 +654,7 @@ public class TeamManager {
     public void denyRequest(CommandSender staff, String teamId, String targetName) {
         String id = teamId.toLowerCase(Locale.ROOT);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
+        if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
@@ -531,23 +686,27 @@ public class TeamManager {
             staff.sendMessage(msg(cfgSnapshot, "invalid-role"));
             return;
         }
+        if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
 
         resolveTarget(staff, targetName, cfgSnapshot, target -> {
             UUID uuid = target.getUniqueId();
             synchronized (lockFor(uuid)) {
-                if (!isMember(uuid, id)) {
-                    staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
-                    return;
-                }
-                // Demoting the last remaining admin would orphan the team.
-                if (role == Role.MEMBER && denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
+                synchronized (teamLockFor(id)) {
+                    if (!isMember(uuid, id)) {
+                        staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
+                        return;
+                    }
+                    // Demoting the last remaining admin would orphan the team.
+                    // T2: guarded by the team lock above (see teamLockFor).
+                    if (role == Role.MEMBER && denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
 
-                setMember(uuid, id, role);
-                staff.sendMessage(msg(cfgSnapshot, "setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
+                    setMember(uuid, id, role);
+                    staff.sendMessage(msg(cfgSnapshot, "setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
 
-                Player online = Bukkit.getPlayer(uuid);
-                if (online != null) {
-                    online.sendMessage(msg(cfgSnapshot, "setrole-success", "player", online.getName(), "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
+                    Player online = Bukkit.getPlayer(uuid);
+                    if (online != null) {
+                        online.sendMessage(msg(cfgSnapshot, "setrole-success", "player", online.getName(), "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
+                    }
                 }
             }
         });
@@ -774,8 +933,10 @@ public class TeamManager {
      * Last-admin guard: refuses to remove/demote the final ADMIN of a team.
      * Must be called BEFORE the mutation. Returns true when the action was
      * denied (caller must return immediately).
-     * Callers must hold synchronized(lockFor(targetUuid)) when invoking this,
-     * so the admin-count check and the following mutation are atomic.
+     * Callers must hold synchronized(lockFor(targetUuid)) AND
+     * synchronized(teamLockFor(teamId)) when invoking this, so the admin-count
+     * check and the following mutation are atomic per team (T2). Player-lock
+     * first, team-lock second — always in this order.
      */
     private boolean denyIfLastAdmin(CommandSender sender, FileConfiguration cfgSnapshot, String teamId, UUID targetUuid) {
         Map<UUID, Role> members = memberships.get(teamId);
@@ -948,6 +1109,26 @@ public class TeamManager {
         return new File(folder, name);
     }
 
+    /**
+     * Fail-closed guard against a corrupt/emptied team.yml: when no team
+     * definitions loaded but persisted state files are non-empty, the
+     * definition filter in loadState() and every save*Sync() must stand down
+     * instead of purging members/invites/requests. Fail closed (keep the
+     * files) rather than purge; fix team.yml and reload to restore.
+     */
+    private boolean hasPersistedTeamState() {
+        return isStateFileNonEmpty("members.yml")
+                || isStateFileNonEmpty("invites.yml")
+                || isStateFileNonEmpty("requests.yml");
+    }
+
+    private boolean isStateFileNonEmpty(String name) {
+        // Deliberately not dataFile(): that helper creates the directory as a
+        // side effect, which a pure existence check must not do.
+        File file = new File(new File(plugin.getDataFolder(), "data/teams"), name);
+        return file.isFile() && file.length() > 0;
+    }
+
     private void loadState() {
         // Serialized against every manager instance's async save*Sync() via the
         // same static per-file locks: a reload must never repopulate the maps
@@ -955,11 +1136,31 @@ public class TeamManager {
         // versa), which could otherwise persist or load a torn mix of old and
         // new state across a /plainbase reload. (Does not drain already-queued
         // async saves of a previous instance — those snapshot that instance's
-        // own maps, so they can only rewrite data that instance already held.)
+        // own maps, so they can only rewrite data that instance already held.
+        // T3 generation guard in save*Sync additionally skips those stale
+        // writes once a newer instance exists.)
+        // T1: every loaded id is filtered against the definitions map —
+        // orphan state for deleted teams is logged and dropped, never
+        // resurrected as ghost memberships/invites/requests.
+        // Fail-closed: with zero definitions but non-empty state files
+        // (corrupt/emptied team.yml) the filter below would drop everything
+        // and the next save would purge the files — stand down instead so the
+        // persisted state survives until team.yml is fixed and reloaded.
+        if (teams.isEmpty() && hasPersistedTeamState()) {
+            plugin.getLogger().severe("No team definitions loaded (modules/team.yml corrupt or empty) but persisted "
+                    + "team state exists — refusing to filter/purge it. Fix team.yml and reload to restore teams.");
+            return;
+        }
         synchronized (MEMBERS_LOCK) {
             memberships.clear();
             FileConfiguration members = YamlConfiguration.loadConfiguration(dataFile("members.yml"));
             for (String teamId : members.getKeys(false)) {
+                String norm = teamId.toLowerCase(Locale.ROOT);
+                if (!teams.containsKey(norm)) {
+                    plugin.getLogger().warning("Team state for unknown team '" + teamId
+                            + "' ignored (no such definition in modules/team.yml); orphan membership dropped.");
+                    continue;
+                }
                 ConfigurationSection section = members.getConfigurationSection(teamId);
                 if (section == null) continue;
                 Map<UUID, Role> map = new ConcurrentHashMap<>();
@@ -969,7 +1170,7 @@ public class TeamManager {
                     } catch (IllegalArgumentException ignored) {
                     }
                 }
-                memberships.put(teamId.toLowerCase(Locale.ROOT), map);
+                if (!map.isEmpty()) memberships.put(norm, map);
             }
         }
 
@@ -981,7 +1182,13 @@ public class TeamManager {
                     UUID uuid = UUID.fromString(uuidStr);
                     Set<String> set = ConcurrentHashMap.newKeySet();
                     for (String team : invitesConfig.getStringList(uuidStr)) {
-                        set.add(team.toLowerCase(Locale.ROOT));
+                        String norm = team.toLowerCase(Locale.ROOT);
+                        if (!teams.containsKey(norm)) {
+                            plugin.getLogger().warning("Pending invite for unknown team '" + team
+                                    + "' ignored (player " + uuidStr + "); orphan dropped.");
+                            continue;
+                        }
+                        set.add(norm);
                     }
                     if (!set.isEmpty()) invites.put(uuid, set);
                 } catch (IllegalArgumentException ignored) {
@@ -993,6 +1200,12 @@ public class TeamManager {
             requests.clear();
             FileConfiguration requestsConfig = YamlConfiguration.loadConfiguration(dataFile("requests.yml"));
             for (String teamId : requestsConfig.getKeys(false)) {
+                String norm = teamId.toLowerCase(Locale.ROOT);
+                if (!teams.containsKey(norm)) {
+                    plugin.getLogger().warning("Pending join requests for unknown team '" + teamId
+                            + "' ignored; orphans dropped.");
+                    continue;
+                }
                 Set<UUID> set = ConcurrentHashMap.newKeySet();
                 for (String uuidStr : requestsConfig.getStringList(teamId)) {
                     try {
@@ -1000,7 +1213,7 @@ public class TeamManager {
                     } catch (IllegalArgumentException ignored) {
                     }
                 }
-                requests.put(teamId.toLowerCase(Locale.ROOT), set);
+                if (!set.isEmpty()) requests.put(norm, set);
             }
         }
     }
@@ -1019,10 +1232,29 @@ public class TeamManager {
     private static final Object REQUESTS_LOCK = new Object();
 
     private void saveMemberships() {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveMembershipsSync());
+        final long captured = generation;
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveMembershipsSync(captured));
     }
 
     private void saveMembershipsSync() {
+        saveMembershipsSync(generation);
+    }
+
+    private void saveMembershipsSync(long captured) {
+        // T3: skip stale writes from a previous manager instance. Warning (not
+        // fine) so a lost write is visible. shutdown()'s synchronous flush is
+        // unaffected and still runs (it uses the current generation).
+        if (captured != GENERATION.get()) {
+            plugin.getLogger().warning("Skipping stale members.yml save from previous TeamManager instance.");
+            return;
+        }
+        // Fail-closed (see loadState): never overwrite persisted state while
+        // no definitions are loaded — that would purge members.yml for good.
+        if (teams.isEmpty() && hasPersistedTeamState()) {
+            plugin.getLogger().severe("Refusing to overwrite members.yml: no team definitions loaded "
+                    + "(modules/team.yml corrupt or empty). State preserved — fix team.yml and reload.");
+            return;
+        }
         synchronized (MEMBERS_LOCK) {
             YamlConfiguration config = new YamlConfiguration();
             for (Map.Entry<String, Map<UUID, Role>> teamEntry : memberships.entrySet()) {
@@ -1035,10 +1267,29 @@ public class TeamManager {
     }
 
     private void saveInvites() {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveInvitesSync());
+        final long captured = generation;
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveInvitesSync(captured));
     }
 
     private void saveInvitesSync() {
+        saveInvitesSync(generation);
+    }
+
+    private void saveInvitesSync(long captured) {
+        // T3: skip stale writes from a previous manager instance. Warning (not
+        // fine) so a lost write is visible. shutdown()'s synchronous flush is
+        // unaffected and still runs (it uses the current generation).
+        if (captured != GENERATION.get()) {
+            plugin.getLogger().warning("Skipping stale invites.yml save from previous TeamManager instance.");
+            return;
+        }
+        // Fail-closed (see loadState): never overwrite persisted state while
+        // no definitions are loaded — that would purge invites.yml for good.
+        if (teams.isEmpty() && hasPersistedTeamState()) {
+            plugin.getLogger().severe("Refusing to overwrite invites.yml: no team definitions loaded "
+                    + "(modules/team.yml corrupt or empty). State preserved — fix team.yml and reload.");
+            return;
+        }
         synchronized (INVITES_LOCK) {
             YamlConfiguration config = new YamlConfiguration();
             for (Map.Entry<UUID, Set<String>> entry : invites.entrySet()) {
@@ -1049,10 +1300,29 @@ public class TeamManager {
     }
 
     private void saveRequests() {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveRequestsSync());
+        final long captured = generation;
+        Bukkit.getAsyncScheduler().runNow(plugin, task -> saveRequestsSync(captured));
     }
 
     private void saveRequestsSync() {
+        saveRequestsSync(generation);
+    }
+
+    private void saveRequestsSync(long captured) {
+        // T3: skip stale writes from a previous manager instance. Warning (not
+        // fine) so a lost write is visible. shutdown()'s synchronous flush is
+        // unaffected and still runs (it uses the current generation).
+        if (captured != GENERATION.get()) {
+            plugin.getLogger().warning("Skipping stale requests.yml save from previous TeamManager instance.");
+            return;
+        }
+        // Fail-closed (see loadState): never overwrite persisted state while
+        // no definitions are loaded — that would purge requests.yml for good.
+        if (teams.isEmpty() && hasPersistedTeamState()) {
+            plugin.getLogger().severe("Refusing to overwrite requests.yml: no team definitions loaded "
+                    + "(modules/team.yml corrupt or empty). State preserved — fix team.yml and reload.");
+            return;
+        }
         synchronized (REQUESTS_LOCK) {
             YamlConfiguration config = new YamlConfiguration();
             for (Map.Entry<String, Set<UUID>> entry : requests.entrySet()) {

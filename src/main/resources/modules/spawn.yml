@@ -1,3 +1,5 @@
+# NOTE: requires modules.spawn=true in config.yml — spawn.enabled/first-spawn.enabled
+# below only take effect while the spawn module itself is enabled.
 spawn:
   enabled: false # opt-in — /setspawn flips this to true for you automatically
   location:

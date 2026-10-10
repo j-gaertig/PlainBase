@@ -5,6 +5,11 @@
 # Every item needs "enabled: true" to actually be given out — the examples
 # below ship disabled so enabling this module doesn't overwrite anything in
 # a player's inventory until you choose which items you actually want.
+#
+# NOTE (duplication): items with "re-give-after-/clear" or
+# "re-give-after-death" should also carry "no-inventory-move" (and "no-drop") —
+# without the movement lock players can stash the original and get a free copy
+# on every re-give. The plugin logs a warning for such items (no logic change).
 
 items:
   spawn-teleporter:

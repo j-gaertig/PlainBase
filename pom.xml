@@ -13,7 +13,7 @@
     <description>Lightweight all-in-one core for Paper servers</description>
 
     <properties>
-        <java.version>25</java.version>
+        <java.version>21</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
@@ -25,8 +25,12 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
                 <configuration>
-                    <source>${java.version}</source>
-                    <target>${java.version}</target>
+                    <!-- release (not source/target): guarantees bytecode and
+                         compile-time API both match Java 21, the baseline
+                         promised by api-version 1.21.6. No Java-25-only APIs
+                         are used, so 21 keeps the widest server
+                         compatibility. Build with JDK 21+ (CI uses JDK 25). -->
+                    <release>${java.version}</release>
                 </configuration>
             </plugin>
             <plugin>

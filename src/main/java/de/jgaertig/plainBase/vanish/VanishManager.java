@@ -62,9 +62,21 @@ public class VanishManager {
         vanishedPlayers.add(player.getUniqueId());
         applySelfState(player);
 
-        // Hide this player from everyone who can't see through vanish
+        // Hide this player from everyone who can't see through vanish.
+        // V1 race fix: hide immediately (same pattern as applyOnJoin) AND keep
+        // the scheduled follow-up — the immediate call closes the 1-tick window,
+        // the scheduled hideFrom covers cross-region viewers that reject a
+        // direct call.
         for (Player viewer : Bukkit.getOnlinePlayers()) {
             if (viewer.equals(player)) continue;
+            try {
+                if (!canSee(viewer, player)) {
+                    viewer.hideEntity(plugin, player);
+                }
+            } catch (Exception e) {
+                // Cross-region viewers may reject a direct hide call —
+                // fall back to the scheduled variant (never breaks vanish).
+            }
             hideFrom(viewer, player);
         }
 
@@ -90,8 +102,21 @@ public class VanishManager {
         vanishedPlayers.remove(player.getUniqueId());
         resetSelfState(player);
 
+        // V1 race fix (mirror of vanish): show immediately AND keep the
+        // scheduled follow-up via showTo.
         for (Player viewer : Bukkit.getOnlinePlayers()) {
             if (viewer.equals(player)) continue;
+            try {
+                viewer.showEntity(plugin, player);
+                try {
+                    viewer.listPlayer(player);
+                } catch (Exception ignored) {
+                    // listPlayer may throw while entity state settles —
+                    // the scheduled showTo retries both.
+                }
+            } catch (Exception e) {
+                // Fall back to the scheduled variant (never breaks unvanish).
+            }
             showTo(viewer, player);
         }
 
@@ -172,8 +197,9 @@ public class VanishManager {
     }
 
     public void loadPlayerData(Player player) {
-        if (plugin.getVanishConfig() == null) return;
-        if (!plugin.getVanishConfig().getBoolean("vanish.persist-on-rejoin", true)) return;
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (vanishConfig == null) return;
+        if (!vanishConfig.getBoolean("vanish.persist-on-rejoin", true)) return;
 
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
             // The sync pre-hide in applyOnJoin() already added the player when
@@ -206,8 +232,9 @@ public class VanishManager {
     }
 
     private void savePlayerData(UUID uuid, boolean vanished) {
-        if (plugin.getVanishConfig() == null) return;
-        boolean persist = plugin.getVanishConfig().getBoolean("vanish.persist-on-rejoin", true);
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (vanishConfig == null) return;
+        boolean persist = vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
 
         Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
             File file = getPlayerDataFile(uuid);
@@ -239,25 +266,23 @@ public class VanishManager {
     }
 
     /**
-     * Quit cleanup: with persist-on-rejoin=false the in-memory entry must not
-     * outlive the session, otherwise vanishedPlayers would grow without bound
-     * (one stale UUID per ever-vanished player). With persist enabled the
-     * entry is intentionally kept so a rejoin stays vanished.
+     * Quit cleanup: the in-memory entry is ALWAYS removed so
+     * vanishedPlayers can never grow without bound (one stale UUID per
+     * ever-vanished player). With persist-on-rejoin=true the file on disk
+     * keeps the state — applyOnJoin() re-vanishes on the next join via
+     * hasPersistedVanish(). No periodic purge (would be a feature).
      */
     public void handleQuit(Player player) {
         if (player == null) return;
-        FileConfiguration cfg = plugin.getVanishConfig();
-        boolean persist = cfg != null && cfg.getBoolean("vanish.persist-on-rejoin", true);
-        if (!persist) {
-            vanishedPlayers.remove(player.getUniqueId());
-        }
+        vanishedPlayers.remove(player.getUniqueId());
     }
 
     public boolean canSee(Player viewer, Player target) {
         try {
             if (viewer.equals(target)) return true;
             if (viewer.hasPermission("plainbase.vanish.see")) return true;
-            if (plugin.getVanishConfig() != null && plugin.getVanishConfig().getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
+            FileConfiguration vanishConfig = plugin.getVanishConfig();
+            if (vanishConfig != null && vanishConfig.getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
             return isVanished(viewer); // Staff who is vanished can see other vanished players
         } catch (Exception e) {
             return false;
@@ -273,7 +298,8 @@ public class VanishManager {
         try {
             if (viewer == null) return false;
             if (viewer.hasPermission("plainbase.vanish.see")) return true;
-            if (plugin.getVanishConfig() != null && plugin.getVanishConfig().getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
+            FileConfiguration vanishConfig = plugin.getVanishConfig();
+            if (vanishConfig != null && vanishConfig.getBoolean("vanish.op-see", true) && viewer.isOp()) return true;
             return isVanished(viewer);
         } catch (Exception e) {
             return false;

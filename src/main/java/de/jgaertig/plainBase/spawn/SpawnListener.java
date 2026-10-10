@@ -26,14 +26,25 @@ public class SpawnListener implements Listener {
             FileConfiguration config = plugin.getSpawnConfig();
             if (config == null) return;
 
+            // Locked reads: writers (SetSpawn/DisableSpawn) mutate under
+            // synchronized(config); join runs on a different thread.
+            final boolean firstSpawnEnabled;
+            final boolean spawnEnabled;
+            synchronized (config) {
+                firstSpawnEnabled = config.getBoolean("first-spawn.enabled", false);
+                spawnEnabled = config.getBoolean("spawn.enabled", false);
+            }
+
+            // NOTE: join only — there is intentionally no respawn hook here
+            // (that would be a new feature, not a bugfix).
             if (!player.hasPlayedBefore()) {
-                if (config.getBoolean("first-spawn.enabled", false)) {
+                if (firstSpawnEnabled) {
                     player.getScheduler().runDelayed(plugin, t -> teleportToConfigLocation(player, "first-spawn.location"), null, 1L);
                     return; // Wenn First-Spawn, dann kein normaler Spawn Teleport nötig
                 }
             }
 
-            if (config.getBoolean("spawn.enabled", false)) {
+            if (spawnEnabled) {
                 player.getScheduler().runDelayed(plugin, t -> teleportToConfigLocation(player, "spawn.location"), null, 1L);
             }
         } catch (Exception e) {
@@ -43,14 +54,41 @@ public class SpawnListener implements Listener {
     }
 
     private void teleportToConfigLocation(Player player, String path) {
+        teleportToConfigLocation(player, path, !"spawn.location".equals(path));
+    }
+
+    /**
+     * @param fallbackToSpawn when the first-spawn location is unusable, fall
+     *                        back to the regular spawn location instead of
+     *                        stranding the player. Never recurses: the spawn
+     *                        path itself passes false.
+     */
+    private void teleportToConfigLocation(Player player, String path, boolean fallbackToSpawn) {
         try {
             if (player == null || !player.isOnline()) return;
             FileConfiguration config = plugin.getSpawnConfig();
             if (config == null) return;
-            String worldName = config.getString(path + ".world");
+            // Consistent snapshot: writers mutate under synchronized(config).
+            final String worldName;
+            final double rawX;
+            final double rawY;
+            final double rawZ;
+            final double rawYaw;
+            final double rawPitch;
+            final boolean spawnEnabled;
+            synchronized (config) {
+                worldName = config.getString(path + ".world");
+                rawX = config.getDouble(path + ".x");
+                rawY = config.getDouble(path + ".y");
+                rawZ = config.getDouble(path + ".z");
+                rawYaw = config.getDouble(path + ".yaw");
+                rawPitch = config.getDouble(path + ".pitch");
+                spawnEnabled = config.getBoolean("spawn.enabled", false);
+            }
             if (worldName == null) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn location is not set correctly. Contact an admin!"));
                 plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": missing world at '" + path + ".world'.");
+                tryFallback(player, fallbackToSpawn && spawnEnabled);
                 return;
             }
 
@@ -67,20 +105,17 @@ public class SpawnListener implements Listener {
                     player.sendMessage(Component.text("Spawn world '" + worldName + "' not found. Contact an admin!"));
                 }
                 plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": world '" + worldName + "' not found (path '" + path + "').");
+                tryFallback(player, fallbackToSpawn && spawnEnabled);
                 return;
             }
 
             Location loc;
-            double rawX = config.getDouble(path + ".x");
-            double rawY = config.getDouble(path + ".y");
-            double rawZ = config.getDouble(path + ".z");
             if (!Double.isFinite(rawX) || !Double.isFinite(rawY) || !Double.isFinite(rawZ)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn location is not set correctly. Contact an admin!"));
                 plugin.getLogger().warning("Spawn teleport failed for " + player.getName() + ": non-finite coordinates at '" + path + "'.");
+                tryFallback(player, fallbackToSpawn && spawnEnabled);
                 return;
             }
-            double rawYaw = config.getDouble(path + ".yaw");
-            double rawPitch = config.getDouble(path + ".pitch");
             float yaw = Double.isFinite(rawYaw) ? (float) rawYaw : 0f;
             float pitch = Double.isFinite(rawPitch) ? (float) rawPitch : 0f;
 
@@ -94,6 +129,27 @@ public class SpawnListener implements Listener {
             }
             player.teleportAsync(loc).thenAccept(success -> {
                 if (!Boolean.TRUE.equals(success) && player.isOnline()) {
+                    // First-spawn failed (e.g. target chunk unavailable): fall
+                    // back to the regular spawn instead of stranding the
+                    // player. Runs on the teleport future thread — re-check
+                    // online state and never throw.
+                    if (fallbackToSpawn) {
+                        try {
+                            FileConfiguration cfg = plugin.getSpawnConfig();
+                            boolean enabled = false;
+                            if (cfg != null) {
+                                synchronized (cfg) {
+                                    enabled = cfg.getBoolean("spawn.enabled", false);
+                                }
+                            }
+                            if (enabled && player.isOnline()) {
+                                player.getScheduler().run(plugin, t -> teleportToConfigLocation(player, "spawn.location", false), null);
+                                return;
+                            }
+                        } catch (Exception ex) {
+                            plugin.getLogger().warning("Spawn fallback failed for " + player.getName() + ": " + ex.getMessage());
+                        }
+                    }
                     try {
                         player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
                     } catch (Exception ex) {
@@ -105,6 +161,19 @@ public class SpawnListener implements Listener {
             // Runs on a delayed scheduler task after join: must never throw.
             plugin.getLogger().warning("Spawn teleport failed for "
                     + (player != null ? player.getName() : "<unknown>") + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Fallback helper: tries the regular spawn location when the first-spawn
+     * location turned out to be unusable. No-op unless explicitly allowed.
+     */
+    private void tryFallback(Player player, boolean allowed) {
+        if (!allowed || player == null || !player.isOnline()) return;
+        try {
+            teleportToConfigLocation(player, "spawn.location", false);
+        } catch (Exception e) {
+            plugin.getLogger().warning("Spawn fallback failed for " + player.getName() + ": " + e.getMessage());
         }
     }
 }

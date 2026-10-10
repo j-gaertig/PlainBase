@@ -76,6 +76,13 @@ public class JoinItemsListener implements Listener {
             // player's inventory with items nobody asked for.
             if (!itemsSection.getBoolean(key + ".enabled", true)) continue;
 
+            // J1 duplication warning (no logic change): an item that is
+            // re-given after /clear or death but is NOT protected with
+            // no-inventory-move (and no-drop) can be duplicated — move the
+            // original into a chest, then trigger the re-give. Warn once per
+            // item key so admins notice the misconfiguration.
+            warnOnUnsafeRegive(itemsSection, key);
+
             if (requiredFlag != null) {
                 List<String> flags = itemsSection.getStringList(key + ".flags");
                 if (!flags.contains(requiredFlag)) continue;
@@ -324,7 +331,10 @@ public class JoinItemsListener implements Listener {
             // Only re-give to self, or to others with explicit admin rights.
             // Without this check, "/clear <other>" from any player would hand
             // free items to that player (/clear farm).
-            if (!target.equals(sender) && !sender.hasPermission("plainbase.admin") && !sender.isOp()) {
+            // NOTE: intentionally NO sender.isOp() shortcut — hasPermission()
+            // already covers OPs via PermissionDefault.OP, while a bare isOp()
+            // would defeat an explicit negation (-plainbase.admin).
+            if (!target.equals(sender) && !sender.hasPermission("plainbase.admin")) {
                 return;
             }
             target.getScheduler().runDelayed(plugin, task -> {
@@ -386,6 +396,35 @@ public class JoinItemsListener implements Listener {
             return Bukkit.getOfflinePlayerIfCached(name);
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    // J1: once-per-key guard so the unsafe re-give warning below does not spam
+    // the console on every join.
+    private final java.util.Set<String> regiveWarnedKeys = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * J1 duplication warning: logs when an item carries a re-give flag without
+     * the matching movement protection. No logic is changed — this is purely
+     * a misconfiguration hint.
+     */
+    private void warnOnUnsafeRegive(ConfigurationSection itemsSection, String key) {
+        try {
+            if (!regiveWarnedKeys.add(key)) return;
+            List<String> flags = itemsSection.getStringList(key + ".flags");
+            boolean hasRegive = flags.contains("re-give-after-/clear") || flags.contains("re-give-after-death");
+            if (!hasRegive) return;
+            boolean hasMoveLock = flags.contains("no-inventory-move");
+            boolean hasDropLock = flags.contains("no-drop");
+            if (!hasMoveLock || !hasDropLock) {
+                plugin.getLogger().warning("Join item '" + key + "' has a re-give flag "
+                        + "(re-give-after-/clear / re-give-after-death) without "
+                        + (!hasMoveLock ? "'no-inventory-move'" + (!hasDropLock ? " and 'no-drop'" : "") : "'no-drop'")
+                        + " — players can duplicate it by moving/dropping the original before the re-give. "
+                        + "Add the missing flag(s) in modules/joinitems.yml unless duplication is intended.");
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed re-give safety check for join item '" + key + "': " + e.getMessage());
         }
     }
 }

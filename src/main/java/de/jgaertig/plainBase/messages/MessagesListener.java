@@ -49,7 +49,11 @@ public class MessagesListener implements Listener {
             event.joinMessage(null);
         } else {
             try {
-                event.joinMessage(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(player, raw)));
+                // B2 MiniMessage-injection guard: the player name is escaped
+                // BEFORE PlaceholderAPI/deserialize (same pattern as
+                // MenuManager#applyPlaceholdersSafe), so a name like "<red>"
+                // can never inject formatting or click events.
+                event.joinMessage(plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, raw)));
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to format join message: " + e.getMessage());
                 event.joinMessage(null);
@@ -62,7 +66,7 @@ public class MessagesListener implements Listener {
 
             for (String line : motdLines) {
                 try {
-                    player.sendMessage(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(player, line)));
+                    player.sendMessage(plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, line)));
                 } catch (Exception e) {
                     plugin.getLogger().warning("Failed to format motd line: " + e.getMessage());
                 }
@@ -96,11 +100,27 @@ public class MessagesListener implements Listener {
             event.quitMessage(null);
         } else {
             try {
-                event.quitMessage(plugin.getMiniMessage().deserialize(plugin.applyPlaceholders(player, raw)));
+                // B2: same escaping as onJoin (see above).
+                event.quitMessage(plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, raw)));
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to format quit message: " + e.getMessage());
                 event.quitMessage(null);
             }
         }
+    }
+
+    /**
+     * B2 MiniMessage-injection guard (pattern from MenuManager:277-283): the
+     * viewer's own name is substituted escaped BEFORE PlaceholderAPI runs, so
+     * a name containing MiniMessage tags can never inject formatting or click
+     * events into join/quit/motd text. The admin-authored template itself
+     * stays raw on purpose (MiniMessage by design).
+     */
+    private String applyPlaceholdersSafe(Player player, String template) {
+        if (template == null) return null;
+        String pre = player != null
+                ? template.replace("%player%", plugin.getMiniMessage().escapeTags(player.getName()))
+                : template;
+        return plugin.applyPlaceholders(player, pre);
     }
 }

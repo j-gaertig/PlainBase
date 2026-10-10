@@ -1,3 +1,5 @@
+# NOTE: requires modules.teleport=true in config.yml — tpa.enabled/rtp.enabled
+# below only take effect while the teleport module itself is enabled.
 tpa:
   enabled: true # only makes the commands available — nobody teleports until a player uses one
   request_timeout: 300 # in seconds

@@ -6,6 +6,7 @@ import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.jetbrains.annotations.NotNull;
@@ -25,17 +26,21 @@ public class TPACommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.teleport", true)) {
+        if (!plugin.getConfig().getBoolean("modules.teleport", false)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
 
-        if (plugin.getTeleportConfig() == null || plugin.getTPAManager() == null) {
+        // Captured once: a /plainbase reload racing this command can null
+        // the manager/config between the guard below and later use.
+        FileConfiguration teleportConfig = plugin.getTeleportConfig();
+        TPAManager tpaManager = plugin.getTPAManager();
+        if (teleportConfig == null || tpaManager == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
             return;
         }
 
-        if (!plugin.getTeleportConfig().getBoolean("tpa.enabled", true)) {
+        if (!teleportConfig.getBoolean("tpa.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA has been disabled."));
             return;
         }
@@ -45,7 +50,7 @@ public class TPACommand implements BasicCommand {
             return;
         }
 
-        if (!plugin.getTeleportConfig().getBoolean("tpa.commands.tpa.enabled", true)) {
+        if (!teleportConfig.getBoolean("tpa.commands.tpa.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }
@@ -77,7 +82,7 @@ public class TPACommand implements BasicCommand {
             return;
         }
 
-        plugin.getTPAManager().sendRequest(player, target, TPAManager.RequestType.TPA);
+        tpaManager.sendRequest(player, target, TPAManager.RequestType.TPA);
 
     }
 
@@ -87,11 +92,26 @@ public class TPACommand implements BasicCommand {
             String prefix = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
             CommandSender sender = stack.getSender();
             if (sender instanceof Player player) {
-                return Bukkit.getOnlinePlayers().stream()
-                        .filter(player::canSee)
-                        .map(Player::getName)
-                        .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
-                        .toList();
+                // Suggest may run off the entity thread (Folia): copy the
+                // player list first and guard canSee per player — on failure
+                // fall back to the unfiltered list instead of breaking.
+                try {
+                    List<Player> online = new java.util.ArrayList<>(Bukkit.getOnlinePlayers());
+                    List<String> out = new java.util.ArrayList<>();
+                    for (Player o : online) {
+                        boolean visible = true;
+                        try {
+                            visible = player.canSee(o);
+                        } catch (Exception ignored) {
+                        }
+                        if (visible && o.getName().toLowerCase(Locale.ROOT).startsWith(prefix)) {
+                            out.add(o.getName());
+                        }
+                    }
+                    return out;
+                } catch (Exception e) {
+                    return List.of();
+                }
             }
             return Bukkit.getOnlinePlayers().stream()
                     .map(Player::getName)

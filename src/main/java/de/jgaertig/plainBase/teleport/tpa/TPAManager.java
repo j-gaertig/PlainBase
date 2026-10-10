@@ -31,6 +31,12 @@ public class TPAManager {
     // cannot accumulate entries.
     private final Set<UUID> tpAutoPlayers = ConcurrentHashMap.newKeySet();
     private final Map<UUID, ScheduledTask> activeWarmups = new ConcurrentHashMap<>();
+    // Warmup anchor tracking: the warmup task is keyed by the teleporting
+    // player (toTeleport), but the destination player (anchor) keeps them in
+    // place. If the anchor quits, the task keyed by toTeleport would survive
+    // as an orphan. Both directions are stored so handleQuit can find and
+    // cancel the other side from either quitter.
+    private final Map<UUID, UUID> warmupPartners = new ConcurrentHashMap<>();
 
     public enum RequestType { TPA, TPAHERE }
 
@@ -90,7 +96,14 @@ public class TPAManager {
             return;
         }
 
-        long seconds = plugin.getTeleportConfig().getLong("tpa.request_timeout", 300);
+        long seconds = 300;
+        FileConfiguration cfg = plugin.getTeleportConfig();
+        if (cfg == null) {
+            activeSessions.remove(targetId, stub);
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
+            return;
+        }
+        seconds = cfg.getLong("tpa.request_timeout", 300);
         if (seconds <= 0) seconds = 30;
         seconds = Math.max(5, Math.min(300, seconds));
         final long timeoutSeconds = seconds;
@@ -143,6 +156,13 @@ public class TPAManager {
 
         Player requester = Bukkit.getPlayer(session.requesterId());
         if (requester != null) {
+            // Re-validate visibility: the requester may have vanished (or the
+            // target may have) between send and accept. Never teleport towards
+            // a player the other side can no longer see.
+            if (isBlockedByVanish(requester, target)) {
+                target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                return true;
+            }
             startTeleportProcedure(requester, target, session.type());
         } else {
             target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
@@ -192,15 +212,74 @@ public class TPAManager {
         savePlayerData(uuid, newStatus);
     }
 
+    /**
+     * Vanish re-check: Bukkit visibility can change between request and
+     * teleport (a side vanishes mid-warmup). A teleport where either side can
+     * no longer see the other — or where either side is vanished per
+     * VanishManager — must not proceed. Uses the generic not-found/left
+     * message so vanish state is never leaked.
+     */
+    private boolean isBlockedByVanish(Player a, Player b) {
+        if (a == null || b == null) return true;
+        try {
+            if (!a.canSee(b) || !b.canSee(a)) return true;
+        } catch (Exception e) {
+            plugin.getLogger().fine("Vanish visibility check failed for " + a.getName() + "/" + b.getName() + ": " + e.getMessage());
+        }
+        try {
+            if (plugin.getVanishManager() != null
+                    && (plugin.getVanishManager().isVanished(a.getUniqueId())
+                    || plugin.getVanishManager().isVanished(b.getUniqueId()))) {
+                return true;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Vanish state check failed for " + a.getName() + "/" + b.getName() + ": " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Whether this player currently has a pending TPA warmup. Used by
+     * RTPManager.proceedToWarmup: a running warmup wins, a new RTP search
+     * aborts instead of killing the TPA warmup.
+     */
+    public boolean hasWarmup(Player p) {
+        return p != null && activeWarmups.containsKey(p.getUniqueId());
+    }
+
     private void expireRequest(UUID targetId) {
         TpaSession session = activeSessions.remove(targetId);
         if (session == null) return;
 
+        // Runs on the async scheduler: only the map removal above may happen
+        // here. Bukkit API calls (sendMessage) must run on entity threads.
+        UUID requesterId = session.requesterId();
         Player target = Bukkit.getPlayer(targetId);
-        Player requester = Bukkit.getPlayer(session.requesterId());
+        Player requester = Bukkit.getPlayer(requesterId);
+        String targetName = target != null ? target.getName() : null;
 
-        if (target != null) target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request expired."));
-        if (requester != null) requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request to " + (target != null ? esc(target.getName()) : "player") + " expired."));
+        if (target != null) {
+            try {
+                target.getScheduler().run(plugin, (t) -> {
+                    if (target.isOnline()) {
+                        target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request expired."));
+                    }
+                }, null);
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to notify TPA expiry for " + targetId + ": " + e.getMessage());
+            }
+        }
+        if (requester != null) {
+            try {
+                requester.getScheduler().run(plugin, (t) -> {
+                    if (requester.isOnline()) {
+                        requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request to " + esc(targetName != null ? targetName : "player") + " expired."));
+                    }
+                }, null);
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to notify TPA expiry for " + requesterId + ": " + e.getMessage());
+            }
+        }
     }
 
     private void clearSession(UUID targetId) {
@@ -211,6 +290,14 @@ public class TPAManager {
     }
 
     private void startTeleportProcedure(Player requester, Player target, RequestType type) {
+        if (requester == null || target == null) return;
+        // Re-validate visibility at procedure start (covers the tpauto
+        // instant-accept path in sendRequest as well as acceptIfPresent).
+        if (isBlockedByVanish(requester, target)) {
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+            target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+            return;
+        }
 
         String msg = "<green>Request accepted! Teleportation starting...";
         requester.sendMessage(plugin.getMiniMessage().deserialize(msg));
@@ -222,51 +309,123 @@ public class TPAManager {
         // Mirror to RTPManager.proceedToWarmup (which cancels the TPA warmup on
         // RTP start): a pending RTP warmup for the same player must not fire
         // after this TPA teleport. cancelWarmup is a no-op with no message
-        // when no RTP warmup exists.
+        // when no RTP warmup exists. A still-searching RTP (no warmup yet) is
+        // cancelled as well so it cannot start a competing warmup afterwards.
         try {
             if (toTeleport != null && plugin.getRTPManager() != null) {
                 plugin.getRTPManager().cancelWarmup(toTeleport, "TPA started.");
+                plugin.getRTPManager().cancelSearch(toTeleport);
+                // Symmetric to the reverse direction (RTP start refunds): a
+                // search cancelled for this TPA teleport must not consume the
+                // RTP cooldown. Null-guarded like the calls above.
+                plugin.getRTPManager().refundCooldown(toTeleport.getUniqueId());
             }
         } catch (Exception e) {
-            plugin.getLogger().fine("Failed to cancel RTP warmup for " + toTeleport.getName() + ": " + e.getMessage());
+            plugin.getLogger().fine("Failed to cancel RTP state for " + toTeleport.getName() + ": " + e.getMessage());
         }
 
-        long seconds = plugin.getTeleportConfig().getLong("tpa.counter.seconds", 3);
+        // Snapshot with null-guard: stopModules() may have cleared
+        // teleport.yml between accept and procedure start — never deref
+        // fresh, abort with a message instead.
+        FileConfiguration teleportConfig = plugin.getTeleportConfig();
+        if (teleportConfig == null) {
+            requester.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
+            target.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
+            return;
+        }
+
+        long seconds = teleportConfig.getLong("tpa.counter.seconds", 3);
         // Clamp like tpa.request_timeout above: negative/huge values must never
         // leak into the scheduler delay or the displayed countdown.
         seconds = Math.max(0, Math.min(30, seconds));
 
-        if (!plugin.getTeleportConfig().getBoolean("tpa.counter.enabled", true) || seconds <= 0) {
+        if (!teleportConfig.getBoolean("tpa.counter.enabled", true) || seconds <= 0) {
             performTeleport(toTeleport, destination);
             return;
         }
 
         ScheduledTask old = activeWarmups.remove(toTeleport.getUniqueId());
         if (old != null) old.cancel();
+        // Drop any stale anchor mapping for a replaced warmup.
+        removeWarmupPartner(toTeleport.getUniqueId());
 
         toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleporting in <yellow>" + seconds + " <gray>seconds. Do not move!"));
 
+        UUID toTeleportId = toTeleport.getUniqueId();
+        UUID destinationId = destination.getUniqueId();
+        warmupPartners.put(toTeleportId, destinationId);
+        warmupPartners.put(destinationId, toTeleportId);
+
         ScheduledTask warmupTask = toTeleport.getScheduler().runDelayed(plugin, (task) -> {
-            activeWarmups.remove(toTeleport.getUniqueId());
+            activeWarmups.remove(toTeleportId);
+            removeWarmupPartner(toTeleportId);
             performTeleport(toTeleport, destination);
         }, null, seconds * 20L);
 
-        activeWarmups.put(toTeleport.getUniqueId(), warmupTask);
+        // Atomic reservation: a concurrent RTP warmup for the same player may
+        // have been registered after the remove() above — putIfAbsent lets the
+        // already-running warmup win instead of overwriting it (TOCTOU with
+        // RTPManager.proceedToWarmup, which mirrors this).
+        if (activeWarmups.putIfAbsent(toTeleportId, warmupTask) != null) {
+            warmupTask.cancel();
+            removeWarmupPartner(toTeleportId);
+            toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: a teleport is already in progress."));
+            return;
+        }
+    }
+
+    /**
+     * Removes both directions of a warmup anchor mapping for the given player.
+     */
+    private void removeWarmupPartner(UUID uuid) {
+        if (uuid == null) return;
+        UUID partner = warmupPartners.remove(uuid);
+        if (partner != null) {
+            warmupPartners.remove(partner, uuid);
+        }
     }
 
     private void performTeleport(Player toTeleport, Player destination) {
         if (toTeleport == null || destination == null) return;
         if (!toTeleport.isOnline() || !destination.isOnline()) return;
+        // Last-moment vanish check before hopping threads: either side may
+        // have vanished during the warmup.
+        if (isBlockedByVanish(toTeleport, destination)) {
+            if (toTeleport.isOnline()) {
+                toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+            }
+            return;
+        }
 
         destination.getScheduler().run(plugin, t -> {
             if (!destination.isOnline() || !toTeleport.isOnline()) return;
+            // Second hop, same re-check: vanish state may have changed between
+            // the two scheduler hops.
+            if (isBlockedByVanish(toTeleport, destination)) {
+                if (toTeleport.isOnline()) {
+                    toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                }
+                return;
+            }
             Location destLoc = destination.getLocation().clone();
             if (destLoc.getWorld() == null) return;
             toTeleport.getScheduler().run(plugin, t2 -> {
                 if (!toTeleport.isOnline() || !destination.isOnline()) return;
+                if (isBlockedByVanish(toTeleport, destination)) {
+                    if (toTeleport.isOnline()) {
+                        toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                    }
+                    return;
+                }
                 toTeleport.teleportAsync(destLoc).thenAccept(success -> {
-                    if (success) {
+                    if (Boolean.TRUE.equals(success)) {
                         toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleport successful!"));
+                    } else if (toTeleport.isOnline()) {
+                        try {
+                            toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
+                        } catch (Exception e) {
+                            plugin.getLogger().fine("Failed to notify TPA teleport failure for " + toTeleport.getName() + ": " + e.getMessage());
+                        }
                     }
                 });
             }, null);
@@ -276,6 +435,7 @@ public class TPAManager {
     public void cancelWarmup(Player p, String reason) {
         if (p == null) return;
         ScheduledTask task = activeWarmups.remove(p.getUniqueId());
+        removeWarmupPartner(p.getUniqueId());
         if (task != null) {
             task.cancel();
             if (p.isOnline()) {
@@ -295,6 +455,7 @@ public class TPAManager {
             }
         }
         activeWarmups.clear();
+        warmupPartners.clear();
         for (Map.Entry<UUID, TpaSession> entry : new ArrayList<>(activeSessions.entrySet())) {
             TpaSession session = entry.getValue();
             if (session != null && session.timeoutTask() != null) session.timeoutTask().cancel();
@@ -318,6 +479,25 @@ public class TPAManager {
 
         ScheduledTask warmup = activeWarmups.remove(quitterId);
         if (warmup != null) warmup.cancel();
+
+        // The quitter may be the anchor (destination) of someone else's
+        // warmup, which is keyed by the teleporting player. Without this the
+        // warmup would survive as an orphan and fire against an offline
+        // anchor. Snapshot the partner first, then drop the mapping and
+        // cancel the other side.
+        UUID partnerId = warmupPartners.get(quitterId);
+        removeWarmupPartner(quitterId);
+        if (partnerId != null && !partnerId.equals(quitterId)) {
+            ScheduledTask partnerWarmup = activeWarmups.remove(partnerId);
+            if (partnerWarmup != null) {
+                partnerWarmup.cancel();
+                removeWarmupPartner(partnerId);
+                Player partner = Bukkit.getPlayer(partnerId);
+                if (partner != null && partner.isOnline()) {
+                    partner.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport request cancelled: player left the server."));
+                }
+            }
+        }
 
         TpaSession asTarget = activeSessions.remove(quitterId);
         if (asTarget != null) {

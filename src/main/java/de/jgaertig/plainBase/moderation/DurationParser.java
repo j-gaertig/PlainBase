@@ -70,7 +70,9 @@ public final class DurationParser {
 
     /**
      * Formats millis into a short human-readable duration, e.g. "1d 2h 3m".
-     * Returns "permanent" for -1, "expired" for 0.
+     * Returns "permanent" for -1, "expired" for 0. Absurdly far-future
+     * durations (e.g. a saturated Long.MAX_VALUE expiry from a huge tempban)
+     * are capped at "> 100y" instead of rendering thousands of days.
      */
     public static String format(long millis) {
         if (millis < 0) return "permanent";
@@ -78,6 +80,7 @@ public final class DurationParser {
 
         long seconds = millis / 1000;
         long days = seconds / 86400;
+        if (days > 36500L) return "> 100y";
         seconds %= 86400;
         long hours = seconds / 3600;
         seconds %= 3600;

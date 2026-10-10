@@ -4,6 +4,7 @@ import de.jgaertig.plainBase.PlainBase;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.jetbrains.annotations.NotNull;
 
 public class DisableFirstSpawn implements BasicCommand {
@@ -18,7 +19,7 @@ public class DisableFirstSpawn implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.spawn", true)) {
+        if (!plugin.getConfig().getBoolean("modules.spawn", false)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
@@ -33,12 +34,31 @@ public class DisableFirstSpawn implements BasicCommand {
             return;
         }
 
-        if (!plugin.getSpawnConfig().getBoolean("commands.disablefirstspawn.enabled", true)) {
+        // Snapshot + locked read: writers mutate under synchronized(config).
+        FileConfiguration disableConfig = plugin.getSpawnConfig();
+        if (disableConfig == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+            return;
+        }
+        boolean commandEnabled;
+        synchronized (disableConfig) {
+            commandEnabled = disableConfig.getBoolean("commands.disablefirstspawn.enabled", true);
+        }
+        if (!commandEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }
 
+        if (args.length != 0) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Usage: <gray>/disablefirstspawn"));
+            return;
+        }
+
         var config = plugin.getSpawnConfig();
+        if (config == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+            return;
+        }
         synchronized (config) {
             config.set("first-spawn.enabled", false);
         }

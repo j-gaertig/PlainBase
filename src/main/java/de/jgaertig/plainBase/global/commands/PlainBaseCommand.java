@@ -42,7 +42,6 @@ public class PlainBaseCommand implements BasicCommand {
 
         if (args.length >= 2 && args[0].equalsIgnoreCase("toggle")) {
             String moduleName = args[1];
-            String path = "modules." + moduleName;
             String safeModule = plugin.getMiniMessage().escapeTags(moduleName);
 
             if (moduleName.isEmpty()) {
@@ -56,10 +55,29 @@ public class PlainBaseCommand implements BasicCommand {
                 Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                     if (!plugin.isEnabled()) return;
                     try {
-                        if (!plugin.getConfig().contains(path)) {
+                        // G3 whitelist: only exact top-level keys under "modules"
+                        // may be toggled. The old contains("modules."+name) check
+                        // also accepted nested paths (e.g. "spawn.enabled" or
+                        // "team.commands.invite.enabled"), letting a typo write a
+                        // stray key. Reject anything with a dot and anything not
+                        // in the live key set.
+                        org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
+                        ConfigurationSection modules;
+                        synchronized (rootCfg) {
+                            modules = rootCfg.getConfigurationSection("modules");
+                        }
+                        boolean known = false;
+                        if (modules != null && !moduleName.contains(".") && !moduleName.contains(" ")) {
+                            try {
+                                known = modules.getKeys(false).contains(moduleName);
+                            } catch (Exception ignored) {
+                            }
+                        }
+                        if (!known) {
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
                             return;
                         }
+                        String path = "modules." + moduleName;
                         boolean newStatus = !plugin.getConfig().getBoolean(path);
                         plugin.getConfig().set(path, newStatus);
                         plugin.saveConfig();
@@ -174,13 +192,17 @@ public class PlainBaseCommand implements BasicCommand {
 
         if (args.length == 2 && args[0].equalsIgnoreCase("toggle")) {
             // Suggestions may run off-thread while a reload swaps the config:
-            // copy the keys under lock, filter outside of it.
+            // snapshot the reference once and read from it without locking —
+            // locking the FileConfiguration instance is pointless because a
+            // reload swaps in a new object (the monitor would change).
             List<String> keys;
-            org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
-            synchronized (cfg) {
-                ConfigurationSection modules = cfg.getConfigurationSection("modules");
-                keys = (modules == null) ? List.of() : List.copyOf(modules.getKeys(false));
+            ConfigurationSection modules = null;
+            try {
+                org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
+                if (cfg != null) modules = cfg.getConfigurationSection("modules");
+            } catch (Exception ignored) {
             }
+            keys = (modules == null) ? List.of() : List.copyOf(modules.getKeys(false));
             String input = args[1].toLowerCase(Locale.ROOT);
             return keys.stream()
                     .filter(s -> s.startsWith(input))

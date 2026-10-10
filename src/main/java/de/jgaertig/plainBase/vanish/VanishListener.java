@@ -57,11 +57,12 @@ public class VanishListener implements Listener {
         Player player = event.getPlayer();
 
         try {
+            FileConfiguration vanishConfig = plugin.getVanishConfig();
             if (plugin.getVanishManager() != null
                     && (plugin.getVanishManager().isVanished(player)
                         || plugin.getVanishManager().hasPersistedVanish(player.getUniqueId()))
-                    && plugin.getVanishConfig() != null
-                    && plugin.getVanishConfig().getBoolean("vanish.hide-join-quit-messages", true)) {
+                    && vanishConfig != null
+                    && vanishConfig.getBoolean("vanish.hide-join-quit-messages", true)) {
                 event.quitMessage(null);
             }
         } catch (Exception e) {
@@ -121,8 +122,9 @@ public class VanishListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onProjectileHit(ProjectileHitEvent event) {
-        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
-        if (!plugin.getVanishConfig().getBoolean("vanish.projectiles-pass-through", true)) return;
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (plugin.getVanishManager() == null || vanishConfig == null) return;
+        if (!vanishConfig.getBoolean("vanish.projectiles-pass-through", true)) return;
         if (!(event.getHitEntity() instanceof Player player)) return;
 
         if (plugin.getVanishManager().isVanished(player)) {
@@ -137,8 +139,9 @@ public class VanishListener implements Listener {
         // so projectiles really pass through vanished players. (Deliberately
         // mirrors the PROJECTILE branch in onDamage: arrows without a shooter
         // only fire EntityDamageEvent, shots with a shooter fire this event.)
-        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
-        if (!plugin.getVanishConfig().getBoolean("vanish.projectiles-pass-through", true)) return;
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (plugin.getVanishManager() == null || vanishConfig == null) return;
+        if (!vanishConfig.getBoolean("vanish.projectiles-pass-through", true)) return;
         if (!(event.getEntity() instanceof Player player)) return;
         if (!(event.getDamager() instanceof Projectile)) return;
         if (event.getCause() != EntityDamageEvent.DamageCause.PROJECTILE) return;
@@ -150,8 +153,9 @@ public class VanishListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onTarget(EntityTargetLivingEntityEvent event) {
-        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
-        if (!plugin.getVanishConfig().getBoolean("vanish.mobs-ignore", true)) return;
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (plugin.getVanishManager() == null || vanishConfig == null) return;
+        if (!vanishConfig.getBoolean("vanish.mobs-ignore", true)) return;
         if (!(event.getTarget() instanceof Player player)) return;
 
         if (plugin.getVanishManager().isVanished(player)) {
@@ -161,23 +165,64 @@ public class VanishListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onDamage(EntityDamageEvent event) {
-        if (plugin.getVanishManager() == null || plugin.getVanishConfig() == null) return;
+        FileConfiguration vanishConfig = plugin.getVanishConfig();
+        if (plugin.getVanishManager() == null || vanishConfig == null) return;
         if (!(event.getEntity() instanceof Player player)) return;
+
+        // V5 outgoing-damage guard (MINIMAL, no new config key, no auto-reveal):
+        // a vanished attacker must never deal invisible PvP damage. Same
+        // cancel-only logic as the victim protection below — just cancelled.
+        try {
+            if (event instanceof EntityDamageByEntityEvent byEntity) {
+                Player attacker = resolveCausalPlayer(byEntity.getDamager());
+                if (attacker == null) {
+                    try {
+                        if (event.getDamageSource() != null
+                                && event.getDamageSource().getCausingEntity() instanceof Player causing) {
+                            attacker = causing;
+                        }
+                    } catch (NoSuchMethodError | Exception ignored) {
+                        // Older API without DamageSource#getCausingEntity.
+                    }
+                }
+                if (attacker != null && plugin.getVanishManager().isVanished(attacker)) {
+                    event.setCancelled(true);
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check vanish attacker state: " + e.getMessage());
+        }
 
         // projectiles-pass-through: damage from arrows/eggs/etc. is dealt via
         // EntityDamageEvent with DamageCause.PROJECTILE (no EntityDamageByEntityEvent
         // is fired for arrows without a shooter), so cancel it here as well.
         if (event.getCause() == EntityDamageEvent.DamageCause.PROJECTILE
-                && plugin.getVanishConfig().getBoolean("vanish.projectiles-pass-through", true)
+                && vanishConfig.getBoolean("vanish.projectiles-pass-through", true)
                 && plugin.getVanishManager().isVanished(player)) {
             event.setCancelled(true);
             return;
         }
 
-        if (!plugin.getVanishConfig().getBoolean("vanish.invincible", false)) return;
+        if (!vanishConfig.getBoolean("vanish.invincible", false)) return;
 
         if (plugin.getVanishManager().isVanished(player)) {
             event.setCancelled(true);
         }
+    }
+
+    /**
+     * Resolves the causal player behind a damager: direct melee attacker or
+     * the shooter of a projectile. Returns null for non-player causes.
+     */
+    private static Player resolveCausalPlayer(org.bukkit.entity.Entity damager) {
+        if (damager instanceof Player p) return p;
+        if (damager instanceof Projectile projectile) {
+            try {
+                if (projectile.getShooter() instanceof Player shooter) return shooter;
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
     }
 }

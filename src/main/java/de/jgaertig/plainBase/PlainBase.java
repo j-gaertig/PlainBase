@@ -54,7 +54,10 @@ public final class PlainBase extends JavaPlugin {
     // ConcurrentModificationExceptions during iteration (GlobalListener,
     // checkAllConfigVersions).
     private final Map<String, FileConfiguration> configs = new ConcurrentHashMap<>();
-    private final Map<String, Double> latestVersions = new HashMap<>();
+    // ConcurrentHashMap: read off-thread (checkAllConfigVersions on the region
+    // thread, GlobalListener admin-join warnings) while onEnable() writes.
+    // A plain HashMap would risk visibility issues across threads.
+    private final Map<String, Double> latestVersions = new ConcurrentHashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     // Volatile: read off-thread (VanishManager/TeamManager scheduler hops,
     // PlaceholderAPI expansion, Brigadier suggestions) while reloadModules()
@@ -180,10 +183,14 @@ public final class PlainBase extends JavaPlugin {
     }
 
     /**
-     * Every permission node registered in {@link #setupPermissions()}.
-     * Used by {@link #removePermissions()} so a server /reload or plugin
-     * re-enable never leaks stale permission registrations into the next
-     * lifecycle (Bukkit keeps permissions after onDisable unless removed).
+     * Inventory of every permission node registered in
+     * {@link #setupPermissions()} — reference documentation only. Deliberately
+     * NOT used by {@link #removePermissions()}: that method must remove
+     * strictly the nodes this instance created (tracked in
+     * {@link #ownedPermissions}) so a server /reload or plugin re-enable
+     * never leaks stale registrations (Bukkit keeps permissions after
+     * onDisable unless removed) without ever deleting a foreign same-named
+     * node. Kept so the full node list stays greppable in one place.
      */
     private static final List<String> ALL_PERMISSIONS = List.of(
             "plainbase.admin",
@@ -480,14 +487,19 @@ public final class PlainBase extends JavaPlugin {
         stopModules();
         reloadConfig();
 
-        if (getConfig().getBoolean("modules.spawn", true)) setupSpawn();
-        if (getConfig().getBoolean("modules.joinitems", true)) setupJoinItems();
-        if (getConfig().getBoolean("modules.messages", true)) setupMessages();
-        if (getConfig().getBoolean("modules.teleport", true)) setupTeleport();
-        if (getConfig().getBoolean("modules.vanish", true)) setupVanish();
-        if (getConfig().getBoolean("modules.menu", true)) setupMenu();
-        if (getConfig().getBoolean("modules.moderation", true)) setupModeration();
-        if (getConfig().getBoolean("modules.team", true)) setupTeam();
+        // Each module is guarded so one broken module (corrupt config, dead
+        // database, ...) disables only itself instead of killing every module
+        // listed after it. ensureGlobalListener() and the version check below
+        // always run afterwards. Defaults are false to match the shipped
+        // config.yml (all modules off unless explicitly enabled).
+        if (isModuleEnabled("spawn")) runModuleSetup("spawn", this::setupSpawn);
+        if (isModuleEnabled("joinitems")) runModuleSetup("joinitems", this::setupJoinItems);
+        if (isModuleEnabled("messages")) runModuleSetup("messages", this::setupMessages);
+        if (isModuleEnabled("teleport")) runModuleSetup("teleport", this::setupTeleport);
+        if (isModuleEnabled("vanish")) runModuleSetup("vanish", this::setupVanish);
+        if (isModuleEnabled("menu")) runModuleSetup("menu", this::setupMenu);
+        if (isModuleEnabled("moderation")) runModuleSetup("moderation", this::setupModeration);
+        if (isModuleEnabled("team")) runModuleSetup("team", this::setupTeam);
 
         ensureGlobalListener();
 
@@ -496,6 +508,32 @@ public final class PlainBase extends JavaPlugin {
         // the server was never restarted. (onEnable() reaches this via
         // reloadModules(), so no separate call there.)
         checkAllConfigVersions();
+    }
+
+    /**
+     * Module flag with a missing-key warning: getBoolean(key, false) silently
+     * assumes disabled when the key is absent (e.g. outdated config.yml after
+     * an update), which hides misconfiguration. Logging only, no migration.
+     */
+    private boolean isModuleEnabled(String moduleName) {
+        if (!getConfig().contains("modules." + moduleName)) {
+            getLogger().warning("Missing config key 'modules." + moduleName
+                    + "' in config.yml, assuming disabled. Add it or regenerate config.yml.");
+            return false;
+        }
+        return getConfig().getBoolean("modules." + moduleName, false);
+    }
+
+    /**
+     * Runs one module setup in isolation: a throwing module is logged and
+     * skipped, later modules still start. Never throws.
+     */
+    private void runModuleSetup(String moduleName, Runnable setup) {
+        try {
+            setup.run();
+        } catch (Exception e) {
+            getLogger().severe("Failed to enable the " + moduleName + " module: " + e.getMessage());
+        }
     }
 
     /**
@@ -513,6 +551,12 @@ public final class PlainBase extends JavaPlugin {
     public void stopModules() {
         // Synchronously flush pending async config writes first: async tasks
         // may be cancelled on disable/reload and their changes would be lost.
+        // Only spawn.yml and menu.yml are flushed here by design — everything
+        // else stays async and may be dropped on a hard kill: vanish
+        // per-player files (VanishManager), tpauto flags
+        // (data/playerdata/<uuid>.yml via TPAManager) and the moderation
+        // cache/database (BanManager.shutdown() closes the pool; unwritten
+        // cache entries are lost).
         try {
             saveSpawnConfig();
         } catch (Exception e) {
@@ -527,7 +571,7 @@ public final class PlainBase extends JavaPlugin {
         // Cache the vanish config BEFORE configs.clear() below: after clearing,
         // getVanishConfig() returns null and the persist check would NPE.
         FileConfiguration vanishConfig = getVanishConfig();
-        boolean vanishEnabled = getConfig().getBoolean("modules.vanish", true);
+        boolean vanishEnabled = getConfig().getBoolean("modules.vanish", false);
         boolean persist = vanishConfig != null && vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
 
         if (broadcastManager != null) {
@@ -584,6 +628,15 @@ public final class PlainBase extends JavaPlugin {
         }
         rtpManager = null;
 
+        // Scheduler-task note (no new API introduced): Folia cancels plugin
+        // tasks automatically only on plugin disable — never on
+        // reloadModules()/module toggle. Every manager with repeating or
+        // long-lived tasks is therefore cancelled explicitly above
+        // (stopBroadcasts, cancelAll x2, BanManager/TeamManager shutdown(),
+        // open menus closed). What remains are bounded one-shot delayed/async
+        // command callbacks (spawn teleports, join-item gives, async
+        // moderation lookups), which expire on their own short timeout
+        // instead of needing a central registry.
         // Vanish config is cached locally above, so unregistering first is safe.
         org.bukkit.event.HandlerList.unregisterAll(this);
         // ConcurrentHashMap: clear() is safe against concurrent off-thread
@@ -603,15 +656,26 @@ public final class PlainBase extends JavaPlugin {
             if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
                 getLogger().warning("Could not create directory: " + parent);
             }
-            saveResource("modules/" + fileName, false);
+            // saveResource() throws IllegalArgumentException (not IOException)
+            // when the default resource is missing from the jar — a broken
+            // build must disable only this module, not kill the whole reload.
+            try {
+                saveResource("modules/" + fileName, false);
+            } catch (IllegalArgumentException e) {
+                getLogger().severe("Missing default resource for " + fileName + "! The module stays disabled: " + e.getMessage());
+                return null;
+            }
         }
 
+        // YamlConfiguration.loadConfiguration() reports malformed YAML via
+        // unchecked exceptions — catch broadly so one corrupt module config
+        // disables only its own module (callers already handle null).
         try (InputStreamReader reader = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
             FileConfiguration config = YamlConfiguration.loadConfiguration(reader);
             configs.put(fileName, config);
             return config;
-        } catch (IOException e) {
-            getLogger().severe("Could not load " + fileName + "!");
+        } catch (Exception e) {
+            getLogger().warning("Could not load " + fileName + ": " + e.getMessage());
             return null;
         }
     }
@@ -641,23 +705,70 @@ public final class PlainBase extends JavaPlugin {
     }
 
     private void checkAllConfigVersions() {
-        Double configLatest = latestVersions.get("config.yml");
+        String configLatest = versionToString(latestVersions.get("config.yml"));
         if (configLatest != null) {
-            checkVersion("config.yml", getConfig().getDouble("version", 0.0), configLatest);
+            checkVersion("config.yml", readVersionString(getConfig()), configLatest);
         }
 
         // Snapshot copy: a concurrent stopModules() -> clear() on another
         // thread must never break this traversal.
         new HashMap<>(configs).forEach((name, config) -> {
-            Double latest = latestVersions.get(name);
+            String latest = versionToString(latestVersions.get(name));
             if (latest != null && config != null) {
-                checkVersion("modules/" + name, config.getDouble("version", 0.0), latest);
+                checkVersion("modules/" + name, readVersionString(config), latest);
             }
         });
     }
 
-    private void checkVersion(String fileName, double currentV, double latestV) {
-        if (currentV < latestV) {
+    /**
+     * Compares dotted version strings segment by segment ("1.10" &gt; "1.9"):
+     * a double comparison would wrongly treat 1.10 as equal to 1.1.
+     * Non-numeric segments count as 0, missing segments count as 0.
+     * Returns negative if a &lt; b, zero if equal, positive if a &gt; b.
+     */
+    private static int compareVersions(String a, String b) {
+        String[] pa = a.split("\\.", -1);
+        String[] pb = b.split("\\.", -1);
+        int len = Math.max(pa.length, pb.length);
+        for (int i = 0; i < len; i++) {
+            int na = parseVersionSegment(i < pa.length ? pa[i] : "0");
+            int nb = parseVersionSegment(i < pb.length ? pb[i] : "0");
+            if (na != nb) return Integer.compare(na, nb);
+        }
+        return 0;
+    }
+
+    private static int parseVersionSegment(String segment) {
+        try {
+            return Integer.parseInt(segment.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Normalizes a stored latest version for comparison. Null (unknown file)
+     * stays null so the caller skips the check.
+     */
+    private static String versionToString(Double version) {
+        return version == null ? null : version.toString();
+    }
+
+    /**
+     * Reads the "version" value of a config as a string, tolerating both
+     * numeric (unquoted YAML, e.g. {@code version: 1.7}) and quoted string
+     * forms (e.g. {@code version: "1.10"} — required to distinguish 1.10
+     * from 1.1, which YAML would otherwise parse to the same double).
+     */
+    private static String readVersionString(FileConfiguration config) {
+        Object value = config.get("version");
+        if (value == null) return "0";
+        String text = value.toString().trim();
+        return text.isEmpty() ? "0" : text;
+    }
+
+    private void checkVersion(String fileName, String currentV, String latestV) {
+        if (compareVersions(currentV, latestV) < 0) {
             getLogger().warning("!!! OUTDATED CONFIG: " + fileName + " !!!");
             getLogger().warning("Your version: " + currentV + " | Required: " + latestV);
             getLogger().warning("Please check GitHub for the latest version and update your file.");
@@ -959,10 +1070,13 @@ public final class PlainBase extends JavaPlugin {
         try {
             Bukkit.getAsyncScheduler().runNow(this, task -> write.run());
         } catch (Exception e) {
-            try {
-                write.run();
-            } catch (Exception ignored) {
-            }
+            // The scheduler rejected the task (plugin disabling / server
+            // shutdown): never fall back to synchronous disk I/O here — this
+            // runs on a Folia region thread and blocking it stalls the tick.
+            // The in-memory config is still flushed synchronously by
+            // stopModules(), so warning is enough. Never throws.
+            getLogger().warning("Could not schedule async save of " + fileName
+                    + ", changes will be flushed on shutdown: " + e.getMessage());
         }
     }
 

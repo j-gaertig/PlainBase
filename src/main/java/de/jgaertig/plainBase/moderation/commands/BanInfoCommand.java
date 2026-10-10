@@ -66,7 +66,10 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
             Optional<BanRecord> active = manager.getActiveBan(offlinePlayer.getUniqueId());
             if (active.isPresent()) {
                 long remaining = active.get().remainingMillis(System.currentTimeMillis());
-                String durationText = active.get().isPermanent() ? "permanent" : DurationParser.format(remaining) + " left";
+                // remaining <= 0 means the ban expired between the active check
+                // and this render — show plain "expired", never "expired left".
+                String durationText = active.get().isPermanent() ? "permanent"
+                        : (remaining <= 0 ? "expired" : DurationParser.format(remaining) + " left");
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("baninfo-status-banned", "<gray>Status: <red>Banned (%duration_left%)").replace("%duration_left%", durationText)));
             } else {
