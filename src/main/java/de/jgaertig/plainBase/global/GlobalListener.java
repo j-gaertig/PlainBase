@@ -17,20 +17,22 @@ public class GlobalListener implements Listener {
     public void onAdminJoin(PlayerJoinEvent event) {
         if (!event.getPlayer().hasPermission("plainbase.admin")) return;
 
-        // String comparison (mirrors PlainBase.compareVersions): a double
-        // comparison would treat 1.10 as equal to 1.1. Doubles are read from
-        // the version map (type unchanged: Map<String, Double>) and converted
-        // via String.valueOf for the segment-wise compare below.
-        String currentMain = String.valueOf(plugin.getConfig().getDouble("version", 0.0));
-        String latestMain = String.valueOf(plugin.getLatestVersions().getOrDefault("config.yml", 0.0));
+        // String comparison (mirrors PlainBase.compareVersions semantics): a
+        // double comparison would treat 1.10 as equal to 1.1, and even
+        // String.valueOf(getDouble(...)) collapses a stored "1.10" to "1.1"
+        // before the compare. Versions are therefore read via get() and
+        // toString() (tolerates numeric unquoted YAML and quoted strings),
+        // and the latest map holds Strings (Map<String, String>).
+        String currentMain = readVersionString(plugin.getConfig().get("version"));
+        String latestMain = plugin.getLatestVersions().getOrDefault("config.yml", "0");
 
         if (compareVersions(currentMain, latestMain) < 0) {
             sendWarning(event, "config.yml", currentMain, latestMain);
         }
 
         plugin.getConfigs().forEach((name, config) -> {
-            String current = String.valueOf(config.getDouble("version", 0.0));
-            String latest = String.valueOf(plugin.getLatestVersions().getOrDefault(name, 0.0));
+            String current = readVersionString(config == null ? null : config.get("version"));
+            String latest = plugin.getLatestVersions().getOrDefault(name, "0");
 
             if (compareVersions(current, latest) < 0) {
                 sendWarning(event, "modules/" + name, current, latest);
@@ -70,5 +72,16 @@ public class GlobalListener implements Listener {
         } catch (NumberFormatException e) {
             return 0;
         }
+    }
+
+    /**
+     * Reads a "version" value as string, tolerating numeric (unquoted YAML)
+     * and quoted-string forms. Mirrors PlainBase.readVersionString: a
+     * getDouble() read would collapse "1.10" to 1.1 before comparing.
+     */
+    private static String readVersionString(Object value) {
+        if (value == null) return "0";
+        String text = value.toString().trim();
+        return text.isEmpty() ? "0" : text;
     }
 }

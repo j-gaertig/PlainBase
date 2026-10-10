@@ -17,6 +17,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class TPAManager {
 
@@ -115,10 +116,14 @@ public class TPAManager {
                         "<gray>Use <green>/tpaccept <gray>or <red>/tpdeny<gray>."
         ));
 
+        // The full session reserves its own identity for the conditional
+        // expiry remove below: the timeout must never delete a NEWER session
+        // installed after accept/deny/cancel re-armed the slot.
+        AtomicReference<TpaSession> expectedRef = new AtomicReference<>();
         ScheduledTask timeoutTask;
         try {
             timeoutTask = Bukkit.getAsyncScheduler().runDelayed(plugin, (t) -> {
-                expireRequest(targetId);
+                expireRequest(targetId, expectedRef.get());
             }, timeoutSeconds, TimeUnit.SECONDS);
         } catch (Exception e) {
             activeSessions.remove(targetId, stub);
@@ -128,6 +133,7 @@ public class TPAManager {
         }
 
         TpaSession full = new TpaSession(requesterId, type, timeoutTask);
+        expectedRef.set(full);
         if (!activeSessions.replace(targetId, stub, full)) {
             // Session was removed concurrently (quit/cancel/accept) before the
             // timeout was attached — never leak the orphan timeout task.
@@ -247,9 +253,16 @@ public class TPAManager {
         return p != null && activeWarmups.containsKey(p.getUniqueId());
     }
 
-    private void expireRequest(UUID targetId) {
-        TpaSession session = activeSessions.remove(targetId);
-        if (session == null) return;
+    /**
+     * Async expiry: removes only the session captured at schedule time. A
+     * newer session for the same target (re-request after accept/deny/cancel)
+     * is foreign and must survive — hence remove(key, expected), never an
+     * unconditional remove.
+     */
+    private void expireRequest(UUID targetId, TpaSession expected) {
+        if (targetId == null || expected == null) return;
+        if (!activeSessions.remove(targetId, expected)) return;
+        TpaSession session = expected;
 
         // Runs on the async scheduler: only the map removal above may happen
         // here. Bukkit API calls (sendMessage) must run on entity threads.
@@ -353,25 +366,36 @@ public class TPAManager {
 
         UUID toTeleportId = toTeleport.getUniqueId();
         UUID destinationId = destination.getUniqueId();
-        warmupPartners.put(toTeleportId, destinationId);
-        warmupPartners.put(destinationId, toTeleportId);
 
-        ScheduledTask warmupTask = toTeleport.getScheduler().runDelayed(plugin, (task) -> {
-            activeWarmups.remove(toTeleportId);
-            removeWarmupPartner(toTeleportId);
-            performTeleport(toTeleport, destination);
-        }, null, seconds * 20L);
+        ScheduledTask warmupTask;
+        try {
+            warmupTask = toTeleport.getScheduler().runDelayed(plugin, (task) -> {
+                activeWarmups.remove(toTeleportId);
+                removeWarmupPartner(toTeleportId);
+                performTeleport(toTeleport, destination);
+            }, null, seconds * 20L);
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to schedule TPA warmup for " + toTeleport.getName() + ": " + e.getMessage());
+            toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
+            return;
+        }
 
-        // Atomic reservation: a concurrent RTP warmup for the same player may
-        // have been registered after the remove() above — putIfAbsent lets the
-        // already-running warmup win instead of overwriting it (TOCTOU with
-        // RTPManager.proceedToWarmup, which mirrors this).
+        // Atomic reservation FIRST: a concurrent warmup for the same player
+        // may have been registered after the remove() above — putIfAbsent
+        // lets the already-running warmup win instead of overwriting it
+        // (TOCTOU with RTPManager.proceedToWarmup, which mirrors this). The
+        // anchor mapping is installed only after winning, so the loser never
+        // owns anything to clean up.
         if (activeWarmups.putIfAbsent(toTeleportId, warmupTask) != null) {
             warmupTask.cancel();
-            removeWarmupPartner(toTeleportId);
+            // Conditional removes only: never delete the winner's mapping.
+            warmupPartners.remove(toTeleportId, destinationId);
+            warmupPartners.remove(destinationId, toTeleportId);
             toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: a teleport is already in progress."));
             return;
         }
+        warmupPartners.put(toTeleportId, destinationId);
+        warmupPartners.put(destinationId, toTeleportId);
     }
 
     /**
@@ -418,14 +442,24 @@ public class TPAManager {
                     return;
                 }
                 toTeleport.teleportAsync(destLoc).thenAccept(success -> {
-                    if (Boolean.TRUE.equals(success)) {
-                        toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleport successful!"));
-                    } else if (toTeleport.isOnline()) {
-                        try {
-                            toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
-                        } catch (Exception e) {
-                            plugin.getLogger().fine("Failed to notify TPA teleport failure for " + toTeleport.getName() + ": " + e.getMessage());
-                        }
+                    // thenAccept runs off the entity thread: hop back onto the
+                    // teleporting player's EntityScheduler for sendMessage
+                    // (Folia Region/EntityScheduler is retained everywhere).
+                    try {
+                        toTeleport.getScheduler().run(plugin, t3 -> {
+                            if (!toTeleport.isOnline()) return;
+                            try {
+                                if (Boolean.TRUE.equals(success)) {
+                                    toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleport successful!"));
+                                } else {
+                                    toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
+                                }
+                            } catch (Exception e) {
+                                plugin.getLogger().fine("Failed to notify TPA teleport result for " + toTeleport.getName() + ": " + e.getMessage());
+                            }
+                        }, null);
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to schedule TPA teleport notify for " + toTeleport.getName() + ": " + e.getMessage());
                     }
                 });
             }, null);
@@ -508,14 +542,23 @@ public class TPAManager {
             }
         }
 
-        List<UUID> outgoingTargets = new ArrayList<>();
+        List<Map.Entry<UUID, TpaSession>> outgoing = new ArrayList<>();
         for (Map.Entry<UUID, TpaSession> entry : new ArrayList<>(activeSessions.entrySet())) {
-            if (entry.getValue().requesterId().equals(quitterId)) {
-                outgoingTargets.add(entry.getKey());
+            TpaSession s = entry.getValue();
+            if (s != null && s.requesterId().equals(quitterId)) {
+                outgoing.add(entry);
             }
         }
-        for (UUID targetId : outgoingTargets) {
-            TpaSession session = activeSessions.remove(targetId);
+        for (Map.Entry<UUID, TpaSession> e : outgoing) {
+            UUID targetId = e.getKey();
+            TpaSession expected = e.getValue();
+            // Conditional remove (same race as cancelOutgoingRequest): the
+            // slot may have been replaced for a different requester since the
+            // scan — never delete a foreign session.
+            if (expected == null || !activeSessions.remove(targetId, expected)) {
+                continue;
+            }
+            TpaSession session = expected;
             if (session != null) {
                 if (session.timeoutTask() != null) session.timeoutTask().cancel();
                 Player target = Bukkit.getPlayer(targetId);
@@ -529,15 +572,26 @@ public class TPAManager {
     public void cancelOutgoingRequest(Player requester) {
 
         UUID targetUUID = null;
+        TpaSession expected = null;
         for (Map.Entry<UUID, TpaSession> entry : new ArrayList<>(activeSessions.entrySet())) {
-            if (entry.getValue().requesterId().equals(requester.getUniqueId())) {
+            TpaSession s = entry.getValue();
+            if (s != null && s.requesterId().equals(requester.getUniqueId())) {
                 targetUUID = entry.getKey();
+                expected = s;
                 break;
             }
         }
 
-        if (targetUUID != null) {
-            clearSession(targetUUID);
+        if (targetUUID != null && expected != null) {
+            // Conditional remove: a concurrent sendRequest may have replaced
+            // the session at targetUUID for a different requester between the
+            // scan above and now — remove(key, expected) never deletes that
+            // foreign session.
+            if (!activeSessions.remove(targetUUID, expected)) {
+                requester.sendMessage(plugin.getMiniMessage().deserialize("<red>You don't have any outgoing requests!"));
+                return;
+            }
+            if (expected.timeoutTask() != null) expected.timeoutTask().cancel();
             requester.sendMessage(plugin.getMiniMessage().deserialize("<gray>Your teleport request has been <red>cancelled<gray>."));
 
             Player target = Bukkit.getPlayer(targetUUID);

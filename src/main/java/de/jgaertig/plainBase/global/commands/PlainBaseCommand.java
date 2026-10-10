@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.stream.Stream;
 
 public class PlainBaseCommand implements BasicCommand {
@@ -61,25 +62,39 @@ public class PlainBaseCommand implements BasicCommand {
                         // "team.commands.invite.enabled"), letting a typo write a
                         // stray key. Reject anything with a dot and anything not
                         // in the live key set.
+                        // F3: toggle and suggest() race on the live YamlConfiguration
+                        // (suggest may run off-thread while this mutates). Capture
+                        // the reference once and do every read/mutation under
+                        // synchronized on that same instance; the key set is
+                        // snapshotted inside the lock so getKeys() never sees a
+                        // concurrent mutation mid-iteration.
                         org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
-                        ConfigurationSection modules;
-                        synchronized (rootCfg) {
-                            modules = rootCfg.getConfigurationSection("modules");
+                        if (rootCfg == null) {
+                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
+                            return;
                         }
-                        boolean known = false;
-                        if (modules != null && !moduleName.contains(".") && !moduleName.contains(" ")) {
+                        boolean known;
+                        synchronized (rootCfg) {
+                            boolean k = false;
                             try {
-                                known = modules.getKeys(false).contains(moduleName);
+                                ConfigurationSection sec = rootCfg.getConfigurationSection("modules");
+                                if (sec != null && !moduleName.contains(".") && !moduleName.contains(" ")) {
+                                    k = sec.getKeys(false).contains(moduleName);
+                                }
                             } catch (Exception ignored) {
                             }
+                            known = k;
                         }
                         if (!known) {
                             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
                             return;
                         }
                         String path = "modules." + moduleName;
-                        boolean newStatus = !plugin.getConfig().getBoolean(path);
-                        plugin.getConfig().set(path, newStatus);
+                        boolean newStatus;
+                        synchronized (rootCfg) {
+                            newStatus = !rootCfg.getBoolean(path);
+                            rootCfg.set(path, newStatus);
+                        }
                         plugin.saveConfig();
                         plugin.reloadModules();
                         if (sender instanceof Player player && !player.isOnline()) return;
@@ -132,14 +147,22 @@ public class PlainBaseCommand implements BasicCommand {
             String safeVersion = plugin.getMiniMessage().escapeTags(serverVersion);
             sender.sendMessage(plugin.getMiniMessage().deserialize("<gray>Checking for updates for Minecraft " + safeVersion + "..."));
 
-            Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+            try {
+                Bukkit.getAsyncScheduler().runNow(plugin, task -> {
                 String latestVersion = getLatestVersionFromModrinth("yfx0z1Sw", serverVersion);
 
+                // P2: the plugin may have been disabled while the Modrinth
+                // request was in flight — scheduling on a disabled plugin
+                // throws, so guard before the second hop. The hop itself
+                // re-checks isEnabled (disable between schedule and run).
+                if (!plugin.isEnabled()) return;
                 // Send result on the global region scheduler (main thread) - thread-safe on Paper and Folia
-                Bukkit.getGlobalRegionScheduler().run(plugin, scheduledTask -> {
-                    if (sender instanceof Player player && !player.isOnline()) {
-                        return;
-                    }
+                try {
+                    Bukkit.getGlobalRegionScheduler().run(plugin, scheduledTask -> {
+                        if (!plugin.isEnabled()) return;
+                        if (sender instanceof Player player && !player.isOnline()) {
+                            return;
+                        }
                     if (latestVersion == null) {
                         sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reach Modrinth. Please try again later."));
                         return;
@@ -161,8 +184,18 @@ public class PlainBaseCommand implements BasicCommand {
                                         "<gray>Download here: <click:open_url:'https://modrinth.com/plugin/plainbase'><underlined><blue>modrinth.com/plugin/plainbase</blue></underlined></click>"
                         ));
                     }
+                    });
+                } catch (Exception e) {
+                    plugin.getLogger().fine("Failed to deliver update result (plugin disabling?): " + e.getMessage());
+                }
                 });
-            });
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to schedule update check: " + e.getMessage());
+                try {
+                    sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not check for updates!"));
+                } catch (Exception ignored) {
+                }
+            }
             return;
         }
 
@@ -191,20 +224,23 @@ public class PlainBaseCommand implements BasicCommand {
         }
 
         if (args.length == 2 && args[0].equalsIgnoreCase("toggle")) {
-            // Suggestions may run off-thread while a reload swaps the config:
-            // snapshot the reference once and read from it without locking —
-            // locking the FileConfiguration instance is pointless because a
-            // reload swaps in a new object (the monitor would change).
-            List<String> keys;
-            ConfigurationSection modules = null;
-            try {
-                org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
-                if (cfg != null) modules = cfg.getConfigurationSection("modules");
-            } catch (Exception ignored) {
+            // F3: suggestions may run off-thread while toggle/reload mutates
+            // the config on the global thread. Capture the reference once and
+            // snapshot the key set under synchronized on that same instance
+            // (toggle uses the same monitor), then filter outside the lock.
+            org.bukkit.configuration.file.FileConfiguration cfg = plugin.getConfig();
+            if (cfg == null) return List.of();
+            java.util.Set<String> snapshot;
+            synchronized (cfg) {
+                try {
+                    ConfigurationSection sec = cfg.getConfigurationSection("modules");
+                    snapshot = (sec == null) ? Set.of() : Set.copyOf(sec.getKeys(false));
+                } catch (Exception ignored) {
+                    snapshot = Set.of();
+                }
             }
-            keys = (modules == null) ? List.of() : List.copyOf(modules.getKeys(false));
             String input = args[1].toLowerCase(Locale.ROOT);
-            return keys.stream()
+            return snapshot.stream()
                     .filter(s -> s.startsWith(input))
                     .toList();
         }

@@ -35,6 +35,7 @@ public class TeleportListener implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
+        if (!plugin.getConfig().getBoolean("modules.teleport", false)) return;
         if (plugin.getTPAManager() != null) {
             plugin.getTPAManager().loadPlayerData(event.getPlayer());
         }
@@ -53,12 +54,10 @@ public class TeleportListener implements Listener {
         }
         try {
             if (plugin.getRTPManager() != null) {
-                plugin.getRTPManager().cancelWarmup(player, "You left!");
-                try {
-                    plugin.getRTPManager().cancelSearch(player);
-                } catch (Exception e) {
-                    plugin.getLogger().warning("Failed to cancel RTP search for " + player.getName() + ": " + e.getMessage());
-                }
+                // Quit refunds the cooldown when a warmup/search was active
+                // (like cancelAll); a plain quit keeps it. Replaces the
+                // cancelWarmup + cancelSearch pair (which never refunded).
+                plugin.getRTPManager().handleQuit(player);
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to cancel teleport warmup for " + player.getName() + ": " + e.getMessage());
@@ -80,11 +79,12 @@ public class TeleportListener implements Listener {
     }
 
     // A world change without a move delta (portal, /world hop, end gate) must
-    // break the warmup just like movement does. No new config key: reuses the
-    // "move" cancel flag.
+    // always break the warmup — even when "move" is not in cancel_on. A
+    // portal/ender-pearl hop during warmup must never survive; cancel_on only
+    // gates move/damage/death/interact.
     @EventHandler
     public void onWorldChange(PlayerChangedWorldEvent event) {
-        checkAndCancel(event.getPlayer(), "move");
+        cancelWarmupsUnconditionally(event.getPlayer());
     }
 
     // Any teleport (ender pearl, chorus, other plugins) breaks the warmup.
@@ -92,7 +92,7 @@ public class TeleportListener implements Listener {
     // after the warmup entry was already removed, so this is a no-op for them.
     @EventHandler(ignoreCancelled = true)
     public void onTeleport(PlayerTeleportEvent event) {
-        checkAndCancel(event.getPlayer(), "move");
+        cancelWarmupsUnconditionally(event.getPlayer());
     }
 
     // A cancelled damage event means no damage was actually taken (spawn
@@ -144,6 +144,31 @@ public class TeleportListener implements Listener {
             }
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to check teleport cancel flag '" + flag + "' for " + p.getName() + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Unconditional warmup abort for PlayerTeleportEvent and
+     * PlayerChangedWorldEvent (ender pearl, chorus, portal, other plugins).
+     * Unlike checkAndCancel, this ignores the cancel_on lists entirely —
+     * an external position change during warmup must never survive, while
+     * cancel_on only gates move/damage/death/interact.
+     */
+    private void cancelWarmupsUnconditionally(Player p) {
+        if (p == null) return;
+        try {
+            if (plugin.getTPAManager() != null) {
+                plugin.getTPAManager().cancelWarmup(p, generateReason("move"));
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to cancel TPA warmup on teleport/world-change for " + p.getName() + ": " + e.getMessage());
+        }
+        try {
+            if (plugin.getRTPManager() != null) {
+                plugin.getRTPManager().cancelWarmup(p, generateReason("move"));
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to cancel RTP warmup on teleport/world-change for " + p.getName() + ": " + e.getMessage());
         }
     }
 

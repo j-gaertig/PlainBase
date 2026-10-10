@@ -1,9 +1,11 @@
 package de.jgaertig.plainBase.teleport.rtp.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.teleport.rtp.RTPManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -24,12 +26,16 @@ public class RTPCommand implements BasicCommand {
             return;
         }
 
-        if (plugin.getTeleportConfig() == null || plugin.getRTPManager() == null) {
+        // Captured once: a /plainbase reload racing this command can null
+        // the manager/config between the guard below and later use.
+        FileConfiguration teleportConfig = plugin.getTeleportConfig();
+        RTPManager rtpManager = plugin.getRTPManager();
+        if (teleportConfig == null || rtpManager == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
             return;
         }
 
-        if (!plugin.getTeleportConfig().getBoolean("rtp.enabled", true)) {
+        if (!teleportConfig.getBoolean("rtp.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP has been disabled."));
             return;
         }
@@ -39,7 +45,7 @@ public class RTPCommand implements BasicCommand {
             return;
         }
 
-        if (!plugin.getTeleportConfig().getBoolean("rtp.commands.rtp.enabled", true)) {
+        if (!teleportConfig.getBoolean("rtp.commands.rtp.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }
@@ -54,11 +60,11 @@ public class RTPCommand implements BasicCommand {
             return;
         }
 
-        if (plugin.getRTPManager() == null) {
+        if (rtpManager == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP is currently unavailable."));
             return;
         }
 
-        plugin.getRTPManager().startRTPProcess(player);
+        rtpManager.startRTPProcess(player);
     }
 }

@@ -67,7 +67,11 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
     @Override
     public String onPlaceholderRequest(Player player, @NotNull String params) {
         if (params == null || params.isEmpty()) return null;
-        return switch (params.toLowerCase(Locale.ROOT)) {
+        // Only the static keys are matched case-insensitively via the lowered
+        // copy — the parameterized team branch below keeps the original params
+        // so team IDs (suffix after team_role_/team_members_) are NOT lowercased.
+        String lower = params.toLowerCase(Locale.ROOT);
+        return switch (lower) {
             case "version" -> plugin.getPluginMeta().getVersion();
             case "vanished" -> player != null && plugin.getVanishManager() != null
                     && plugin.getVanishManager().isVanished(player) ? "true" : "false";
@@ -133,7 +137,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
                     ? String.valueOf(plugin.getTeamManager().getTeams().size()) : "0";
 
             // Team module (parameterized: %plainbase_team_role_<team>% / %plainbase_team_members_<team>%)
-            default -> handleTeamParameterized(player, params.toLowerCase(Locale.ROOT));
+            default -> handleTeamParameterized(player, params);
         };
     }
 
@@ -145,14 +149,17 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
     private String handleTeamParameterized(Player player, String params) {
         if (plugin.getTeamManager() == null) return null;
 
-        if (params.startsWith("team_role_")) {
+        // Prefix match is case-insensitive, but the team-ID suffix keeps its
+        // original case (team IDs are case-sensitive; lowercasing the whole
+        // params string broke lookups for mixed-case IDs).
+        if (params.regionMatches(true, 0, "team_role_", 0, "team_role_".length())) {
             String teamId = params.substring("team_role_".length());
             if (player == null) return "none";
             var role = plugin.getTeamManager().getRole(player.getUniqueId(), teamId);
             return role != null ? role.name().toLowerCase(Locale.ROOT) : "none";
         }
 
-        if (params.startsWith("team_members_")) {
+        if (params.regionMatches(true, 0, "team_members_", 0, "team_members_".length())) {
             String teamId = params.substring("team_members_".length());
             return String.valueOf(plugin.getTeamManager().getMembers(teamId).size());
         }

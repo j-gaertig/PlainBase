@@ -1,9 +1,11 @@
 package de.jgaertig.plainBase.teleport.tpa.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.teleport.tpa.TPAManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -23,12 +25,16 @@ public class TPACANCELCommand implements BasicCommand {
             return;
         }
 
-        if (plugin.getTeleportConfig() == null || plugin.getTPAManager() == null) {
+        // Captured once: a /plainbase reload racing this command can null
+        // the manager/config between the guard below and later use.
+        FileConfiguration teleportConfig = plugin.getTeleportConfig();
+        TPAManager tpaManager = plugin.getTPAManager();
+        if (teleportConfig == null || tpaManager == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
             return;
         }
 
-        if (!plugin.getTeleportConfig().getBoolean("tpa.enabled", true)) {
+        if (!teleportConfig.getBoolean("tpa.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA has been disabled."));
             return;
         }
@@ -38,7 +44,7 @@ public class TPACANCELCommand implements BasicCommand {
             return;
         }
 
-        if (!plugin.getTeleportConfig().getBoolean("tpa.commands.tpacancel.enabled", true)) {
+        if (!teleportConfig.getBoolean("tpa.commands.tpacancel.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This command has been disabled."));
             return;
         }
@@ -48,7 +54,7 @@ public class TPACANCELCommand implements BasicCommand {
             return;
         }
 
-        if (plugin.getTPAManager() == null) {
+        if (tpaManager == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>TPA is currently unavailable."));
             return;
         }
@@ -58,6 +64,6 @@ public class TPACANCELCommand implements BasicCommand {
             return;
         }
 
-        plugin.getTPAManager().cancelOutgoingRequest(player);
+        tpaManager.cancelOutgoingRequest(player);
     }
 }

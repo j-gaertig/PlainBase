@@ -102,13 +102,31 @@ public class VanishCommand implements BasicCommand {
                 return;
             }
 
-            Player target = Bukkit.getPlayer(args[0]);
+            // Exact first: Bukkit#getPlayer does prefix matching ("Alex" also
+            // matches "Alexander") and could vanish the wrong player on a
+            // typo. The canSee oracle guard below still applies to both paths.
+            Player target = Bukkit.getPlayerExact(args[0]);
+            if (target == null) {
+                try {
+                    target = Bukkit.getPlayer(args[0]);
+                } catch (Exception e) {
+                    target = null;
+                }
+            }
             if (target == null) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>Player not found!"));
                 return;
             }
             if (target.equals(player)) {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>Use /vanish without arguments to vanish yourself."));
+                return;
+            }
+            // Oracle guard (mirrors suggest() filtering): a viewer who cannot
+            // see the target must get the same "not found" as for an offline
+            // player — otherwise /vanish <name> reveals whether a hidden
+            // (vanished) player is online.
+            if (!vanishManager.canSee(player, target)) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Player not found!"));
                 return;
             }
 

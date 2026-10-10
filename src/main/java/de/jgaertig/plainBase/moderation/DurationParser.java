@@ -33,7 +33,9 @@ public final class DurationParser {
         int matchedChars = 0;
 
         while (matcher.find()) {
-            matchedChars += matcher.group().length();
+            // Only count the number+unit characters, not the whitespace the
+            // pattern tolerates between them ("1 h" must match stripped "1h").
+            matchedChars += matcher.group(1).length() + matcher.group(2).length();
             String amountStr = matcher.group(1);
             String unit = matcher.group(2).toLowerCase(Locale.ROOT);
             try {

@@ -11,6 +11,8 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 
+import java.util.UUID;
+
 public class SpawnListener implements Listener {
 
     private final PlainBase plugin;
@@ -37,16 +39,46 @@ public class SpawnListener implements Listener {
 
             // NOTE: join only — there is intentionally no respawn hook here
             // (that would be a new feature, not a bugfix).
-            if (!player.hasPlayedBefore()) {
-                if (firstSpawnEnabled) {
-                    player.getScheduler().runDelayed(plugin, t -> teleportToConfigLocation(player, "first-spawn.location"), null, 1L);
-                    return; // Wenn First-Spawn, dann kein normaler Spawn Teleport nötig
-                }
-            }
+            if (!firstSpawnEnabled && !spawnEnabled) return;
 
-            if (spawnEnabled) {
-                player.getScheduler().runDelayed(plugin, t -> teleportToConfigLocation(player, "spawn.location"), null, 1L);
-            }
+            // Player#hasPlayedBefore() can hit disk — never call it on the
+            // join (region) thread. Async hop, then schedule back on the
+            // entity thread: the delayed teleport below is unchanged, only the
+            // first-join check moved off-thread. No behaviour change — the
+            // entity task re-checks isOnline (quit mid-hop no-ops) and the
+            // teleport path still reads the config snapshot fresh. On lookup
+            // failure fail closed as a returning player (regular spawn path)
+            // rather than firing first-spawn for a stranger.
+            final UUID uuid = player.getUniqueId();
+            final boolean firstEnabled = firstSpawnEnabled;
+            final boolean spawnOnJoin = spawnEnabled;
+            Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+                boolean played;
+                try {
+                    played = Bukkit.getOfflinePlayer(uuid).hasPlayedBefore();
+                } catch (RuntimeException e) {
+                    played = true;
+                }
+                boolean firstJoin = !played;
+                try {
+                    player.getScheduler().run(plugin, t -> {
+                        try {
+                            if (!player.isOnline()) return;
+                            if (firstJoin && firstEnabled) {
+                                player.getScheduler().runDelayed(plugin, t2 -> teleportToConfigLocation(player, "first-spawn.location"), null, 1L);
+                                return; // Wenn First-Spawn, dann kein normaler Spawn Teleport nötig
+                            }
+                            if (spawnOnJoin) {
+                                player.getScheduler().runDelayed(plugin, t2 -> teleportToConfigLocation(player, "spawn.location"), null, 1L);
+                            }
+                        } catch (Exception e) {
+                            plugin.getLogger().warning("Failed to handle spawn join teleport for " + player.getName() + ": " + e.getMessage());
+                        }
+                    }, null);
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to schedule spawn join teleport for " + player.getName() + ": " + e.getMessage());
+                }
+            });
         } catch (Exception e) {
             // A failing spawn teleport must never break the join event itself.
             plugin.getLogger().warning("Failed to handle spawn join teleport: " + e.getMessage());
@@ -128,33 +160,42 @@ public class SpawnListener implements Listener {
                 loc = new Location(world, rawX, rawY, rawZ, yaw, pitch);
             }
             player.teleportAsync(loc).thenAccept(success -> {
-                if (!Boolean.TRUE.equals(success) && player.isOnline()) {
-                    // First-spawn failed (e.g. target chunk unavailable): fall
-                    // back to the regular spawn instead of stranding the
-                    // player. Runs on the teleport future thread — re-check
-                    // online state and never throw.
-                    if (fallbackToSpawn) {
-                        try {
-                            FileConfiguration cfg = plugin.getSpawnConfig();
-                            boolean enabled = false;
-                            if (cfg != null) {
-                                synchronized (cfg) {
-                                    enabled = cfg.getBoolean("spawn.enabled", false);
+                // thenAccept runs off the entity thread: hop back onto the
+                // EntityScheduler before any sendMessage/fallback scheduling
+                // (Folia scheduler retained).
+                try {
+                    player.getScheduler().run(plugin, t -> {
+                        if (!Boolean.TRUE.equals(success) && player.isOnline()) {
+                            // First-spawn failed (e.g. target chunk unavailable): fall
+                            // back to the regular spawn instead of stranding the
+                            // player. Now on the entity thread — re-check
+                            // online state and never throw.
+                            if (fallbackToSpawn) {
+                                try {
+                                    FileConfiguration cfg = plugin.getSpawnConfig();
+                                    boolean enabled = false;
+                                    if (cfg != null) {
+                                        synchronized (cfg) {
+                                            enabled = cfg.getBoolean("spawn.enabled", false);
+                                        }
+                                    }
+                                    if (enabled && player.isOnline()) {
+                                        player.getScheduler().run(plugin, t2 -> teleportToConfigLocation(player, "spawn.location", false), null);
+                                        return;
+                                    }
+                                } catch (Exception ex) {
+                                    plugin.getLogger().warning("Spawn fallback failed for " + player.getName() + ": " + ex.getMessage());
                                 }
                             }
-                            if (enabled && player.isOnline()) {
-                                player.getScheduler().run(plugin, t -> teleportToConfigLocation(player, "spawn.location", false), null);
-                                return;
+                            try {
+                                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
+                            } catch (Exception ex) {
+                                plugin.getLogger().warning("Failed to notify " + player.getName() + " about spawn teleport failure: " + ex.getMessage());
                             }
-                        } catch (Exception ex) {
-                            plugin.getLogger().warning("Spawn fallback failed for " + player.getName() + ": " + ex.getMessage());
                         }
-                    }
-                    try {
-                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
-                    } catch (Exception ex) {
-                        plugin.getLogger().warning("Failed to notify " + player.getName() + " about spawn teleport failure: " + ex.getMessage());
-                    }
+                    }, null);
+                } catch (Exception ex) {
+                    plugin.getLogger().warning("Failed to schedule spawn teleport notify for " + player.getName() + ": " + ex.getMessage());
                 }
             });
         } catch (Exception e) {

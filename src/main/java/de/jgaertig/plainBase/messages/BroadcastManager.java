@@ -67,7 +67,11 @@ public class BroadcastManager {
 
     public void stopBroadcasts() {
         for (ScheduledTask task : activeTasks) {
-            task.cancel();
+            try {
+                task.cancel();
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to cancel broadcast task: " + e.getMessage());
+            }
         }
         activeTasks.clear();
     }

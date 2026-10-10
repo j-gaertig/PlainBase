@@ -233,7 +233,7 @@ public class BanManager {
         if (canonical == null) return;
         try {
             db.trackPlayerIp(uuid, name, canonical);
-        } catch (SQLException e) {
+        } catch (SQLException | RuntimeException e) {
             plugin.getLogger().warning("Could not track player IP for " + name + ": " + e.getMessage());
         }
     }
@@ -241,7 +241,7 @@ public class BanManager {
     public String findLastIpByName(String name) {
         try {
             return db.findLastIpByName(name);
-        } catch (SQLException e) {
+        } catch (SQLException | RuntimeException e) {
             plugin.getLogger().warning("Could not look up last IP for " + name + ": " + e.getMessage());
             return null;
         }
@@ -285,7 +285,7 @@ public class BanManager {
                         bansCache.add(record);
                         bansByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(record);
                         result = Optional.of(record);
-                    } catch (SQLException e) {
+                    } catch (SQLException | RuntimeException e) {
                         plugin.getLogger().severe("Could not insert ban for " + name + ": " + e.getMessage());
                         result = Optional.empty();
                     }
@@ -320,7 +320,7 @@ public class BanManager {
                             success = false;
                         }
                     }
-                } catch (SQLException e) {
+                } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().severe("Could not revoke ban for " + uuid + ": " + e.getMessage());
                     success = false;
                 }
@@ -377,7 +377,7 @@ public class BanManager {
                         IpBanRecord record = db.insertIpBan(ip, reason, staffUuid, staffName, durationMillis);
                         ipBansCache.add(record);
                         result = Optional.of(record);
-                    } catch (SQLException e) {
+                    } catch (SQLException | RuntimeException e) {
                         plugin.getLogger().severe("Could not insert IP ban for " + ip + ": " + e.getMessage());
                         result = Optional.empty();
                     }
@@ -409,7 +409,7 @@ public class BanManager {
                             success = false;
                         }
                     }
-                } catch (SQLException e) {
+                } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
                     success = false;
                 }

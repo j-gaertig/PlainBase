@@ -33,7 +33,20 @@ public class RTPManager {
     }
 
     public void startRTPProcess(Player player) {
+        if (player == null || !player.isOnline()) return;
         if (isOnCooldown(player)) return;
+
+        // Early TPA-warmup precheck (before setCooldown): a running TPA warmup
+        // wins. Aborting here avoids consuming the RTP cooldown and starting
+        // a search that proceedToWarmup would only abort (with refund) later.
+        try {
+            if (plugin.getTPAManager() != null && plugin.getTPAManager().hasWarmup(player)) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: a teleport is already in progress."));
+                return;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check TPA warmup for " + player.getName() + ": " + e.getMessage());
+        }
 
         UUID uuid = player.getUniqueId();
         if (activeWarmups.containsKey(uuid) || !searching.add(uuid)) {
@@ -319,7 +332,13 @@ public class RTPManager {
         // Runs on the entity thread: re-validate world and safety — the spot
         // was checked seconds ago at search time and the terrain or the
         // player's world may have changed during the warmup.
-        Location dest = loc.clone();
+        // Folia: block/biome access (isLocationSafe → getBlock()) is only
+        // legal on the DESTINATION region thread (runAttemptOnRegion already
+        // runs there via RegionScheduler). The player's entity thread owns a
+        // different region when the target chunk is far away, so the
+        // re-check hops via RegionScheduler onto the dest chunk first and
+        // only then teleports. Never call getBlock() on the entity thread.
+        final Location dest = loc.clone();
         try {
             if (dest.getWorld() == null || !player.getWorld().equals(dest.getWorld())) {
                 cooldowns.remove(player.getUniqueId());
@@ -332,35 +351,109 @@ public class RTPManager {
             cooldowns.remove(player.getUniqueId());
             return;
         }
-        boolean safe;
+        final World destWorld = dest.getWorld();
+        final int chunkX = dest.getBlockX() >> 4;
+        final int chunkZ = dest.getBlockZ() >> 4;
+        final UUID uuid = player.getUniqueId();
         try {
-            safe = isLocationSafe(dest);
+            Bukkit.getRegionScheduler().execute(plugin, destWorld, chunkX, chunkZ, () -> {
+                boolean safe;
+                try {
+                    safe = isLocationSafe(dest);
+                } catch (Exception e) {
+                    safe = false;
+                }
+                if (!safe) {
+                    cooldowns.remove(uuid);
+                    try {
+                        player.getScheduler().run(plugin, t -> {
+                            if (player.isOnline()) {
+                                player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer safe. Try again!"));
+                            }
+                        }, null);
+                    } catch (Exception ignored) {
+                    }
+                    return;
+                }
+                teleportValidated(player, dest, uuid);
+            });
         } catch (Exception e) {
-            safe = false;
-        }
-        if (!safe) {
-            cooldowns.remove(player.getUniqueId());
-            if (player.isOnline()) {
-                player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer safe. Try again!"));
+            cooldowns.remove(uuid);
+            plugin.getLogger().warning("Could not validate RTP destination for " + player.getName() + ": " + e.getMessage());
+            try {
+                player.getScheduler().run(plugin, t -> {
+                    if (player.isOnline()) {
+                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP search failed. Try again later!"));
+                    }
+                }, null);
+            } catch (Exception ignored) {
             }
+        }
+    }
+
+    /**
+     * Teleports after the destination region validated the spot (see
+     * {@link #executeTeleport}). Runs on the dest region thread; teleportAsync
+     * is thread-safe, result messaging hops back onto the entity thread.
+     */
+    private void teleportValidated(Player player, Location dest, UUID uuid) {
+        // isOnline guard before teleportAsync (TPA TPAManager 436-443 pattern):
+        // the dest region thread may run after the player quit — never
+        // teleport an offline player, refund the cooldown instead.
+        if (player == null || !player.isOnline()) {
+            if (uuid != null) cooldowns.remove(uuid);
             return;
         }
-        UUID uuid = player.getUniqueId();
-        player.teleportAsync(dest.clone().add(0, 1, 0)).thenAccept(success -> {
+        if (dest == null || dest.getWorld() == null) {
+            if (uuid != null) cooldowns.remove(uuid);
+            return;
+        }
+        try {
+            player.teleportAsync(dest.clone().add(0, 1, 0)).thenAccept(success -> {
+            // thenAccept runs off the entity thread: hop back onto the
+            // EntityScheduler for sendMessage (Folia scheduler retained).
             if (Boolean.TRUE.equals(success)) {
-                player.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleported to a safe random location!"));
-            } else {
-                // A failed teleport must not consume the cooldown.
-                cooldowns.remove(uuid);
-                if (player.isOnline()) {
+                try {
+                    player.getScheduler().run(plugin, t -> {
+                        if (player.isOnline()) {
+                            player.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleported to a safe random location!"));
+                        }
+                    }, null);
+                } catch (Exception e) {
+                    plugin.getLogger().fine("Failed to notify RTP teleport success for " + player.getName() + ": " + e.getMessage());
+                }
+                return;
+            }
+            // A failed teleport must not consume the cooldown.
+            if (uuid != null) cooldowns.remove(uuid);
+            try {
+                player.getScheduler().run(plugin, t -> {
+                    if (!player.isOnline()) return;
                     try {
                         player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
                     } catch (Exception e) {
                         plugin.getLogger().fine("Failed to notify RTP teleport failure for " + player.getName() + ": " + e.getMessage());
                     }
-                }
+                }, null);
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to schedule RTP teleport failure notify for " + player.getName() + ": " + e.getMessage());
             }
-        });
+            });
+        } catch (Exception e) {
+            // Scheduler/teleport threw synchronously (player gone, plugin
+            // disabling): a search that never teleported must refund the
+            // cooldown, like the failure path above.
+            if (uuid != null) cooldowns.remove(uuid);
+            plugin.getLogger().fine("Failed to start RTP teleport for " + player.getName() + ": " + e.getMessage());
+            try {
+                player.getScheduler().run(plugin, t -> {
+                    if (player.isOnline()) {
+                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
+                    }
+                }, null);
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private boolean isLocationSafe(Location loc) {
@@ -380,6 +473,9 @@ public class RTPManager {
 
         Material ground = loc.getBlock().getType();
         String groundName = ground.name();
+        // Always-unsafe ground regardless of the blacklist toggle: falling
+        // through or suffocating spots that must never be an RTP target.
+        if (isAlwaysUnsafeBlock(groundName)) return false;
         if (groundName.contains("LEAVES")) return false;
         if (!ground.isSolid()) return false;
         if (ground == Material.LAVA || ground == Material.WATER || ground == Material.FIRE
@@ -396,6 +492,9 @@ public class RTPManager {
         // handling needed.
         String head1Name = b1.getType().name();
         String head2Name = b2.getType().name();
+        // Same always-unsafe basis for headroom (portal/powder-snow are
+        // passable, so the passability check above would not catch them).
+        if (isAlwaysUnsafeBlock(head1Name) || isAlwaysUnsafeBlock(head2Name)) return false;
         if (head1Name.contains("LEAVES") || head2Name.contains("LEAVES")) return false;
         if (blacklistEnabled) {
             java.util.List<String> blacklist = teleportConfig.getStringList("rtp.blacklist.blocks");
@@ -404,12 +503,31 @@ public class RTPManager {
             Material head1 = b1.getType();
             Material head2 = b2.getType();
             if (head1 == Material.LAVA || head1 == Material.WATER || head1 == Material.FIRE
-                    || head1 == Material.CACTUS || head1 == Material.MAGMA_BLOCK) return false;
+                    || head1 == Material.CACTUS || head1 == Material.MAGMA_BLOCK
+                    || head1 == Material.CAMPFIRE || head1 == Material.SOUL_CAMPFIRE) return false;
             if (head2 == Material.LAVA || head2 == Material.WATER || head2 == Material.FIRE
-                    || head2 == Material.CACTUS || head2 == Material.MAGMA_BLOCK) return false;
+                    || head2 == Material.CACTUS || head2 == Material.MAGMA_BLOCK
+                    || head2 == Material.CAMPFIRE || head2 == Material.SOUL_CAMPFIRE) return false;
         }
 
         return true;
+    }
+
+    /**
+     * Hardcoded always-unsafe block basis, applied independently of the
+     * {@code rtp.blacklist.enabled} toggle. Name-based (not Material enum) so
+     * version renames (PORTAL vs NETHER_PORTAL, END_PORTAL vs ENDER_PORTAL)
+     * can never slip through on any Paper build.
+     */
+    private static boolean isAlwaysUnsafeBlock(String materialName) {
+        if (materialName == null) return false;
+        return switch (materialName) {
+            case "BEDROCK", "BARRIER",
+                    "PORTAL", "NETHER_PORTAL",
+                    "END_PORTAL", "ENDER_PORTAL", "END_GATEWAY",
+                    "POWDER_SNOW" -> true;
+            default -> false;
+        };
     }
 
     private boolean isOnCooldown(Player player) {
@@ -442,15 +560,61 @@ public class RTPManager {
         cooldowns.put(player.getUniqueId(), System.currentTimeMillis() + (seconds * 1000));
     }
 
+    /**
+     * Quit path: cancels a pending warmup/search and refunds the cooldown —
+     * but ONLY when a warmup or search was actually active (like cancelAll).
+     * A plain quit with no pending RTP keeps its cooldown, so a relog cannot
+     * dodge the anti-spam timer. Unlike cancelWarmup/cancelSearch (which keep
+     * the cooldown for move/damage/interact cancels), this is quit-only.
+     */
+    public void handleQuit(Player player) {
+        if (player == null) return;
+        UUID uuid;
+        try {
+            uuid = player.getUniqueId();
+        } catch (Exception e) {
+            return;
+        }
+        ScheduledTask warmup = activeWarmups.remove(uuid);
+        boolean hadWarmup = warmup != null;
+        if (warmup != null) {
+            try {
+                warmup.cancel();
+            } catch (Exception ignored) {
+            }
+        }
+        boolean hadSearch = searching.remove(uuid);
+        if (hadWarmup || hadSearch) {
+            cooldowns.remove(uuid);
+        }
+        // Opportunistic purge of expired entries (same as cancelSearch) so
+        // cooldowns of players who never return cannot accumulate.
+        try {
+            cooldowns.entrySet().removeIf(e -> e.getValue() == null || e.getValue() <= System.currentTimeMillis());
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to purge expired RTP cooldowns: " + e.getMessage());
+        }
+    }
+
     public void cancelSearch(Player player) {
         if (player == null) return;
         searching.remove(player.getUniqueId());
         // Opportunistic purge of this player's entry on quit/cancel so stale
         // entries of players who never come back cannot accumulate. Only
         // expired entries are removed — an active cooldown is never deleted.
+        long now = System.currentTimeMillis();
         Long expiry = cooldowns.get(player.getUniqueId());
-        if (expiry != null && expiry <= System.currentTimeMillis()) {
+        if (expiry != null && expiry <= now) {
             cooldowns.remove(player.getUniqueId(), expiry);
+        }
+        // Global opportunistic purge of all expired cooldowns (quit/cancel
+        // path): without this, cooldowns of players who quit with an active
+        // cooldown and never return would linger until a map-sized cleanup.
+        // Active (unexpired) entries are never touched.
+        try {
+            cooldowns.entrySet().removeIf(e -> e.getValue() == null || e.getValue() <= System.currentTimeMillis());
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to purge expired RTP cooldowns: " + e.getMessage());
         }
     }
 
@@ -491,6 +655,11 @@ public class RTPManager {
             }
         }
         activeWarmups.clear();
+        // Warmup cooldowns must be refunded too: a reload-cancelled warmup
+        // never teleported, so keeping its cooldown would punish the player.
+        for (UUID uuid : hadWarmup) {
+            cooldowns.remove(uuid);
+        }
         // A stuck search must not vanish silently: notify every searcher and
         // refund the cooldown when the search never reached a warmup — same
         // as TPAManager.cancelAll notifies both sides of pending sessions.

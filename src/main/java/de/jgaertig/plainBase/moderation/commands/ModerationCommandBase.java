@@ -326,13 +326,38 @@ public abstract class ModerationCommandBase {
     /**
      * Online-player lookup that prefers an exact name match: Bukkit#getPlayer
      * does prefix matching ("Alex" also matches "Alexander"), which could ban
-     * or kick the wrong player on a typo. Exact first, fuzzy only as fallback.
+     * or kick the wrong player on a typo. Exact first, fuzzy only as
+     * fallback — and the fuzzy fallback never resolves to a vanished player
+     * invisible to the viewer (falls through to offline lookup instead, same
+     * oracle protection as TeamManager#onlinePlayerExactFirst).
      */
-    protected static Player onlinePlayerExactFirst(String name) {
+    protected Player onlinePlayerExactFirst(String name, CommandSender viewer) {
         if (name == null) return null;
-        Player exact = Bukkit.getPlayerExact(name);
+        Player exact;
+        try {
+            exact = Bukkit.getPlayerExact(name);
+        } catch (Exception e) {
+            return null;
+        }
         if (exact != null) return exact;
-        return Bukkit.getPlayer(name);
+        Player fuzzy;
+        try {
+            fuzzy = Bukkit.getPlayer(name);
+        } catch (Exception e) {
+            return null;
+        }
+        if (fuzzy == null) return null;
+        if (viewer instanceof Player p) {
+            try {
+                var vanishManager = plugin.getVanishManager();
+                if (vanishManager != null && vanishManager.isVanished(fuzzy) && !vanishManager.canSee(p, fuzzy)) {
+                    return null;
+                }
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return fuzzy;
     }
 
     /**
@@ -349,8 +374,8 @@ public abstract class ModerationCommandBase {
      * runs INSIDE the async task above (never on the region thread), so no
      * disk I/O lands on the main thread.
      */
-    protected void resolveTarget(String name, Consumer<OfflinePlayer> callback) {
-        Player online = onlinePlayerExactFirst(name);
+    protected void resolveTarget(CommandSender sender, String name, Consumer<OfflinePlayer> callback) {
+        Player online = onlinePlayerExactFirst(name, sender);
         if (online != null) {
             callback.accept(online);
             return;

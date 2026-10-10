@@ -234,8 +234,13 @@ public class JoinItemsListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onSwap(PlayerSwapHandItemsEvent event) {
+        // Fallback without a new key (mirrors onCreativeClick/onDrag):
+        // "no-inventory-move" also blocks the offhand swap, so items flagged
+        // only with it cannot be smuggled out via the swap path.
         if (isActionRestricted(event.getPlayer(), event.getMainHandItem(), "no-swap") ||
-                isActionRestricted(event.getPlayer(), event.getOffHandItem(), "no-swap")) {
+                isActionRestricted(event.getPlayer(), event.getOffHandItem(), "no-swap") ||
+                isActionRestricted(event.getPlayer(), event.getMainHandItem(), "no-inventory-move") ||
+                isActionRestricted(event.getPlayer(), event.getOffHandItem(), "no-inventory-move")) {
             event.setCancelled(true);
         }
     }
@@ -249,7 +254,19 @@ public class JoinItemsListener implements Listener {
         String message = event.getMessage().toLowerCase(Locale.ROOT);
         if (message.equals("/clear") || message.startsWith("/clear ")
                 || message.equals("/minecraft:clear") || message.startsWith("/minecraft:clear ")) {
-            handleReGive(event.getPlayer(), message, "re-give-after-/clear");
+            // Minimal dupe guard: a filtered clear ("/clear <player> stone")
+            // only removes the filtered items, so re-giving join items for it
+            // would duplicate them. Re-give only for unfiltered clears
+            // ("/clear" or "/clear <player>"). Vanilla syntax is
+            // /clear [<targets> [<item> [<maxCount>]]], so anything beyond
+            // command + target carries an item filter. Split on \\s+ (not
+            // " "): multiple spaces must not shift the argument indices.
+            // The raw message (original case) is used for arg extraction so
+            // exact-name lookup below sees the real spelling; `message` stays
+            // the lowercased copy for command matching only.
+            String rawMessage = event.getMessage();
+            if (rawMessage.trim().split("\\s+").length > 2) return;
+            handleReGive(event.getPlayer(), rawMessage, "re-give-after-/clear");
         }
     }
 
@@ -260,9 +277,11 @@ public class JoinItemsListener implements Listener {
         // Only items whose own config key carries the re-give-after-death
         // flag are removed — one-shot join items without the flag keep
         // their normal drop behaviour.
+        // "no-drop" items must never drop either: dropping them on death
+        // would bypass the no-drop protection (and duplicate re-given ones).
         if (event.getKeepInventory()) return;
         try {
-            event.getDrops().removeIf(this::isRegiveAfterDeathJoinItem);
+            event.getDrops().removeIf(item -> isRegiveAfterDeathJoinItem(item) || isNoDropJoinItem(item));
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to filter join items from death drops: " + e.getMessage());
         }
@@ -308,6 +327,20 @@ public class JoinItemsListener implements Listener {
         }
     }
 
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onArmorStandManipulate(PlayerArmorStandManipulateEvent event) {
+        // Same smuggling path as item frames (see onInteractEntity): swapping
+        // a join item onto an armor stand would move it out of the protected
+        // inventory. (PlayerArmorStandManipulateEvent extends
+        // PlayerInteractEntityEvent but is not caught above, which returns
+        // early for non-ItemFrame entities.)
+        Player player = event.getPlayer();
+        if (isJoinItem(player.getInventory().getItemInMainHand())
+                || isJoinItem(player.getInventory().getItemInOffHand())) {
+            event.setCancelled(true);
+        }
+    }
+
     @EventHandler
     public void onRespawn(PlayerRespawnEvent event) {
         Player player = event.getPlayer();
@@ -324,9 +357,11 @@ public class JoinItemsListener implements Listener {
         }, null, 5L);
     }
 
-    private void handleReGive(Player sender, String message, String flag) {
-        String[] args = message.split(" ");
-        Player target = (args.length == 1) ? sender : Bukkit.getPlayer(args[1]);
+    private void handleReGive(Player sender, String rawMessage, String flag) {
+        if (rawMessage == null) return;
+        String[] args = rawMessage.trim().split("\\s+");
+        if (args.length == 0) return;
+        Player target = (args.length == 1) ? sender : resolveReGiveTarget(args[1]);
         if (target != null && target.isOnline()) {
             // Only re-give to self, or to others with explicit admin rights.
             // Without this check, "/clear <other>" from any player would hand
@@ -346,11 +381,43 @@ public class JoinItemsListener implements Listener {
     }
 
     /**
+     * Resolves the /clear re-give target by name. Selectors (@a/@p/@r/@s/@e,
+     * incl. "@p[...]" args) resolve to null — they must never trigger a
+     * re-give (resolving them would either hit the wrong player or silently
+     * skip, and mass-clear re-gives would duplicate items). Exact first:
+     * Bukkit#getPlayer does prefix matching and could hand items to the
+     * wrong player on a typo.
+     */
+    private static Player resolveReGiveTarget(String name) {
+        if (name == null || name.startsWith("@")) return null;
+        Player exact = Bukkit.getPlayerExact(name);
+        if (exact != null) return exact;
+        try {
+            return Bukkit.getPlayer(name);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
      * True for join items whose own config entry carries the
      * re-give-after-death flag (i.e. items that will be re-given on respawn
      * and therefore must not drop on death).
      */
     private boolean isRegiveAfterDeathJoinItem(ItemStack item) {
+        return joinItemHasFlag(item, "re-give-after-death");
+    }
+
+    /**
+     * True for join items whose own config entry carries the no-drop flag
+     * (i.e. items that must never leave the inventory, including via death
+     * drops).
+     */
+    private boolean isNoDropJoinItem(ItemStack item) {
+        return joinItemHasFlag(item, "no-drop");
+    }
+
+    private boolean joinItemHasFlag(ItemStack item, String flag) {
         if (!isJoinItem(item)) return false;
         ItemMeta meta = item.getItemMeta();
         if (meta == null) return false;
@@ -358,7 +425,7 @@ public class JoinItemsListener implements Listener {
         if (configKey == null) return false;
         try {
             return plugin.getJoinItemsConfig().getStringList("items." + configKey + ".flags")
-                    .contains("re-give-after-death");
+                    .contains(flag);
         } catch (Exception e) {
             return false;
         }

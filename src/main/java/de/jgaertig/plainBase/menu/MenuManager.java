@@ -161,16 +161,70 @@ public class MenuManager {
     }
 
     /**
-     * Closes every open menu inventory. Called on module stop/reload before
+     * Synchronous best-effort close, called from stopModules() BEFORE
+     * HandlerList.unregisterAll: the deferred {@link #closeAllMenus()} below
+     * only schedules per-player EntityScheduler tasks, so unregistering
+     * immediately afterwards would leave a race where an open menu's clicks
+     * are no longer cancelled. This pass tries to close directly so menus
+     * are confirmed closed before the listener is gone; where it throws
+     * (Folia entity-thread-only access from the global thread) the deferred
+     * backup covers it. Never throws.
+     */
+    public void closeAllMenusSyncBestEffort() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (player == null) continue;
+            try {
+                Inventory top;
+                try {
+                    top = player.getOpenInventory().getTopInventory();
+                } catch (Exception e) {
+                    // Wrong thread on Folia — deferred closeAllMenus() retries
+                    // on the entity thread.
+                    continue;
+                }
+                if (top != null && top.getHolder() instanceof MenuHolder) {
+                    try {
+                        player.closeInventory();
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to close menu for " + player.getName() + ": " + e.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to close menu (sync): " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Deferred backup for {@link #closeAllMenusSyncBestEffort()}: closes every
+     * open menu inventory. Called on module stop/reload before
      * the MenuListener is unregistered: an open menu whose clicks are no
      * longer cancelled would let players take items out of the GUI
      * (duplication/exploit risk).
+     * <p>
+     * Folia: inventory access is entity-thread-only, so the holder check and
+     * the close hop per player via {@code player.getScheduler().run(...)}
+     * (same pattern as TPAManager expiry notifications). Each player is
+     * isolated in its own try/catch so one throwing player never aborts the
+     * loop.
      */
     public void closeAllMenus() {
         for (Player player : Bukkit.getOnlinePlayers()) {
-            Inventory top = player.getOpenInventory().getTopInventory();
-            if (top != null && top.getHolder() instanceof MenuHolder) {
-                player.closeInventory();
+            if (player == null) continue;
+            try {
+                player.getScheduler().run(plugin, (t) -> {
+                    try {
+                        if (!player.isOnline()) return;
+                        Inventory top = player.getOpenInventory().getTopInventory();
+                        if (top != null && top.getHolder() instanceof MenuHolder) {
+                            player.closeInventory();
+                        }
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Failed to close menu for " + player.getName() + ": " + e.getMessage());
+                    }
+                }, null);
+            } catch (Exception e) {
+                plugin.getLogger().fine("Failed to schedule menu close: " + e.getMessage());
             }
         }
     }
@@ -310,6 +364,10 @@ public class MenuManager {
         config.set("menus." + name, null);
         // Async persist (see createMenu): in-memory state is authoritative here.
         plugin.saveMenuConfigAsync();
+        // Close open GUIs first: after reloadMenus() the MenuListener no longer
+        // knows this menu, and clicks in a stale open inventory would no
+        // longer be cancelled (item-takeout exploit).
+        closeAllMenus();
         reloadMenus();
     }
 

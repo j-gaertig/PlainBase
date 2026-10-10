@@ -14,6 +14,7 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.player.PlayerAdvancementDoneEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerKickEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 
 public class VanishListener implements Listener {
@@ -67,6 +68,35 @@ public class VanishListener implements Listener {
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to handle vanish quit state for " + player.getName() + ": " + e.getMessage());
+        }
+
+        try {
+            if (plugin.getVanishManager() != null) {
+                plugin.getVanishManager().handleQuit(player);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to purge vanish state for " + player.getName() + ": " + e.getMessage());
+        }
+    }
+
+    @EventHandler
+    public void onKick(PlayerKickEvent event) {
+        // A kicked vanished player must not leak via the leave message either
+        // (kick fires no PlayerQuitEvent path that would hide it — same
+        // hide-join-quit + isVanished/hasPersistedVanish condition as onQuit).
+        Player player = event.getPlayer();
+
+        try {
+            FileConfiguration vanishConfig = plugin.getVanishConfig();
+            if (plugin.getVanishManager() != null
+                    && (plugin.getVanishManager().isVanished(player)
+                        || plugin.getVanishManager().hasPersistedVanish(player.getUniqueId()))
+                    && vanishConfig != null
+                    && vanishConfig.getBoolean("vanish.hide-join-quit-messages", true)) {
+                event.leaveMessage(null);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to handle vanish kick state for " + player.getName() + ": " + e.getMessage());
         }
 
         try {
@@ -212,14 +242,33 @@ public class VanishListener implements Listener {
     }
 
     /**
-     * Resolves the causal player behind a damager: direct melee attacker or
-     * the shooter of a projectile. Returns null for non-player causes.
+     * Resolves the causal player behind a damager: direct melee attacker, the
+     * shooter of a projectile, the igniter of primed TNT, or the source of a
+     * lingering effect cloud. Returns null for non-player causes.
+     * <p>
+     * NOTE: FallingBlock (and similar physics entities) expose no source API,
+     * so a vanished player dropping an anvil/sand on someone cannot be
+     * attributed here — the DamageSource#getCausingEntity fallback in the
+     * caller covers whatever the server tracks, the rest is unattributable
+     * without NMS.
      */
     private static Player resolveCausalPlayer(org.bukkit.entity.Entity damager) {
         if (damager instanceof Player p) return p;
         if (damager instanceof Projectile projectile) {
             try {
                 if (projectile.getShooter() instanceof Player shooter) return shooter;
+            } catch (Exception ignored) {
+            }
+        }
+        if (damager instanceof org.bukkit.entity.TNTPrimed tnt) {
+            try {
+                if (tnt.getSource() instanceof Player igniter) return igniter;
+            } catch (Exception ignored) {
+            }
+        }
+        if (damager instanceof org.bukkit.entity.AreaEffectCloud cloud) {
+            try {
+                if (cloud.getSource() instanceof Player source) return source;
             } catch (Exception ignored) {
             }
         }

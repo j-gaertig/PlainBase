@@ -61,7 +61,9 @@ public class Spawn implements BasicCommand {
 
         boolean spawnEnabled;
         synchronized (spawnConfig) {
-            spawnEnabled = spawnConfig.getBoolean("spawn.enabled", true);
+            // Default false: matches spawn.yml + SpawnListener (opt-in via
+            // /setspawn); a missing key must not teleport to an unset spot.
+            spawnEnabled = spawnConfig.getBoolean("spawn.enabled", false);
         }
         if (!spawnEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn position has been disabled."));
@@ -132,17 +134,23 @@ public class Spawn implements BasicCommand {
         }
 
         player.teleportAsync(loc).thenAccept(success -> {
-            if (!player.isOnline()) {
-                return;
-            }
+            // thenAccept runs off the entity thread: hop back onto the
+            // EntityScheduler for sendMessage (Folia scheduler retained).
             try {
-                if (Boolean.TRUE.equals(success)) {
-                    player.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleported to spawn!"));
-                } else {
-                    player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
-                }
+                player.getScheduler().run(plugin, t -> {
+                    if (!player.isOnline()) return;
+                    try {
+                        if (Boolean.TRUE.equals(success)) {
+                            player.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleported to spawn!"));
+                        } else {
+                            player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
+                        }
+                    } catch (Exception e) {
+                        plugin.getLogger().warning("Failed to notify " + player.getName() + " about spawn teleport: " + e.getMessage());
+                    }
+                }, null);
             } catch (Exception e) {
-                plugin.getLogger().warning("Failed to notify " + player.getName() + " about spawn teleport: " + e.getMessage());
+                plugin.getLogger().warning("Failed to schedule spawn teleport notify for " + player.getName() + ": " + e.getMessage());
             }
         });
 

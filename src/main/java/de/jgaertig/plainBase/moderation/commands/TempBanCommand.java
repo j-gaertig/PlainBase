@@ -5,7 +5,9 @@ import de.jgaertig.plainBase.moderation.BanManager;
 import de.jgaertig.plainBase.moderation.DurationParser;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
+import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -30,7 +32,17 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
 
         if (!checkPreconditions(sender, "plainbase.moderation.tempban", "tempban")) return;
 
-        if (!plugin.getModerationConfig().getBoolean("ban.enabled", true)) {
+        // Captured once (manager + config): a /plainbase reload racing the
+        // async hops below can null either mid-chain — stale locals keep the
+        // callback working instead of NPE-ing (same pattern as KickCommand).
+        BanManager manager = plugin.getBanManager();
+        FileConfiguration moderationConfig = plugin.getModerationConfig();
+        if (manager == null || moderationConfig == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            return;
+        }
+
+        if (!moderationConfig.getBoolean("ban.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Banning is currently disabled."));
             return;
         }
@@ -59,7 +71,12 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
         String staffName = sender.getName();
         long finalDuration = durationMillis;
 
-        resolveTarget(targetName, offlinePlayer -> {
+        resolveTarget(sender, targetName, offlinePlayer -> {
+            if (isGone(sender)) return;
+            if (manager == null || moderationConfig == null) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+                return;
+            }
             if (offlinePlayer == null) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
@@ -89,8 +106,8 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                 return;
             }
 
-            BanManager manager = plugin.getBanManager();
             manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, result -> {
+                if (isGone(sender)) return;
                 if (result.isEmpty()) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("already-banned", "<red>%player% is already banned.").replace("%player%", esc(name))));
@@ -106,9 +123,24 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                                     .replace("%reason%", esc(reason))
                                     .replace("%staff%", esc(staffName))
                                     .replace("%remaining%", esc(durationText))));
-                } else if (!offlinePlayer.hasPlayedBefore()) {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize(
-                            message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", esc(name))));
+                } else {
+                    // hasPlayedBefore() can hit disk — never call it on this
+                    // region thread. Hop async, then report back.
+                    Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+                        boolean played;
+                        try {
+                            played = offlinePlayer.hasPlayedBefore();
+                        } catch (RuntimeException e) {
+                            played = true;
+                        }
+                        if (!played) {
+                            Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                                if (isGone(sender)) return;
+                                sender.sendMessage(plugin.getMiniMessage().deserialize(
+                                        message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", esc(name))));
+                            });
+                        }
+                    });
                 }
 
                 sender.sendMessage(plugin.getMiniMessage().deserialize(

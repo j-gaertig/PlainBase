@@ -53,7 +53,7 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
 
         // Exact name first: Bukkit#getPlayer does prefix matching and could
         // kick the wrong player on a typo ("Alex" also matches "Alexander").
-        Player target = onlinePlayerExactFirst(args[0]);
+        Player target = onlinePlayerExactFirst(args[0], sender);
         if (target == null) {
             sender.sendMessage(plugin.getMiniMessage().deserialize(
                     message("player-not-online", "<red>%player% is not online.").replace("%player%", esc(args[0]))));

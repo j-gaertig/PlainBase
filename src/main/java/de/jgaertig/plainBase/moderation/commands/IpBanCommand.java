@@ -6,6 +6,7 @@ import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -33,7 +34,17 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
         if (!checkPreconditions(sender, "plainbase.moderation.banip", "banip")) return;
 
-        if (!plugin.getModerationConfig().getBoolean("ip-ban.enabled", true)) {
+        // Captured once (manager + config): a /plainbase reload racing the
+        // async hops below can null either mid-chain — stale locals keep the
+        // callback working instead of NPE-ing (same pattern as KickCommand).
+        BanManager manager = plugin.getBanManager();
+        FileConfiguration moderationConfig = plugin.getModerationConfig();
+        if (manager == null || moderationConfig == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            return;
+        }
+
+        if (!moderationConfig.getBoolean("ip-ban.enabled", true)) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>IP banning is currently disabled."));
             return;
         }
@@ -51,14 +62,9 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
 
-        // Captured once: a /plainbase reload racing the async hops below can
-        // null plugin.getBanManager() mid-chain — a stale local reference
-        // keeps the callback working instead of NPE-ing.
-        BanManager manager = plugin.getBanManager();
-
-        resolveIp(target, (ip, dbError) -> {
+        resolveIp(sender, target, (ip, dbError) -> {
             if (isGone(sender)) return;
-            if (manager == null) {
+            if (manager == null || moderationConfig == null) {
                 sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
                 return;
             }
@@ -158,7 +164,7 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
      * "ip-not-found" (a SQLException resolving to null would otherwise claim
      * the player simply never joined).
      */
-    private void resolveIp(String arg, BiConsumer<String, Boolean> callback) {
+    private void resolveIp(CommandSender sender, String arg, BiConsumer<String, Boolean> callback) {
         if (isIpLike(arg)) {
             // Normalize ("::ffff:1.2.3.4", leading zeros, ...) to canonical
             // form so stored, cached and checked values always compare equal.
@@ -168,7 +174,7 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
         // Exact name first: Bukkit#getPlayer does prefix matching and could
         // resolve (and ban the IP of) the wrong player on a typo.
-        Player online = onlinePlayerExactFirst(arg);
+        Player online = onlinePlayerExactFirst(arg, sender);
         if (online != null) {
             String onlineIp = normalizeIp(addressIp(online));
             if (onlineIp != null) {

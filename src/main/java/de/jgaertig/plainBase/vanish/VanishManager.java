@@ -24,10 +24,12 @@ public class VanishManager {
     }
 
     public boolean isVanished(Player player) {
+        if (player == null) return false;
         return isVanished(player.getUniqueId());
     }
 
     public boolean isVanished(UUID uuid) {
+        if (uuid == null) return false;
         return vanishedPlayers.contains(uuid);
     }
 
@@ -50,6 +52,7 @@ public class VanishManager {
      * @return true if the player is now vanished, false if un-vanished
      */
     public boolean toggleVanish(Player player) {
+        if (player == null) return false;
         if (isVanished(player)) {
             unvanish(player);
             return false;
@@ -59,6 +62,7 @@ public class VanishManager {
     }
 
     public void vanish(Player player) {
+        if (player == null || !player.isOnline()) return;
         vanishedPlayers.add(player.getUniqueId());
         applySelfState(player);
 
@@ -99,7 +103,9 @@ public class VanishManager {
     }
 
     public void unvanish(Player player) {
+        if (player == null) return;
         vanishedPlayers.remove(player.getUniqueId());
+        if (!player.isOnline()) return;
         resetSelfState(player);
 
         // V1 race fix (mirror of vanish): show immediately AND keep the
@@ -279,6 +285,7 @@ public class VanishManager {
 
     public boolean canSee(Player viewer, Player target) {
         try {
+            if (viewer == null || target == null) return false;
             if (viewer.equals(target)) return true;
             if (viewer.hasPermission("plainbase.vanish.see")) return true;
             FileConfiguration vanishConfig = plugin.getVanishConfig();
@@ -343,8 +350,13 @@ public class VanishManager {
 
     /**
      * Applies the player's own vanish state (visibility, collision, sounds).
+     * Folia: entity state is entity-thread-only — hops via the player's
+     * scheduler. Null- and isOnline-guarded both before scheduling (stale or
+     * offline callers like resetAll races) and inside the task (disconnect
+     * between scheduling and execution).
      */
     private void applySelfState(Player player) {
+        if (player == null || !player.isOnline()) return;
         // Snapshot for the synchronous part; the scheduler body re-reads the
         // config with a null-guard because stopModules() may have cleared it
         // between scheduling and execution (next tick) — the captured reference
@@ -352,6 +364,7 @@ public class VanishManager {
         final FileConfiguration snapshot = plugin.getVanishConfig();
 
         player.getScheduler().run(plugin, (t) -> {
+            if (!player.isOnline()) return;
             FileConfiguration config = plugin.getVanishConfig();
             if (config == null) config = snapshot;
             if (config == null) return;
@@ -366,7 +379,9 @@ public class VanishManager {
     }
 
     private void resetSelfState(Player player) {
+        if (player == null || !player.isOnline()) return;
         player.getScheduler().run(plugin, (t) -> {
+            if (!player.isOnline()) return;
             player.setInvisible(false);
             player.setCollidable(true);
             player.setSilent(false);

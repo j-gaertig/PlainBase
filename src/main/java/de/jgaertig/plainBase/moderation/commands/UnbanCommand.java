@@ -35,7 +35,17 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
 
-        resolveTarget(targetName, offlinePlayer -> {
+        // Captured once: a /plainbase reload racing the async hops below can
+        // null plugin.getBanManager() mid-chain — a stale local reference
+        // keeps the callback working instead of NPE-ing.
+        BanManager manager = plugin.getBanManager();
+
+        resolveTarget(sender, targetName, offlinePlayer -> {
+            if (isGone(sender)) return;
+            if (manager == null) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+                return;
+            }
             if (offlinePlayer == null) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
@@ -43,9 +53,9 @@ public class UnbanCommand extends ModerationCommandBase implements BasicCommand 
             }
 
             String name = displayName(offlinePlayer, targetName);
-            BanManager manager = plugin.getBanManager();
 
             manager.unbanPlayerAsync(offlinePlayer.getUniqueId(), staffUuid, staffName, unbanned -> {
+                if (isGone(sender)) return;
                 if (!unbanned) {
                     sender.sendMessage(plugin.getMiniMessage().deserialize(
                             message("not-banned", "<red>%player% is not currently banned. <gray>(Name change? Bans are UUID-based.)").replace("%player%", esc(name))));

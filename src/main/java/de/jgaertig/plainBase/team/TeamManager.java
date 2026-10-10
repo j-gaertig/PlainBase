@@ -64,11 +64,16 @@ public class TeamManager {
     private volatile Map<String, TeamDefinition> teams = Map.of();
 
     // teamId -> (uuid -> role)
-    private final Map<String, Map<UUID, Role>> memberships = new ConcurrentHashMap<>();
+    // Copy-on-write snapshots, replaced wholesale by loadState(): concurrent
+    // readers only ever see the old or the new complete map, never a
+    // half-cleared one (same pattern as the teams-Map above). Reads need no
+    // lock; the published maps themselves are never mutated in place by the
+    // reload path (live mutations operate on the current reference).
+    private volatile Map<String, Map<UUID, Role>> memberships = new ConcurrentHashMap<>();
     // uuid -> pending invite team ids
-    private final Map<UUID, Set<String>> invites = new ConcurrentHashMap<>();
+    private volatile Map<UUID, Set<String>> invites = new ConcurrentHashMap<>();
     // teamId -> pending join-request uuids
-    private final Map<String, Set<UUID>> requests = new ConcurrentHashMap<>();
+    private volatile Map<String, Set<UUID>> requests = new ConcurrentHashMap<>();
     // uuid -> the team currently mirrored on the vanilla scoreboard (see class javadoc).
     // NOTE (audit V21/V22, documented as open, not changed): entries are kept
     // across quit on purpose (offline targeting, relog resync via
@@ -354,7 +359,12 @@ public class TeamManager {
             if (!(staff instanceof Player viewer)) return false;
             var vanishManager = plugin.getVanishManager();
             if (vanishManager == null) return false;
-            Player maybe = Bukkit.getPlayer(targetName);
+            // Exact first: Bukkit#getPlayer does prefix matching and could
+            // deny a legitimate offline invite ("Alex") because a vanished
+            // "Alexander" shares the prefix. Only an exact online match can
+            // deny here; fuzzy vanished players are filtered in
+            // onlinePlayerExactFirst and fall through to offline lookup.
+            Player maybe = Bukkit.getPlayerExact(targetName);
             if (maybe != null && vanishManager.isVanished(maybe) && !vanishManager.canSee(viewer, maybe)) {
                 staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", targetName));
                 return true;
@@ -399,19 +409,23 @@ public class TeamManager {
         try {
             if (ownerUuid != null && id != null) {
                 if (isInvitePending) {
-                    Set<String> set = invites.get(ownerUuid);
-                    if (set != null) {
-                        set.remove(id);
-                        if (set.isEmpty()) invites.remove(ownerUuid);
-                        saveInvites();
+                    synchronized (INVITES_LOCK) {
+                        Set<String> set = invites.get(ownerUuid);
+                        if (set != null) {
+                            set.remove(id);
+                            if (set.isEmpty()) invites.remove(ownerUuid);
+                        }
                     }
+                    saveInvites();
                 } else {
-                    Set<UUID> set = requests.get(id);
-                    if (set != null) {
-                        set.remove(ownerUuid);
-                        if (set.isEmpty()) requests.remove(id);
-                        saveRequests();
+                    synchronized (REQUESTS_LOCK) {
+                        Set<UUID> set = requests.get(id);
+                        if (set != null) {
+                            set.remove(ownerUuid);
+                            if (set.isEmpty()) requests.remove(id);
+                        }
                     }
+                    saveRequests();
                 }
             }
         } catch (Exception e) {
@@ -454,7 +468,12 @@ public class TeamManager {
                     return;
                 }
 
-                invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
+                // Mutation under INVITES_LOCK (same lock as loadState/save):
+                // the stripe lock above serializes per-player check-then-act,
+                // the file lock serializes against reload swaps and saves.
+                synchronized (INVITES_LOCK) {
+                    invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
+                }
                 saveInvites();
                 staff.sendMessage(msg(cfgSnapshot, "invite-sent", "player", targetName, "team", id));
 
@@ -482,10 +501,12 @@ public class TeamManager {
                 return;
             }
 
-            invites.computeIfPresent(uuid, (k, set) -> {
-                set.remove(id);
-                return set.isEmpty() ? null : set;
-            });
+            synchronized (INVITES_LOCK) {
+                invites.computeIfPresent(uuid, (k, set) -> {
+                    set.remove(id);
+                    return set.isEmpty() ? null : set;
+                });
+            }
             saveInvites();
             setMember(uuid, id, Role.MEMBER);
             player.sendMessage(msg(cfgSnapshot, "invite-accepted", "team", id));
@@ -502,10 +523,12 @@ public class TeamManager {
             // T1: same ghost purge as accept.
             if (denyUnknownTeam(player, cfgSnapshot, id, uuid, true)) return;
 
-            invites.computeIfPresent(uuid, (k, set) -> {
-                set.remove(id);
-                return set.isEmpty() ? null : set;
-            });
+            synchronized (INVITES_LOCK) {
+                invites.computeIfPresent(uuid, (k, set) -> {
+                    set.remove(id);
+                    return set.isEmpty() ? null : set;
+                });
+            }
             saveInvites();
             player.sendMessage(msg(cfgSnapshot, "invite-denied", "team", id));
         }
@@ -532,10 +555,14 @@ public class TeamManager {
                     }
 
                     // Adding directly also clears any pending invite/request for this team.
-                    Set<String> pendingInvites = invites.get(uuid);
-                    if (pendingInvites != null) pendingInvites.remove(id);
-                    Set<UUID> pendingRequests = requests.get(id);
-                    if (pendingRequests != null) pendingRequests.remove(uuid);
+                    synchronized (INVITES_LOCK) {
+                        Set<String> pendingInvites = invites.get(uuid);
+                        if (pendingInvites != null) pendingInvites.remove(id);
+                    }
+                    synchronized (REQUESTS_LOCK) {
+                        Set<UUID> pendingRequests = requests.get(id);
+                        if (pendingRequests != null) pendingRequests.remove(uuid);
+                    }
                     saveInvites();
                     saveRequests();
 
@@ -638,7 +665,9 @@ public class TeamManager {
                 return;
             }
 
-            requests.computeIfAbsent(id, k -> ConcurrentHashMap.newKeySet()).add(uuid);
+            synchronized (REQUESTS_LOCK) {
+                requests.computeIfAbsent(id, k -> ConcurrentHashMap.newKeySet()).add(uuid);
+            }
             saveRequests();
             player.sendMessage(msg(cfgSnapshot, "request-sent", "team", id));
 
@@ -663,10 +692,12 @@ public class TeamManager {
                     staff.sendMessage(msg(cfgSnapshot, "request-not-found", "player", targetName, "team", id));
                     return;
                 }
-                requests.computeIfPresent(id, (k, set) -> {
-                    set.remove(uuid);
-                    return set.isEmpty() ? null : set;
-                });
+                synchronized (REQUESTS_LOCK) {
+                    requests.computeIfPresent(id, (k, set) -> {
+                        set.remove(uuid);
+                        return set.isEmpty() ? null : set;
+                    });
+                }
                 saveRequests();
                 staff.sendMessage(msg(cfgSnapshot, "request-reject-success", "player", targetName, "team", id));
 
@@ -868,13 +899,50 @@ public class TeamManager {
     }
 
     /**
+     * Online-player lookup that prefers an exact name match: Bukkit#getPlayer
+     * does prefix matching ("Alex" also matches "Alexander"), which could add
+     * or invite the wrong player on a typo. Exact first, fuzzy only as
+     * fallback — and the fuzzy fallback never resolves to a vanished player
+     * invisible to the viewer (falls through to offline lookup instead, same
+     * oracle protection as denyVanishedOracle).
+     */
+    private Player onlinePlayerExactFirst(String name, CommandSender viewer) {
+        if (name == null) return null;
+        Player exact;
+        try {
+            exact = Bukkit.getPlayerExact(name);
+        } catch (Exception e) {
+            return null;
+        }
+        if (exact != null) return exact;
+        Player fuzzy;
+        try {
+            fuzzy = Bukkit.getPlayer(name);
+        } catch (Exception e) {
+            return null;
+        }
+        if (fuzzy == null) return null;
+        if (viewer instanceof Player p) {
+            try {
+                var vanishManager = plugin.getVanishManager();
+                if (vanishManager != null && vanishManager.isVanished(fuzzy) && !vanishManager.canSee(p, fuzzy)) {
+                    return null;
+                }
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return fuzzy;
+    }
+
+    /**
      * Snapshot-aware variant: the caller passes the config captured at entry
      * so the async continuation never re-reads getTeamConfig() fresh (which
      * could be null after a concurrent reload). Same pattern as TeamCommand,
      * which snapshots its FileConfiguration once per execution.
      */
     private void resolveTarget(CommandSender staff, String name, FileConfiguration cfgSnapshot, Consumer<OfflinePlayer> callback) {
-        Player online = Bukkit.getPlayer(name);
+        Player online = onlinePlayerExactFirst(name, staff);
         if (online != null) {
             callback.accept(online);
             return;
@@ -889,12 +957,29 @@ public class TeamManager {
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             @SuppressWarnings("deprecation")
             OfflinePlayer resolved = Bukkit.getOfflinePlayer(name);
+            // hasPlayedBefore() can hit disk — capture it here off-thread and
+            // send the result along, never call it on the region thread below.
+            String resolvedName;
+            boolean played;
+            try {
+                resolvedName = resolved.getName();
+            } catch (RuntimeException e) {
+                resolvedName = null;
+            }
+            try {
+                played = resolved.hasPlayedBefore();
+            } catch (RuntimeException e) {
+                played = false;
+            }
+            String finalName = resolvedName;
+            boolean finalPlayed = played;
+            OfflinePlayer finalResolved = resolved;
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
-                if (resolved.getName() == null && !resolved.hasPlayedBefore()) {
+                if (finalName == null && !finalPlayed) {
                     staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", name));
                     return;
                 }
-                callback.accept(resolved);
+                callback.accept(finalResolved);
             });
         });
     }
@@ -917,7 +1002,15 @@ public class TeamManager {
     }
 
     private void setMember(UUID uuid, String teamId, Role role) {
-        memberships.computeIfAbsent(teamId, k -> new ConcurrentHashMap<>()).put(uuid, role);
+        // Mutation under MEMBERS_LOCK (same lock as loadState/save): the
+        // caller's stripe locks serialize check-then-act per player/team,
+        // this lock serializes against reload swaps and async saves.
+        // Lock order is always stripe lock(s) first, file lock last (leaf) —
+        // file locks are never held while acquiring a stripe lock, so no
+        // deadlock is possible.
+        synchronized (MEMBERS_LOCK) {
+            memberships.computeIfAbsent(teamId, k -> new ConcurrentHashMap<>()).put(uuid, role);
+        }
         saveMemberships();
         refreshScoreboardEntries(teamId);
         assignScoreboardTeam(uuid, teamId);
@@ -950,8 +1043,10 @@ public class TeamManager {
     }
 
     private void removeMember(UUID uuid, String teamId) {
-        Map<UUID, Role> members = memberships.get(teamId);
-        if (members != null) members.remove(uuid);
+        synchronized (MEMBERS_LOCK) {
+            Map<UUID, Role> members = memberships.get(teamId);
+            if (members != null) members.remove(uuid);
+        }
         saveMemberships();
         refreshScoreboardEntries(teamId);
         if (teamId.equals(scoreboardTeamOf.get(uuid))) {
@@ -1152,7 +1247,10 @@ public class TeamManager {
             return;
         }
         synchronized (MEMBERS_LOCK) {
-            memberships.clear();
+            // Built locally, then published atomically (copy-on-write swap like
+            // the teams-Map): concurrent readers only ever see the old or the
+            // new complete map, never a half-cleared one.
+            Map<String, Map<UUID, Role>> fresh = new ConcurrentHashMap<>();
             FileConfiguration members = YamlConfiguration.loadConfiguration(dataFile("members.yml"));
             for (String teamId : members.getKeys(false)) {
                 String norm = teamId.toLowerCase(Locale.ROOT);
@@ -1170,12 +1268,13 @@ public class TeamManager {
                     } catch (IllegalArgumentException ignored) {
                     }
                 }
-                if (!map.isEmpty()) memberships.put(norm, map);
+                if (!map.isEmpty()) fresh.put(norm, map);
             }
+            memberships = fresh;
         }
 
         synchronized (INVITES_LOCK) {
-            invites.clear();
+            Map<UUID, Set<String>> fresh = new ConcurrentHashMap<>();
             FileConfiguration invitesConfig = YamlConfiguration.loadConfiguration(dataFile("invites.yml"));
             for (String uuidStr : invitesConfig.getKeys(false)) {
                 try {
@@ -1190,14 +1289,15 @@ public class TeamManager {
                         }
                         set.add(norm);
                     }
-                    if (!set.isEmpty()) invites.put(uuid, set);
+                    if (!set.isEmpty()) fresh.put(uuid, set);
                 } catch (IllegalArgumentException ignored) {
                 }
             }
+            invites = fresh;
         }
 
         synchronized (REQUESTS_LOCK) {
-            requests.clear();
+            Map<String, Set<UUID>> fresh = new ConcurrentHashMap<>();
             FileConfiguration requestsConfig = YamlConfiguration.loadConfiguration(dataFile("requests.yml"));
             for (String teamId : requestsConfig.getKeys(false)) {
                 String norm = teamId.toLowerCase(Locale.ROOT);
@@ -1213,8 +1313,9 @@ public class TeamManager {
                     } catch (IllegalArgumentException ignored) {
                     }
                 }
-                if (!set.isEmpty()) requests.put(norm, set);
+                if (!set.isEmpty()) fresh.put(norm, set);
             }
+            requests = fresh;
         }
     }
 

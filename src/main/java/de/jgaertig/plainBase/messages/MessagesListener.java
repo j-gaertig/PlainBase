@@ -1,13 +1,17 @@
 package de.jgaertig.plainBase.messages;
 
 import de.jgaertig.plainBase.PlainBase;
+import net.kyori.adventure.text.Component;
+import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerKickEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 
 import java.util.List;
+import java.util.UUID;
 
 public class MessagesListener implements Listener {
 
@@ -42,22 +46,68 @@ public class MessagesListener implements Listener {
         var config = plugin.getMessagesConfig();
         if (config == null) return;
 
-        // join message (empty string = disabled)
-        String path = player.hasPlayedBefore() ? "messages.join" : "messages.first-join";
-        String raw = config.getString(path, "");
-        if (raw == null || raw.isBlank()) {
-            event.joinMessage(null);
-        } else {
-            try {
-                // B2 MiniMessage-injection guard: the player name is escaped
-                // BEFORE PlaceholderAPI/deserialize (same pattern as
-                // MenuManager#applyPlaceholdersSafe), so a name like "<red>"
-                // can never inject formatting or click events.
-                event.joinMessage(plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, raw)));
-            } catch (Exception e) {
-                plugin.getLogger().warning("Failed to format join message: " + e.getMessage());
-                event.joinMessage(null);
-            }
+        // Player#hasPlayedBefore() can hit disk — never call it on the join
+        // thread. Snapshot the cheap config strings sync, suppress the vanilla
+        // join line now, and resolve first-join vs returning off-thread
+        // (SpawnListener 55-58 pattern). The message is broadcast delayed
+        // instead of blocking the join.
+        String joinRaw = config.getString("messages.join", "");
+        String firstJoinRaw = config.getString("messages.first-join", "");
+        event.joinMessage(null);
+        UUID uuid = player.getUniqueId();
+        try {
+            Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+                boolean played;
+                try {
+                    played = Bukkit.getOfflinePlayer(uuid).hasPlayedBefore();
+                } catch (Exception e) {
+                    // Fail closed as a returning player (same as SpawnListener):
+                    // never fire first-join for a stranger on lookup failure.
+                    played = true;
+                }
+                String raw = played ? joinRaw : firstJoinRaw;
+                if (raw == null || raw.isBlank()) return;
+                try {
+                    player.getScheduler().run(plugin, t -> {
+                        try {
+                            if (!player.isOnline()) return;
+                            Component msg;
+                            try {
+                                // B2 MiniMessage-injection guard: the player name is escaped
+                                // BEFORE PlaceholderAPI/deserialize (same pattern as
+                                // MenuManager#applyPlaceholdersSafe), so a name like "<red>"
+                                // can never inject formatting or click events.
+                                msg = plugin.getMiniMessage().deserialize(applyPlaceholdersSafe(player, raw));
+                            } catch (Exception e) {
+                                plugin.getLogger().warning("Failed to format join message: " + e.getMessage());
+                                return;
+                            }
+                            // Event is long finished — broadcast the same component
+                            // to everyone (joinMessage semantics), plus console.
+                            try {
+                                for (Player online : Bukkit.getOnlinePlayers()) {
+                                    try {
+                                        online.sendMessage(msg);
+                                    } catch (Exception ignored) {
+                                    }
+                                }
+                                try {
+                                    Bukkit.getConsoleSender().sendMessage(msg);
+                                } catch (Exception ignored) {
+                                }
+                            } catch (Exception e) {
+                                plugin.getLogger().fine("Failed to broadcast join message: " + e.getMessage());
+                            }
+                        } catch (Exception e) {
+                            plugin.getLogger().fine("Failed to send delayed join message: " + e.getMessage());
+                        }
+                    }, null);
+                } catch (Exception e) {
+                    plugin.getLogger().fine("Failed to schedule delayed join message: " + e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to resolve join message: " + e.getMessage());
         }
 
         // motd
@@ -106,6 +156,26 @@ public class MessagesListener implements Listener {
                 plugin.getLogger().warning("Failed to format quit message: " + e.getMessage());
                 event.quitMessage(null);
             }
+        }
+    }
+
+    @EventHandler
+    public void onKick(PlayerKickEvent event) {
+        Player player = event.getPlayer();
+
+        // Defense-in-depth, mirrors onQuit: a kicked vanished player stays
+        // silent. Non-vanished kicks are left untouched (no custom kick
+        // message configured — only suppression, never formatting).
+        try {
+            var vanishManager = plugin.getVanishManager();
+            var vanishConfig = plugin.getVanishConfig();
+            if (vanishManager != null && vanishConfig != null
+                    && (vanishManager.isVanished(player) || vanishManager.hasPersistedVanish(player.getUniqueId()))
+                    && vanishConfig.getBoolean("vanish.hide-join-quit-messages", true)) {
+                event.leaveMessage(null);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check vanish kick state for " + player.getName() + ": " + e.getMessage());
         }
     }
 

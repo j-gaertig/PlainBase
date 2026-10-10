@@ -57,7 +57,9 @@ public final class PlainBase extends JavaPlugin {
     // ConcurrentHashMap: read off-thread (checkAllConfigVersions on the region
     // thread, GlobalListener admin-join warnings) while onEnable() writes.
     // A plain HashMap would risk visibility issues across threads.
-    private final Map<String, Double> latestVersions = new ConcurrentHashMap<>();
+    // Values are Strings (not Doubles) so "1.10" stays distinct from "1.1":
+    // a double would collapse both to 1.1 before the segment-wise compare.
+    private final Map<String, String> latestVersions = new ConcurrentHashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     // Volatile: read off-thread (VanishManager/TeamManager scheduler hops,
     // PlaceholderAPI expansion, Brigadier suggestions) while reloadModules()
@@ -89,15 +91,15 @@ public final class PlainBase extends JavaPlugin {
 
         saveDefaultConfig();
 
-        latestVersions.put("config.yml", 1.7);
-        latestVersions.put("spawn.yml", 1.2);
-        latestVersions.put("joinitems.yml", 1.2);
-        latestVersions.put("messages.yml", 1.1);
-        latestVersions.put("teleport.yml", 1.0);
-        latestVersions.put("vanish.yml", 1.1);
-        latestVersions.put("menu.yml", 1.1);
-        latestVersions.put("moderation.yml", 2.0);
-        latestVersions.put("team.yml", 1.2);
+        latestVersions.put("config.yml", "1.7");
+        latestVersions.put("spawn.yml", "1.2");
+        latestVersions.put("joinitems.yml", "1.2");
+        latestVersions.put("messages.yml", "1.1");
+        latestVersions.put("teleport.yml", "1.0");
+        latestVersions.put("vanish.yml", "1.1");
+        latestVersions.put("menu.yml", "1.1");
+        latestVersions.put("moderation.yml", "2.0");
+        latestVersions.put("team.yml", "1.2");
 
         registerPlaceholderExpansion();
 
@@ -484,8 +486,13 @@ public final class PlainBase extends JavaPlugin {
      * Bukkit.getGlobalRegionScheduler() before calling this.
      */
     public void reloadModules() {
-        stopModules();
+        // F1: reload the main config FIRST so stopModules() below decides on
+        // the NEW module flags (toggle-off must reveal vanished players even
+        // though the old in-memory config still said enabled). Module configs
+        // in the configs map are untouched by reloadConfig(), so the
+        // spawn/menu flush inside stopModules() still sees the old data.
         reloadConfig();
+        stopModules();
 
         // Each module is guarded so one broken module (corrupt config, dead
         // database, ...) disables only itself instead of killing every module
@@ -501,13 +508,37 @@ public final class PlainBase extends JavaPlugin {
         if (isModuleEnabled("moderation")) runModuleSetup("moderation", this::setupModeration);
         if (isModuleEnabled("team")) runModuleSetup("team", this::setupTeam);
 
-        ensureGlobalListener();
+        ensureGlobalListenerSafe();
 
         // Warning-only version check, also on every /plainbase reload/toggle:
         // an outdated module config after an update must be noticed even when
         // the server was never restarted. (onEnable() reaches this via
         // reloadModules(), so no separate call there.)
-        checkAllConfigVersions();
+        checkAllConfigVersionsSafe();
+    }
+
+    /**
+     * F6: tail-calls of reloadModules() must never kill the whole enable or
+     * leave later modules unstarted when they throw (a broken listener
+     * registration or a corrupt version value). Logged and skipped instead.
+     */
+    private void ensureGlobalListenerSafe() {
+        try {
+            ensureGlobalListener();
+        } catch (Exception e) {
+            getLogger().warning("Failed to register global listener: " + e.getMessage());
+        }
+    }
+
+    /**
+     * F6: see {@link #ensureGlobalListenerSafe()}.
+     */
+    private void checkAllConfigVersionsSafe() {
+        try {
+            checkAllConfigVersions();
+        } catch (Exception e) {
+            getLogger().warning("Failed to check config versions: " + e.getMessage());
+        }
     }
 
     /**
@@ -570,12 +601,20 @@ public final class PlainBase extends JavaPlugin {
 
         // Cache the vanish config BEFORE configs.clear() below: after clearing,
         // getVanishConfig() returns null and the persist check would NPE.
+        // vanishEnabled reads the NEW main config: reloadModules() calls
+        // reloadConfig() before stopModules() (F1), so a toggle-off already
+        // sees modules.vanish=false here. onDisable() has no prior reload and
+        // correctly sees the current flags.
         FileConfiguration vanishConfig = getVanishConfig();
         boolean vanishEnabled = getConfig().getBoolean("modules.vanish", false);
         boolean persist = vanishConfig != null && vanishConfig.getBoolean("vanish.persist-on-rejoin", true);
 
         if (broadcastManager != null) {
-            broadcastManager.stopBroadcasts();
+            try {
+                broadcastManager.stopBroadcasts();
+            } catch (Exception e) {
+                getLogger().fine("Failed to stop broadcasts: " + e.getMessage());
+            }
             broadcastManager = null;
         }
 
@@ -583,29 +622,64 @@ public final class PlainBase extends JavaPlugin {
         // persist-on-rejoin is disabled (reload must not keep anyone hidden).
         // A plain reload with persist enabled keeps vanished players hidden
         // and setupVanish() re-applies their state.
+        // F1: a throwing resetAll must not abort the rest of stopModules(),
+        // and a disabled module must drop the manager reference — otherwise
+        // the stale manager (and its hidden players) survives the toggle-off
+        // because setupVanish() never runs to replace it.
         if (vanishManager != null && (!vanishEnabled || !persist)) {
-            vanishManager.resetAll();
+            try {
+                vanishManager.resetAll();
+            } catch (Exception e) {
+                getLogger().fine("Failed to reset vanish state: " + e.getMessage());
+            }
+        }
+        if (!vanishEnabled) {
+            vanishManager = null;
         }
 
         // Close any open menu inventories before the listeners are
         // unregistered: an open menu whose clicks are no longer cancelled
         // would let players take items out of the GUI (duplication/exploit).
+        // Sync best-effort first so menus are confirmed closed before
+        // HandlerList.unregisterAll below; the deferred closeAllMenus() is
+        // only the backup for Folia entity-thread failures.
+        // Each step is isolated: a throwing manager must never abort the rest.
         if (menuManager != null) {
-            menuManager.closeAllMenus();
+            try {
+                menuManager.closeAllMenusSyncBestEffort();
+            } catch (Exception e) {
+                getLogger().fine("Failed to close menus (sync): " + e.getMessage());
+            }
+            try {
+                menuManager.closeAllMenus();
+            } catch (Exception e) {
+                getLogger().fine("Failed to close menus: " + e.getMessage());
+            }
         }
         menuManager = null;
 
         // Cancels the periodic cache-refresh task and closes the JDBC
         // connection pool cleanly instead of just dropping the reference.
+        // Null-guarded: getModerationConfig() may already be null when the
+        // module never started (BanManager.startPeriodicRefresh/shutdown must
+        // tolerate a null config the same way).
         if (banManager != null) {
-            banManager.shutdown();
+            try {
+                banManager.shutdown();
+            } catch (Exception e) {
+                getLogger().fine("Failed to shut down ban manager: " + e.getMessage());
+            }
         }
         banManager = null;
 
         // Unregisters the mirrored vanilla scoreboard teams so a disabled/reloaded
         // team module doesn't leave stale "pb_<id>" teams around.
         if (teamManager != null) {
-            teamManager.shutdown();
+            try {
+                teamManager.shutdown();
+            } catch (Exception e) {
+                getLogger().fine("Failed to shut down team manager: " + e.getMessage());
+            }
         }
         teamManager = null;
 
@@ -638,12 +712,20 @@ public final class PlainBase extends JavaPlugin {
         // moderation lookups), which expire on their own short timeout
         // instead of needing a central registry.
         // Vanish config is cached locally above, so unregistering first is safe.
-        org.bukkit.event.HandlerList.unregisterAll(this);
+        try {
+            org.bukkit.event.HandlerList.unregisterAll(this);
+        } catch (Exception e) {
+            getLogger().fine("Failed to unregister listeners: " + e.getMessage());
+        }
         // ConcurrentHashMap: clear() is safe against concurrent off-thread
         // reads (BanManager refresh, scheduler callbacks). Iterate a snapshot
         // copy anywhere we traverse the map so a concurrent clear()/put()
         // can never throw ConcurrentModificationException mid-iteration.
-        configs.clear();
+        try {
+            configs.clear();
+        } catch (Exception e) {
+            getLogger().fine("Failed to clear config cache: " + e.getMessage());
+        }
         // The unregister above also removed the global listener: drop the
         // reference so reloadModules() re-registers it via ensureGlobalListener().
         globalListener = null;
@@ -684,7 +766,7 @@ public final class PlainBase extends JavaPlugin {
         return configs;
     }
 
-    public Map<String, Double> getLatestVersions() {
+    public Map<String, String> getLatestVersions() {
         return latestVersions;
     }
 
@@ -748,10 +830,11 @@ public final class PlainBase extends JavaPlugin {
 
     /**
      * Normalizes a stored latest version for comparison. Null (unknown file)
-     * stays null so the caller skips the check.
+     * stays null so the caller skips the check. Takes a String (F2): the map
+     * holds version strings so "1.10" never collapses to "1.1" via double.
      */
-    private static String versionToString(Double version) {
-        return version == null ? null : version.toString();
+    private static String versionToString(String version) {
+        return version;
     }
 
     /**

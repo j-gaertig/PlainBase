@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.moderation.commands;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.moderation.BanManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.command.CommandSender;
@@ -51,7 +52,17 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         String staffName = sender.getName();
         String finalIp = ip;
 
-        plugin.getBanManager().unbanIpAsync(finalIp, staffUuid, staffName, unbanned -> {
+        // Captured once: a /plainbase reload racing the async hop below can
+        // null plugin.getBanManager() mid-chain — a stale local reference
+        // keeps the callback working instead of NPE-ing.
+        BanManager manager = plugin.getBanManager();
+        if (manager == null) {
+            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Moderation module is reloading, try again shortly."));
+            return;
+        }
+
+        manager.unbanIpAsync(finalIp, staffUuid, staffName, unbanned -> {
+            if (isGone(sender)) return;
             if (!unbanned) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize(
                         message("ip-not-banned", "<red>%ip% is not currently banned.").replace("%ip%", esc(finalIp))));
