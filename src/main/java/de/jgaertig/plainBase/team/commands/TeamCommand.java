@@ -103,7 +103,15 @@ public class TeamCommand implements BasicCommand {
         TeamManager teams = plugin.getTeamManager();
         FileConfiguration teamConfig = plugin.getTeamConfig();
 
-        if (!plugin.getConfig().getBoolean("modules.team", false)) {
+        // Root-config read under the central configLock (same monitor as
+        // PlainBaseCommand toggle/suggest): the instance is fetched INSIDE the
+        // lock since reloadConfig() may swap it at any time.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.team", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(mm("<red>This module is currently disabled."));
             return;
         }
@@ -248,7 +256,18 @@ public class TeamCommand implements BasicCommand {
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         TeamManager teams = plugin.getTeamManager();
         if (teams == null) return List.of();
-        if (!plugin.getConfig().getBoolean("modules.team", false)) return List.of();
+        // Root-config read under the central configLock (instance inside the
+        // lock, see execute() above).
+        try {
+            boolean suggestModuleEnabled;
+            synchronized (plugin.getConfigLock()) {
+                FileConfiguration rootCfg = plugin.getConfig();
+                suggestModuleEnabled = rootCfg != null && rootCfg.getBoolean("modules.team", false);
+            }
+            if (!suggestModuleEnabled) return List.of();
+        } catch (Exception e) {
+            return List.of();
+        }
         FileConfiguration teamCfg = plugin.getTeamConfig();
         if (teamCfg == null || !teamCfg.getBoolean("team.enabled", true)) return List.of();
         if (!teamCfg.getBoolean("team.commands.team.enabled", true)) return List.of();

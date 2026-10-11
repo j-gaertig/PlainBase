@@ -346,11 +346,13 @@ public class TeamManager {
     // ---------------------------------------------------------------
 
     public boolean isMember(UUID uuid, String teamId) {
+        if (uuid == null || teamId == null) return false;
         Map<UUID, Role> members = memberships.get(teamId.toLowerCase(Locale.ROOT));
         return members != null && members.containsKey(uuid);
     }
 
     public Role getRole(UUID uuid, String teamId) {
+        if (uuid == null || teamId == null) return null;
         Map<UUID, Role> members = memberships.get(teamId.toLowerCase(Locale.ROOT));
         return members != null ? members.get(uuid) : null;
     }

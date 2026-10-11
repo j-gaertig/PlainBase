@@ -51,6 +51,17 @@ public class RTPManager {
 
     public void startRTPProcess(Player player) {
         if (player == null || !player.isOnline()) return;
+        // Dead players must never start a search (warmup death always cancels
+        // via TeleportListener, this is the early reject for /rtp while dead).
+        try {
+            if (player.isDead()) {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>You cannot use RTP while dead."));
+                return;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check death state for " + player.getName() + ": " + e.getMessage());
+            return;
+        }
         if (isOnCooldown(player)) return;
 
         // Early TPA-warmup precheck (before setCooldown): a running TPA warmup
@@ -358,6 +369,17 @@ public class RTPManager {
 
     private void proceedToWarmup(Player player, Location foundLoc) {
         if (player == null || !player.isOnline()) return;
+        // Dead players must never enter a warmup (race guard when death lands
+        // between search and warmup). Refunds the cooldown like other aborts.
+        try {
+            if (player.isDead()) {
+                cooldowns.remove(player.getUniqueId());
+                return;
+            }
+        } catch (Exception e) {
+            cooldowns.remove(player.getUniqueId());
+            return;
+        }
 
         // Snapshot: this runs at the end of an async -> region -> player-thread
         // chain, so stopModules() may have cleared teleport.yml in between.
@@ -674,7 +696,9 @@ public class RTPManager {
         if (!ground.isSolid()) return false;
         if (ground == Material.LAVA || ground == Material.WATER || ground == Material.FIRE
                 || ground == Material.CACTUS || ground == Material.MAGMA_BLOCK
-                || ground == Material.CAMPFIRE || ground == Material.SOUL_CAMPFIRE) return false;
+                || ground == Material.CAMPFIRE || ground == Material.SOUL_CAMPFIRE
+                || ground == Material.WITHER_ROSE || ground == Material.SWEET_BERRY_BUSH
+                || ground == Material.POINTED_DRIPSTONE) return false;
 
         org.bukkit.block.Block b1 = loc.getBlock().getRelative(0, 1, 0);
         org.bukkit.block.Block b2 = loc.getBlock().getRelative(0, 2, 0);
@@ -698,10 +722,14 @@ public class RTPManager {
             Material head2 = b2.getType();
             if (head1 == Material.LAVA || head1 == Material.WATER || head1 == Material.FIRE
                     || head1 == Material.CACTUS || head1 == Material.MAGMA_BLOCK
-                    || head1 == Material.CAMPFIRE || head1 == Material.SOUL_CAMPFIRE) return false;
+                    || head1 == Material.CAMPFIRE || head1 == Material.SOUL_CAMPFIRE
+                    || head1 == Material.WITHER_ROSE || head1 == Material.SWEET_BERRY_BUSH
+                    || head1 == Material.POINTED_DRIPSTONE) return false;
             if (head2 == Material.LAVA || head2 == Material.WATER || head2 == Material.FIRE
                     || head2 == Material.CACTUS || head2 == Material.MAGMA_BLOCK
-                    || head2 == Material.CAMPFIRE || head2 == Material.SOUL_CAMPFIRE) return false;
+                    || head2 == Material.CAMPFIRE || head2 == Material.SOUL_CAMPFIRE
+                    || head2 == Material.WITHER_ROSE || head2 == Material.SWEET_BERRY_BUSH
+                    || head2 == Material.POINTED_DRIPSTONE) return false;
         }
 
         return true;

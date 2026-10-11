@@ -36,7 +36,15 @@ public abstract class ModerationCommandBase {
      * @return true if the command may proceed, false if it already sent a rejection message.
      */
     protected boolean checkPreconditions(CommandSender sender, String permissionNode, String commandKey) {
-        if (!plugin.getConfig().getBoolean("modules.moderation", false)) {
+        // Root-config read under the central configLock (same monitor as
+        // PlainBaseCommand toggle/suggest): the instance is fetched INSIDE the
+        // lock since reloadConfig() may swap it at any time.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return false;
         }
@@ -689,7 +697,12 @@ public abstract class ModerationCommandBase {
     protected List<String> suggestOnlinePlayers(CommandSender sender, String input, String permissionNode) {
         if (!hasSuggestPermission(sender, permissionNode)) return List.of();
         try {
-            if (!plugin.getConfig().getBoolean("modules.moderation", false)) return List.of();
+            boolean moduleEnabled;
+            synchronized (plugin.getConfigLock()) {
+                FileConfiguration rootCfg = plugin.getConfig();
+                moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+            }
+            if (!moduleEnabled) return List.of();
         } catch (Exception e) {
             return List.of();
         }

@@ -10,7 +10,7 @@ vanish:
   mobs-ignore: true               # Mobs don't target or look at vanished players
   pickup-block: true             # Vanished players don't pick up items
   hide-join-quit-messages: true   # No join/quit messages for vanished players
-  op-see: true                    # OPs (with plainbase.vanish.see) can see vanished players
+  op-see: true                    # OPs can see vanished players without needing plainbase.vanish.see
 
   world:
     enabled: true                 # /vanish world

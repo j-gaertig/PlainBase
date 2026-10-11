@@ -15,9 +15,11 @@ import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.player.PlayerAdvancementDoneEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerKickEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 
 public class VanishListener implements Listener {
 
@@ -143,6 +145,32 @@ public class VanishListener implements Listener {
             }
         } catch (Exception e) {
             plugin.getLogger().warning("Failed to handle vanish death state for " + event.getEntity().getName() + ": " + e.getMessage());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onRespawn(PlayerRespawnEvent event) {
+        // Respawn rebuilds client-side entity tracking — re-hide or the
+        // respawned player becomes visible to everyone for a tick.
+        try {
+            if (plugin.getVanishManager() != null) {
+                plugin.getVanishManager().rehide(event.getPlayer());
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to re-hide vanished player on respawn for " + event.getPlayer().getName() + ": " + e.getMessage());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onWorldChange(PlayerChangedWorldEvent event) {
+        // World change rebuilds client-side entity tracking — same re-hide
+        // as on respawn.
+        try {
+            if (plugin.getVanishManager() != null) {
+                plugin.getVanishManager().rehide(event.getPlayer());
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to re-hide vanished player on world change for " + event.getPlayer().getName() + ": " + e.getMessage());
         }
     }
 

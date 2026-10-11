@@ -60,10 +60,6 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
 
         resolveTarget(sender, targetName, offlinePlayer -> {
             if (isGone(sender)) return;
-            if (manager == null || moderationConfig == null) {
-                sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
-                return;
-            }
             if (offlinePlayer == null) {
                 sender.sendMessage(render(
                         message("player-not-found", "<red>Could not resolve player: %player%").replace("%player%", esc(targetName))));
@@ -111,7 +107,8 @@ public class BanCommand extends ModerationCommandBase implements BasicCommand {
                     kickSafely(online, render(
                             message("ban-screen", "<red>You are banned.\n<gray>Reason: %reason%")
                                     .replace("%reason%", esc(reason))
-                                    .replace("%staff%", esc(staffName))));
+                                    .replace("%staff%", esc(staffName))
+                                    .replace("%remaining%", "permanent")));
                 } else {
                     // hasPlayedBefore() can hit disk — never call it on this
                     // region thread. Hop async, then report back.

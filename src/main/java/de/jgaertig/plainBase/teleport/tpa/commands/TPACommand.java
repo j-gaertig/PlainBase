@@ -27,7 +27,14 @@ public class TPACommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.teleport", false)) {
+        // Root-config read under the central configLock: the instance is
+        // fetched INSIDE the lock since reloadConfig() may swap it.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.teleport", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
@@ -155,8 +162,15 @@ public class TPACommand implements BasicCommand {
             // Mirror execute() gates (silent for tab-completion): no
             // suggestions when the module/command is off, the teleport
             // config is reloading, or the sender lacks the TPA permission.
+            // Root-config read under the central configLock (instance inside
+            // the lock, see execute() above).
             try {
-                if (!plugin.getConfig().getBoolean("modules.teleport", false)) return List.of();
+                boolean suggestModuleEnabled;
+                synchronized (plugin.getConfigLock()) {
+                    FileConfiguration rootCfg = plugin.getConfig();
+                    suggestModuleEnabled = rootCfg != null && rootCfg.getBoolean("modules.teleport", false);
+                }
+                if (!suggestModuleEnabled) return List.of();
             } catch (Exception e) {
                 return List.of();
             }

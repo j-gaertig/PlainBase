@@ -85,7 +85,11 @@ public class BanManager {
         this.db = new ModerationDatabase(plugin);
         db.connect();
         startPeriodicRefresh();
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> refreshCacheBlocking());
+        try {
+            Bukkit.getAsyncScheduler().runNow(plugin, task -> refreshCacheBlocking());
+        } catch (RuntimeException e) {
+            plugin.getLogger().warning("Could not schedule moderation cache fill: " + e.getMessage());
+        }
     }
 
     public void shutdown() {
@@ -364,9 +368,15 @@ public class BanManager {
                 return;
             }
             BanRecord inserted = record;
-            synchronized (mutationLock) {
-                bansCache.add(inserted);
-                bansByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(inserted);
+            // Ghost-entry guard: id == -1 means generated keys were
+            // unavailable — never cache it (no real row id, would leak into
+            // banlist/baninfo/unban guards). The DB row still exists; the
+            // next periodic refresh picks it up with its real id.
+            if (inserted.id() != -1) {
+                synchronized (mutationLock) {
+                    bansCache.add(inserted);
+                    bansByUuid.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(inserted);
+                }
             }
             complete(() -> callback.accept(Optional.of(inserted), false));
         });
@@ -528,8 +538,12 @@ public class BanManager {
                 return;
             }
             IpBanRecord inserted = record;
-            synchronized (mutationLock) {
-                ipBansCache.add(inserted);
+            // Same ghost-entry guard as tryBanAsync (see there): id == -1 is
+            // never cached; the refresh picks the row up with its real id.
+            if (inserted.id() != -1) {
+                synchronized (mutationLock) {
+                    ipBansCache.add(inserted);
+                }
             }
             complete(() -> callback.accept(Optional.of(inserted), false));
         });
@@ -544,6 +558,12 @@ public class BanManager {
             callback.accept(false, true);
             return;
         }
+        // Canonicalize once at the entrance, identically to tryBanIpAsync:
+        // live-check, cache comparison and logging below must all use one
+        // spelling, otherwise " Reported" vs stored forms miss each other.
+        // Unparseable input keeps its raw value (no new rejection path).
+        String normalizedEntrance = ModerationCommandBase.normalizeIp(ip);
+        final String targetIp = normalizedEntrance != null ? normalizedEntrance : ip;
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             long now = System.currentTimeMillis();
             // Same active-only guard as unbanPlayerAsync: an expired
@@ -553,12 +573,12 @@ public class BanManager {
             List<Integer> guardIds = new ArrayList<>();
             boolean guardFailed = false;
             try {
-                guardIds.addAll(db.findActiveIpBanIds(ip, now));
+                guardIds.addAll(db.findActiveIpBanIds(targetIp, now));
             } catch (SQLException | RuntimeException e) {
-                plugin.getLogger().warning("Could not live-check IP ban for " + ip + ", falling back to cache: " + e.getMessage());
+                plugin.getLogger().warning("Could not live-check IP ban for " + targetIp + ", falling back to cache: " + e.getMessage());
                 guardFailed = true;
                 for (IpBanRecord r : ipBansCache) {
-                    if (r.ip() != null && r.ip().equals(ip) && r.isActive(now)) guardIds.add(r.id());
+                    if (r.ip() != null && r.ip().equals(targetIp) && r.isActive(now)) guardIds.add(r.id());
                 }
             }
             if (guardIds.isEmpty()) {
@@ -572,7 +592,7 @@ public class BanManager {
             try {
                 revoked = db.revokeIpBansByIds(guardIds, staffUuid, staffName, now);
             } catch (SQLException | RuntimeException e) {
-                plugin.getLogger().severe("Could not revoke IP ban for " + ip + ": " + e.getMessage());
+                plugin.getLogger().severe("Could not revoke IP ban for " + targetIp + ": " + e.getMessage());
                 complete(() -> callback.accept(false, true));
                 return;
             }

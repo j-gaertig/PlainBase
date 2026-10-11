@@ -2,6 +2,7 @@ package de.jgaertig.plainBase.placeholder;
 
 import de.jgaertig.plainBase.PlainBase;
 import me.clip.placeholderapi.expansion.PlaceholderExpansion;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 
@@ -64,7 +65,12 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
 
     @Override
     public @NotNull String getVersion() {
-        return plugin.getPluginMeta().getVersion();
+        try {
+            String version = plugin.getPluginMeta().getVersion();
+            return version != null ? version : "unknown";
+        } catch (Exception e) {
+            return "unknown";
+        }
     }
 
     @Override
@@ -80,7 +86,7 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
         // so team IDs (suffix after team_role_/team_members_) are NOT lowercased.
         String lower = params.toLowerCase(Locale.ROOT);
         return switch (lower) {
-            case "version" -> plugin.getPluginMeta().getVersion();
+            case "version" -> getVersion();
             case "vanished" -> player != null && plugin.getVanishManager() != null
                     && plugin.getVanishManager().isVanished(player) ? "true" : "false";
             case "moderation_bancount" -> player != null && plugin.getBanManager() != null
@@ -90,27 +96,18 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
             case "moderation_banned" -> player != null && plugin.getBanManager() != null
                     && plugin.getBanManager().getActiveBan(player.getUniqueId()).isPresent() ? "true" : "false";
 
-            // Spawn module
-            case "spawn_enabled" -> plugin.getSpawnConfig() != null
-                    && plugin.getSpawnConfig().getBoolean("spawn.enabled", false) ? "true" : "false";
-            case "spawn_world" -> plugin.getSpawnConfig() != null
-                    ? plugin.getSpawnConfig().getString("spawn.location.world", "") : "";
-            case "spawn_x" -> plugin.getSpawnConfig() != null
-                    ? String.valueOf(plugin.getSpawnConfig().getDouble("spawn.location.x", 0.0)) : "0.0";
-            case "spawn_y" -> plugin.getSpawnConfig() != null
-                    ? String.valueOf(plugin.getSpawnConfig().getDouble("spawn.location.y", 0.0)) : "0.0";
-            case "spawn_z" -> plugin.getSpawnConfig() != null
-                    ? String.valueOf(plugin.getSpawnConfig().getDouble("spawn.location.z", 0.0)) : "0.0";
-            case "firstspawn_enabled" -> plugin.getSpawnConfig() != null
-                    && plugin.getSpawnConfig().getBoolean("first-spawn.enabled", false) ? "true" : "false";
-            case "firstspawn_world" -> plugin.getSpawnConfig() != null
-                    ? plugin.getSpawnConfig().getString("first-spawn.location.world", "") : "";
-            case "firstspawn_x" -> plugin.getSpawnConfig() != null
-                    ? String.valueOf(plugin.getSpawnConfig().getDouble("first-spawn.location.x", 0.0)) : "0.0";
-            case "firstspawn_y" -> plugin.getSpawnConfig() != null
-                    ? String.valueOf(plugin.getSpawnConfig().getDouble("first-spawn.location.y", 0.0)) : "0.0";
-            case "firstspawn_z" -> plugin.getSpawnConfig() != null
-                    ? String.valueOf(plugin.getSpawnConfig().getDouble("first-spawn.location.z", 0.0)) : "0.0";
+            // Spawn module (spawn.yml reads under the instance monitor, same as
+            // Spawn/SetSpawn: writers mutate under synchronized(config)).
+            case "spawn_enabled" -> spawnFlag("spawn.enabled", false) ? "true" : "false";
+            case "spawn_world" -> spawnText("spawn.location.world", "");
+            case "spawn_x" -> String.valueOf(spawnNumber("spawn.location.x", 0.0));
+            case "spawn_y" -> String.valueOf(spawnNumber("spawn.location.y", 0.0));
+            case "spawn_z" -> String.valueOf(spawnNumber("spawn.location.z", 0.0));
+            case "firstspawn_enabled" -> spawnFlag("first-spawn.enabled", false) ? "true" : "false";
+            case "firstspawn_world" -> spawnText("first-spawn.location.world", "");
+            case "firstspawn_x" -> String.valueOf(spawnNumber("first-spawn.location.x", 0.0));
+            case "firstspawn_y" -> String.valueOf(spawnNumber("first-spawn.location.y", 0.0));
+            case "firstspawn_z" -> String.valueOf(spawnNumber("first-spawn.location.z", 0.0));
 
             // Teleport module
             case "teleport_tpa_autoaccept" -> player != null && plugin.getTPAManager() != null
@@ -152,6 +149,47 @@ public class PlainBaseExpansion extends PlaceholderExpansion {
     private String vanishCanSee(Player player) {
         if (player == null || plugin.getVanishManager() == null) return "false";
         return plugin.getVanishManager().canSeeVanished(player) ? "true" : "false";
+    }
+
+    /**
+     * Locked spawn.yml reads (Spawn-Muster): single snapshot per call, read
+     * under the instance monitor. Leaf-only (no configLock nesting).
+     */
+    private boolean spawnFlag(String path, boolean def) {
+        try {
+            FileConfiguration sc = plugin.getSpawnConfig();
+            if (sc == null) return def;
+            synchronized (sc) {
+                return sc.getBoolean(path, def);
+            }
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private String spawnText(String path, String def) {
+        try {
+            FileConfiguration sc = plugin.getSpawnConfig();
+            if (sc == null) return def;
+            synchronized (sc) {
+                String v = sc.getString(path, def);
+                return v != null ? v : def;
+            }
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private double spawnNumber(String path, double def) {
+        try {
+            FileConfiguration sc = plugin.getSpawnConfig();
+            if (sc == null) return def;
+            synchronized (sc) {
+                return sc.getDouble(path, def);
+            }
+        } catch (Exception e) {
+            return def;
+        }
     }
 
     private String handleTeamParameterized(Player player, String params) {

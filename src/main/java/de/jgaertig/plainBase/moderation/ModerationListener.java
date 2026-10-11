@@ -40,8 +40,15 @@ public class ModerationListener implements Listener {
         // This event runs OFF the main thread and the config object is
         // reload-mutable — a concurrent /plainbase reload can throw here.
         // Fail open (allow the login), never block all logins on a config race.
+        // Root-config read under the central configLock: the instance is
+        // fetched INSIDE the lock since reloadConfig() may swap it.
         try {
-            if (!plugin.getConfig().getBoolean("modules.moderation", false)) return;
+            boolean moduleEnabled;
+            synchronized (plugin.getConfigLock()) {
+                FileConfiguration rootCfg = plugin.getConfig();
+                moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+            }
+            if (!moduleEnabled) return;
         } catch (RuntimeException e) {
             return;
         }
@@ -173,7 +180,17 @@ public class ModerationListener implements Listener {
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onJoin(PlayerJoinEvent event) {
-        if (!plugin.getConfig().getBoolean("modules.moderation", false)) return;
+        // Root-config read under the central configLock (see onPreLogin).
+        try {
+            boolean moduleEnabled;
+            synchronized (plugin.getConfigLock()) {
+                FileConfiguration rootCfg = plugin.getConfig();
+                moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+            }
+            if (!moduleEnabled) return;
+        } catch (RuntimeException e) {
+            return;
+        }
 
         BanManager manager = plugin.getBanManager();
         if (manager == null) return;

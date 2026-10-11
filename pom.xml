@@ -67,6 +67,10 @@
                             <pattern>org.slf4j</pattern>
                             <shadedPattern>de.jgaertig.plainBase.libs.slf4j</shadedPattern>
                         </relocation>
+                        <!-- sqlite-jdbc is intentionally NOT relocated: its JNI native
+                             methods are bound to the org.sqlite.* class names, so
+                             relocation breaks the native .so linkage
+                             (UnsatisfiedLinkError on NativeDB._open_utf8). -->
                     </relocations>
                     <!-- JDBC drivers (sqlite-jdbc, mysql-connector-j) and HikariCP
                          register themselves via META-INF/services — this transformer
@@ -142,6 +146,17 @@
             <groupId>com.zaxxer</groupId>
             <artifactId>HikariCP</artifactId>
             <version>5.1.0</version>
+        </dependency>
+        <!-- SLF4J provider for the relocated slf4j-api (transitive via HikariCP
+             5.1.0 -> slf4j-api 2.0.17): without a provider LoggerFactory falls
+             back to System.err ("no provider" warning -> Paper nag about
+             System.err). slf4j-jdk14 (same version 2.0.17) routes via JUL,
+             which Paper handles; NOT simple/nop (simple prints to System.err).
+             Caught by the org.slf4j relocate + ServicesResourceTransformer. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-jdk14</artifactId>
+            <version>2.0.17</version>
         </dependency>
     </dependencies>
 </project>

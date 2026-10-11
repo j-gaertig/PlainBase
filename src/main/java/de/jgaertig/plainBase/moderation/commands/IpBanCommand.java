@@ -16,6 +16,7 @@ import java.util.UUID;
 import java.net.InetAddress;
 import java.sql.SQLException;
 import java.util.function.BiConsumer;
+import org.bukkit.OfflinePlayer;
 
 /**
  * /banip <ip-or-player> [reason] — bans a raw IP address, or resolves a
@@ -191,31 +192,45 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
             // garbage.
         }
 
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            // Reload race: the manager can be gone by the time this async
-            // task runs — resolve to "not found" instead of NPE-ing.
-            BanManager manager = plugin.getBanManager();
-            String lastIp = null;
-            boolean dbError = false;
-            if (manager == null) {
-                lastIp = null;
-            } else {
-                try {
-                    lastIp = manager.findLastIpByNameStrict(arg);
-                } catch (SQLException | RuntimeException e) {
-                    plugin.getLogger().warning("Could not look up last IP for " + arg + ": " + e.getMessage());
-                    dbError = true;
+        // Offline: resolve the exact profile first (phantom-guard via
+        // resolveTarget), then look up the last IP by UUID (stable across
+        // name changes). The name-based lookup is only the fallback when no
+        // UUID is known (uncached/never-joined name resolving to null).
+        resolveTarget(sender, arg, (OfflinePlayer offlinePlayer) -> {
+            final UUID targetUuid = offlinePlayer == null ? null : offlinePlayer.getUniqueId();
+            Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+                // Reload race: the manager can be gone by the time this async
+                // task runs — resolve to "not found" instead of NPE-ing.
+                BanManager manager = plugin.getBanManager();
+                String lastIp = null;
+                boolean dbError = false;
+                if (manager == null) {
+                    lastIp = null;
+                } else if (targetUuid != null) {
+                    try {
+                        lastIp = manager.findLastIpByUuidStrict(targetUuid);
+                    } catch (SQLException | RuntimeException e) {
+                        plugin.getLogger().warning("Could not look up last IP for " + arg + ": " + e.getMessage());
+                        dbError = true;
+                    }
+                } else {
+                    try {
+                        lastIp = manager.findLastIpByNameStrict(arg);
+                    } catch (SQLException | RuntimeException e) {
+                        plugin.getLogger().warning("Could not look up last IP for " + arg + ": " + e.getMessage());
+                        dbError = true;
+                    }
                 }
-            }
-            // Stored IPs were recorded via getHostAddress() already, but
-            // normalize defensively so legacy rows still match. A missing,
-            // blank, literal-"unknown" (legacy rows from before the listener
-            // skipped null addresses) or otherwise unparseable value resolves
-            // to null so the caller takes the ip-not-found path — it must
-            // NEVER be passed on as a bannable address.
-            String resolved = (!dbError && isUsableStoredIp(lastIp)) ? normalizeIp(lastIp) : null;
-            boolean finalDbError = dbError;
-            Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(resolved, finalDbError));
+                // Stored IPs were recorded via getHostAddress() already, but
+                // normalize defensively so legacy rows still match. A missing,
+                // blank, literal-"unknown" (legacy rows from before the listener
+                // skipped null addresses) or otherwise unparseable value resolves
+                // to null so the caller takes the ip-not-found path — it must
+                // NEVER be passed on as a bannable address.
+                String resolved = (!dbError && isUsableStoredIp(lastIp)) ? normalizeIp(lastIp) : null;
+                boolean finalDbError = dbError;
+                Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(resolved, finalDbError));
+            });
         });
     }
 

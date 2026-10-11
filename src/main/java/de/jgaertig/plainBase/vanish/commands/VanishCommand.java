@@ -28,7 +28,15 @@ public class VanishCommand implements BasicCommand {
     public void execute(@NotNull CommandSourceStack stack, @NotNull String @NotNull [] args) {
         CommandSender sender = stack.getSender();
 
-        if (!plugin.getConfig().getBoolean("modules.vanish", false)) {
+        // Root-config read under the central configLock (same monitor as
+        // PlainBaseCommand toggle/suggest): the instance is fetched INSIDE the
+        // lock since reloadConfig() may swap it at any time.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.vanish", false);
+        }
+        if (!moduleEnabled) {
             sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module is currently disabled."));
             return;
         }
@@ -221,8 +229,15 @@ public class VanishCommand implements BasicCommand {
     @Override
     public @NotNull List<String> suggest(@NotNull CommandSourceStack stack, @NotNull String @NonNull [] args) {
         // Mirror execute() guards: no suggestions when the module is off or unavailable.
+        // Root-config read under the central configLock (instance inside the
+        // lock, see execute() above).
         try {
-            if (!plugin.getConfig().getBoolean("modules.vanish", false)) return List.of();
+            boolean suggestModuleEnabled;
+            synchronized (plugin.getConfigLock()) {
+                FileConfiguration rootCfg = plugin.getConfig();
+                suggestModuleEnabled = rootCfg != null && rootCfg.getBoolean("modules.vanish", false);
+            }
+            if (!suggestModuleEnabled) return List.of();
         } catch (Exception e) {
             return List.of();
         }

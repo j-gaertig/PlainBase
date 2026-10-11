@@ -38,7 +38,14 @@ public class TeleportListener implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
-        if (!plugin.getConfig().getBoolean("modules.teleport", false)) return;
+        // Root-config read under the central configLock: the instance is
+        // fetched INSIDE the lock since reloadConfig() may swap it.
+        boolean moduleEnabled;
+        synchronized (plugin.getConfigLock()) {
+            org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
+            moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.teleport", false);
+        }
+        if (!moduleEnabled) return;
         if (plugin.getTPAManager() != null) {
             plugin.getTPAManager().loadPlayerData(event.getPlayer());
         }
@@ -46,7 +53,9 @@ public class TeleportListener implements Listener {
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        if (!plugin.getConfig().getBoolean("modules.teleport", false)) return;
+        // Unconditional cleanup: pending warmups/sessions must die with the
+        // player even when the teleport module is disabled — never gate this
+        // behind modules.teleport.
         Player player = event.getPlayer();
         try {
             if (plugin.getTPAManager() != null) {
@@ -140,6 +149,9 @@ public class TeleportListener implements Listener {
             // nothing to check against, same as the old NPE-caught path.
             if (cfg == null) return;
             if (cfg != cachedConfig) {
+                // Fresh config instance (reload): stale type warnings must not
+                // survive — a fixed-then-rebroken key has to warn again.
+                WARNED_TYPE_KEYS.clear();
                 cachedTpaCancelOn = List.copyOf(readCancelList(cfg, "tpa.counter.cancel_on"));
                 cachedRtpCancelOn = List.copyOf(readCancelList(cfg, "rtp.counter.cancel_on"));
                 cachedConfig = cfg;

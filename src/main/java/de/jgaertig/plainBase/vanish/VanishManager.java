@@ -153,6 +153,35 @@ public class VanishManager {
         }
     }
 
+    /**
+     * Re-hides an already-vanished player from all viewers (respawn /
+     * world-change path): the client rebuilds its entity tracking on both, so
+     * the hide must be re-applied. Same immediate + scheduled pattern as
+     * vanish()/applyOnJoin() — immediate hideEntity closes the 1-tick window,
+     * the scheduled hideFrom covers cross-region viewers that reject a direct
+     * call. No-ops for non-vanished players. Never throws.
+     */
+    public void rehide(Player player) {
+        if (player == null || !player.isOnline()) return;
+        if (!isVanished(player)) return;
+        for (Player viewer : Bukkit.getOnlinePlayers()) {
+            if (viewer.equals(player)) continue;
+            try {
+                if (!canSee(viewer, player)) {
+                    viewer.hideEntity(plugin, player);
+                }
+            } catch (Exception e) {
+                // Cross-region viewers may reject a direct hide call —
+                // fall back to the scheduled variant (never breaks vanish).
+            }
+            try {
+                hideFrom(viewer, player);
+            } catch (Exception ignored) {
+            }
+        }
+        detargetMobs(player);
+    }
+
     public void unvanish(Player player) {
         if (player == null) return;
         UUID uuid = player.getUniqueId();
@@ -620,6 +649,7 @@ public class VanishManager {
         try {
             if (viewer == null || target == null) return false;
             if (viewer.equals(target)) return true;
+            if (!isVanished(target)) return true;
             if (viewer.hasPermission("plainbase.vanish.see")) return true;
             FileConfiguration vanishConfig = plugin.getVanishConfig();
             if (vanishConfig != null && vanishConfig.getBoolean("vanish.op-see", true) && viewer.isOp()) return true;

@@ -118,7 +118,9 @@ public class SetSpawn implements BasicCommand {
                 plugin.getLogger().warning("Failed to check world border for /setspawn: " + e.getMessage());
             }
             // Spawn safety (warn-only): an obstructed spawn suffocates players
-            // on arrival. Never blocks saving — intentional admin setups (e.g.
+            // on arrival, damaging ground (magma, campfire, cactus, wither
+            // rose, berry bush — RTPManager ground rejects) hurts them.
+            // Never blocks saving — intentional admin setups (e.g.
             // enclosed spawn rooms) must keep working.
             try {
                 org.bukkit.block.Block feet = loc.getBlock();
@@ -131,12 +133,18 @@ public class SetSpawn implements BasicCommand {
                 } catch (Exception e) {
                     noGround = false;
                 }
-                if (obstructed || noGround) {
-                    String detail = obstructed ? "target block obstructed" : "no solid ground below";
+                boolean hazardous = false;
+                try {
+                    hazardous = isDamagingSpawnGround(ground.getType().name());
+                } catch (Exception e) {
+                    hazardous = false;
+                }
+                if (obstructed || noGround || hazardous) {
+                    String detail = obstructed ? "target block obstructed" : noGround ? "no solid ground below" : "damaging ground below";
                     plugin.getLogger().warning("/setspawn by " + player.getName() + ": location "
                             + String.format("%.1f, %.1f, %.1f", loc.getX(), loc.getY(), loc.getZ())
-                            + " in '" + loc.getWorld().getName() + "' may be unsafe (" + detail + ") — players may suffocate or fall.");
-                    player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Warning: this spawn location may be unsafe (" + detail + "). Players may suffocate or fall — move to a safe spot and re-run to silence this warning."));
+                            + " in '" + loc.getWorld().getName() + "' may be unsafe (" + detail + ") — players may suffocate, fall or take damage.");
+                    player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Warning: this spawn location may be unsafe (" + detail + "). Players may suffocate, fall or take damage — move to a safe spot and re-run to silence this warning."));
                 }
             } catch (Exception e) {
                 plugin.getLogger().fine("Failed to check spawn safety for /setspawn: " + e.getMessage());
@@ -148,6 +156,21 @@ public class SetSpawn implements BasicCommand {
         }
 
         player.sendMessage(plugin.getMiniMessage().deserialize("<green>Successfully set spawn location!"));
+    }
+
+    /**
+     * Damaging ground types (magma, campfire, cactus, wither rose, berry
+     * bush — RTPManager ground rejects). Name-based, no Material import.
+     */
+    private static boolean isDamagingSpawnGround(String materialName) {
+        if (materialName == null) return false;
+        return switch (materialName) {
+            case "LAVA", "WATER", "FIRE",
+                    "CACTUS", "MAGMA_BLOCK",
+                    "CAMPFIRE", "SOUL_CAMPFIRE",
+                    "WITHER_ROSE", "SWEET_BERRY_BUSH" -> true;
+            default -> false;
+        };
     }
 
     private double parseCoordinate(String arg, double current) {

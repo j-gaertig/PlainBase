@@ -23,7 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class MenuManager {
 
     private final PlainBase plugin;
-    private final Map<String, MenuDefinition> menus = new ConcurrentHashMap<>();
+    private volatile Map<String, MenuDefinition> menus = new ConcurrentHashMap<>();
 
     public record MenuDefinition(String name, String title, int size,
                                  Material fillMaterial, Map<Integer, ItemDefinition> items) {
@@ -78,56 +78,67 @@ public class MenuManager {
     }
 
     public void reloadMenus() {
-        menus.clear();
+        // Built locally, then published via volatile reference swap (same
+        // pattern as BanManager's copy-on-write swap): readers never observe
+        // the intermediate half-filled state a clear-then-parse-in-place leaves.
+        Map<String, MenuDefinition> fresh = new LinkedHashMap<>();
         FileConfiguration config = plugin.getMenuConfig();
-        if (config == null) return;
+        if (config == null) {
+            menus = new ConcurrentHashMap<>(fresh);
+            return;
+        }
+        synchronized (config) {
+            ConfigurationSection section = config.getConfigurationSection("menus");
 
-        ConfigurationSection section = config.getConfigurationSection("menus");
-        if (section == null) return;
-
-        for (String key : section.getKeys(false)) {
-            // A menu must be explicitly enabled to show up in /menu list|open.
-            // Default "true" keeps pre-existing configs (saved before this
-            // flag existed) working unchanged; the shipped example menu ships
-            // disabled so a fresh install doesn't expose an unreviewed demo.
-            if (!section.getBoolean(key + ".enabled", true)) continue;
-
-            String title = section.getString(key + ".title", key);
-            int size = section.getInt(key + ".size", 27);
-
-            Material fill = null;
-            String fillString = section.getString(key + ".fill-material");
-            if (fillString != null && !fillString.isEmpty()) {
-                fill = Material.matchMaterial(fillString);
+            if (section == null) {
+                menus = new ConcurrentHashMap<>(fresh);
+                return;
             }
+            for (String key : section.getKeys(false)) {
+                // A menu must be explicitly enabled to show up in /menu list|open.
+                // Default "true" keeps pre-existing configs (saved before this
+                // flag existed) working unchanged; the shipped example menu ships
+                // disabled so a fresh install doesn't expose an unreviewed demo.
+                if (!section.getBoolean(key + ".enabled", true)) continue;
 
-            Map<Integer, ItemDefinition> items = new LinkedHashMap<>();
-            ConfigurationSection itemsSection = section.getConfigurationSection(key + ".items");
-            if (itemsSection != null) {
-                // Slots are 0-indexed: a menu with size 27 uses slots 0-26.
-                // Out-of-range entries are skipped with a warning (a silent skip
-                // would leave admins staring at an empty menu, e.g. slot 54 in
-                // a size-27 menu from 1-indexed thinking).
-                int maxSlot = normalizeSize(size) - 1;
-                for (String slotKey : itemsSection.getKeys(false)) {
-                    try {
-                        int slot = Integer.parseInt(slotKey);
-                        if (slot < 0 || slot > maxSlot) {
-                            plugin.getLogger().warning("Slot '" + slotKey + "' in menu '" + key
-                                    + "' is out of range (size " + size + " allows 0-indexed slots 0-"
-                                    + maxSlot + "); item ignored.");
-                            continue;
+                String title = section.getString(key + ".title", key);
+                int size = section.getInt(key + ".size", 27);
+
+                Material fill = null;
+                String fillString = section.getString(key + ".fill-material");
+                if (fillString != null && !fillString.isEmpty()) {
+                    fill = Material.matchMaterial(fillString);
+                }
+
+                Map<Integer, ItemDefinition> items = new LinkedHashMap<>();
+                ConfigurationSection itemsSection = section.getConfigurationSection(key + ".items");
+                if (itemsSection != null) {
+                    // Slots are 0-indexed: a menu with size 27 uses slots 0-26.
+                    // Out-of-range entries are skipped with a warning (a silent skip
+                    // would leave admins staring at an empty menu, e.g. slot 54 in
+                    // a size-27 menu from 1-indexed thinking).
+                    int maxSlot = normalizeSize(size) - 1;
+                    for (String slotKey : itemsSection.getKeys(false)) {
+                        try {
+                            int slot = Integer.parseInt(slotKey);
+                            if (slot < 0 || slot > maxSlot) {
+                                plugin.getLogger().warning("Slot '" + slotKey + "' in menu '" + key
+                                        + "' is out of range (size " + size + " allows 0-indexed slots 0-"
+                                        + maxSlot + "); item ignored.");
+                                continue;
+                            }
+                            ItemDefinition def = parseItem(itemsSection, slotKey);
+                            if (def != null) items.put(slot, def);
+                        } catch (NumberFormatException ignored) {
+                            plugin.getLogger().warning("Invalid slot number '" + slotKey + "' in menu '" + key + "'");
                         }
-                        ItemDefinition def = parseItem(itemsSection, slotKey);
-                        if (def != null) items.put(slot, def);
-                    } catch (NumberFormatException ignored) {
-                        plugin.getLogger().warning("Invalid slot number '" + slotKey + "' in menu '" + key + "'");
                     }
                 }
-            }
 
-            menus.put(key, new MenuDefinition(key, title, size, fill, items));
+                fresh.put(key, new MenuDefinition(key, title, size, fill, items));
+            }
         }
+        menus = new ConcurrentHashMap<>(fresh);
     }
 
     private ItemDefinition parseItem(ConfigurationSection itemsSection, String key) {
@@ -431,9 +442,11 @@ public class MenuManager {
         // The name is player-typed (/menu new) and lands inside a MiniMessage
         // template — escape it so tags in the name cannot inject formatting or
         // click events into the stored title (same pattern as TeamManager#msg).
-        config.set(path + ".title", "<gray>" + plugin.getMiniMessage().escapeTags(name));
-        config.set(path + ".size", 27);
-        config.set(path + ".items", null);
+        synchronized (config) {
+            config.set(path + ".title", "<gray>" + plugin.getMiniMessage().escapeTags(name));
+            config.set(path + ".size", 27);
+            config.set(path + ".items", null);
+        }
         // Async persist: the in-memory config is already updated, so the
         // reloadMenus() below sees the change even before the disk write lands.
         plugin.saveMenuConfigAsync();
@@ -446,7 +459,9 @@ public class MenuManager {
             plugin.getLogger().warning("Cannot delete menu '" + name + "': menu.yml is not loaded.");
             return;
         }
-        config.set("menus." + name, null);
+        synchronized (config) {
+            config.set("menus." + name, null);
+        }
         // Async persist (see createMenu): in-memory state is authoritative here.
         plugin.saveMenuConfigAsync();
         // ORDERING (must stay close-before-reload): close open GUIs FIRST,

@@ -454,6 +454,13 @@ public class JoinItemsListener implements Listener {
     }
 
     @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        // Quit before respawn would otherwise leave a stale entry behind that
+        // suppresses a future, unrelated re-give (see keepInventoryDeaths).
+        keepInventoryDeaths.remove(event.getPlayer().getUniqueId());
+    }
+
+    @EventHandler
     public void onRespawn(PlayerRespawnEvent event) {
         Player player = event.getPlayer();
         // keepInventory guard: with the keep-inventory gamerule the player never
@@ -552,7 +559,7 @@ public class JoinItemsListener implements Listener {
             return cfg.getStringList("items." + configKey + ".flags")
                     .contains(flag);
         } catch (Exception e) {
-            return false;
+            return true;
         }
     }
 

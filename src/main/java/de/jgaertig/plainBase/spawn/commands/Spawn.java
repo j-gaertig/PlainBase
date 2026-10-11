@@ -166,6 +166,7 @@ public class Spawn implements BasicCommand {
             return;
         }
 
+        try {
         player.teleportAsync(loc).thenAccept(success -> {
             // thenAccept runs off the entity thread: hop back onto the
             // EntityScheduler for sendMessage (Folia scheduler retained).
@@ -186,6 +187,14 @@ public class Spawn implements BasicCommand {
                 plugin.getLogger().warning("Failed to schedule spawn teleport notify for " + player.getName() + ": " + e.getMessage());
             }
         });
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to start spawn teleport for " + player.getName() + ": " + e.getMessage());
+            try {
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again or contact an admin!"));
+            } catch (Exception ex) {
+                plugin.getLogger().warning("Failed to notify " + player.getName() + " about spawn teleport failure: " + ex.getMessage());
+            }
+        }
 
     }
 
@@ -200,6 +209,8 @@ public class Spawn implements BasicCommand {
         try {
             if (world == null || loc == null) return loc;
             if (isSpawnSpotSafe(loc)) return loc;
+            String reason = unsafeSpawnReason(loc);
+            if (reason == null) reason = "obstructed";
             Location found = null;
             int foundOffset = 0;
             for (int i = 1; i <= 5; i++) {
@@ -214,13 +225,13 @@ public class Spawn implements BasicCommand {
             }
             if (found != null) {
                 plugin.getLogger().warning("Spawn teleport for " + player.getName()
-                        + ": configured location obstructed, using safe spot +" + foundOffset + " up.");
-                player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Spawn location was obstructed, using nearest safe spot instead. Contact an admin!"));
+                        + ": configured location unsafe (" + reason + "), using safe spot +" + foundOffset + " up.");
+                player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Spawn location was unsafe (" + reason + "), using nearest safe spot instead. Contact an admin!"));
                 return found;
             }
             plugin.getLogger().warning("Spawn teleport for " + player.getName()
-                    + ": configured location obstructed and no safe spot found within +5, teleporting anyway.");
-            player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Warning: spawn location looks obstructed. Contact an admin!"));
+                    + ": configured location unsafe (" + reason + ") and no safe spot found within +5, teleporting anyway.");
+            player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Warning: spawn location looks unsafe (" + reason + "). Contact an admin!"));
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to check spawn safety for " + player.getName() + ": " + e.getMessage());
         }
@@ -228,15 +239,53 @@ public class Spawn implements BasicCommand {
     }
 
     private boolean isSpawnSpotSafe(Location cand) {
+        return unsafeSpawnReason(cand) == null;
+    }
+
+    /**
+     * Null when the spot is safe, otherwise a short human-readable reason
+     * (obstructed / no solid ground / damaging ground). Fail-open: a lookup
+     * error yields null so the teleport is never blocked.
+     */
+    private String unsafeSpawnReason(Location cand) {
         try {
             org.bukkit.block.Block feet = cand.getBlock();
             org.bukkit.block.Block head = cand.clone().add(0, 1, 0).getBlock();
             org.bukkit.block.Block ground = cand.clone().add(0, -1, 0).getBlock();
-            if (!feet.isPassable() || !head.isPassable()) return false;
-            return ground.getType().isSolid();
+            if (!feet.isPassable() || !head.isPassable()) return "obstructed";
+            String groundName;
+            boolean solid;
+            try {
+                solid = ground.getType().isSolid();
+                groundName = ground.getType().name();
+            } catch (Exception e) {
+                return null;
+            }
+            if (!solid) return "no solid ground below";
+            try {
+                if (isDamagingSpawnGround(groundName)) return "damaging ground below";
+            } catch (Exception e) {
+                return null;
+            }
         } catch (Exception e) {
             // Fail-open: a lookup error must never block the teleport.
-            return true;
+            return null;
         }
+        return null;
+    }
+
+    /**
+     * Damaging ground types (magma, campfire, cactus, wither rose, berry
+     * bush — RTPManager ground rejects). Name-based, no Material import.
+     */
+    private static boolean isDamagingSpawnGround(String materialName) {
+        if (materialName == null) return false;
+        return switch (materialName) {
+            case "LAVA", "WATER", "FIRE",
+                    "CACTUS", "MAGMA_BLOCK",
+                    "CAMPFIRE", "SOUL_CAMPFIRE",
+                    "WITHER_ROSE", "SWEET_BERRY_BUSH" -> true;
+            default -> false;
+        };
     }
 }

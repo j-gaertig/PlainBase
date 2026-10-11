@@ -351,6 +351,16 @@ public class TPAManager {
 
     private void startTeleportProcedure(Player requester, Player target, RequestType type) {
         if (requester == null || target == null) return;
+        // Dead players must never start a teleport (warmup death always
+        // cancels via TeleportListener, this is the race guard when death
+        // lands between accept and procedure start). Silent like the
+        // performTeleport race guard below.
+        try {
+            if (requester.isDead() || target.isDead()) return;
+        } catch (Exception e) {
+            plugin.getLogger().fine("Failed to check death state for TPA teleport: " + e.getMessage());
+            return;
+        }
         // Re-validate visibility at procedure start (covers the tpauto
         // instant-accept path in sendRequest as well as acceptIfPresent).
         if (isBlockedByVanish(requester, target)) {
@@ -461,6 +471,37 @@ public class TPAManager {
         }
     }
 
+    /**
+     * Damaging ground types that must never be a TPA arrival spot, even when
+     * solid (mirrors the RTPManager ground hazard rejects). Name-based so
+     * version renames can never slip through on any Paper build.
+     */
+    private static boolean isDamagingGroundBlock(String materialName) {
+        if (materialName == null) return false;
+        return switch (materialName) {
+            case "LAVA", "WATER", "FIRE",
+                    "CACTUS", "MAGMA_BLOCK",
+                    "CAMPFIRE", "SOUL_CAMPFIRE",
+                    "WITHER_ROSE", "SWEET_BERRY_BUSH" -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Hardcoded always-unsafe block basis, same as
+     * RTPManager#isAlwaysUnsafeBlock: applied independently of any config.
+     */
+    private static boolean isAlwaysUnsafeBlock(String materialName) {
+        if (materialName == null) return false;
+        return switch (materialName) {
+            case "BEDROCK", "BARRIER",
+                    "PORTAL", "NETHER_PORTAL",
+                    "END_PORTAL", "ENDER_PORTAL", "END_GATEWAY",
+                    "POWDER_SNOW" -> true;
+            default -> false;
+        };
+    }
+
     private void performTeleport(Player toTeleport, Player destination) {
         if (toTeleport == null || destination == null) return;
         if (!toTeleport.isOnline() || !destination.isOnline()) return;
@@ -531,10 +572,30 @@ public class TPAManager {
                         continue;
                     }
                     if (!feet.isPassable() || !head.isPassable()) continue;
+                    // Headroom hazards: passable but unnavigable/harmful blocks
+                    // (portal, powder snow — same always-unsafe basis as
+                    // RTPManager) must never be an arrival spot.
+                    try {
+                        if (isAlwaysUnsafeBlock(feet.getType().name())
+                                || isAlwaysUnsafeBlock(head.getType().name())) continue;
+                    } catch (Exception e) {
+                        continue;
+                    }
                     // Ground stability: never arrive floating — the block
                     // below must be solid to stand on.
                     try {
                         if (!ground.getType().isSolid()) continue;
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    // Hazard ground: damaging blocks (magma, campfire, cactus,
+                    // wither rose, berry bush — RTPManager ground rejects) must
+                    // never be an arrival spot, even when solid. Always-unsafe
+                    // ground (bedrock, barrier, portal, ...) likewise.
+                    try {
+                        String groundName = ground.getType().name();
+                        if (groundName.contains("LEAVES")) continue;
+                        if (isDamagingGroundBlock(groundName) || isAlwaysUnsafeBlock(groundName)) continue;
                     } catch (Exception e) {
                         continue;
                     }
@@ -569,7 +630,8 @@ public class TPAManager {
                     }
                     return;
                 }
-                toTeleport.teleportAsync(arrivalLoc).thenAccept(success -> {
+                try {
+                    toTeleport.teleportAsync(arrivalLoc).thenAccept(success -> {
                     // thenAccept runs off the entity thread: hop back onto the
                     // teleporting player's EntityScheduler for sendMessage
                     // (Folia Region/EntityScheduler is retained everywhere).
@@ -589,7 +651,18 @@ public class TPAManager {
                     } catch (Exception e) {
                         plugin.getLogger().fine("Failed to schedule TPA teleport notify for " + toTeleport.getName() + ": " + e.getMessage());
                     }
-                });
+                    });
+                } catch (Exception e) {
+                    plugin.getLogger().fine("Failed to start TPA teleport for " + toTeleport.getName() + ": " + e.getMessage());
+                    try {
+                        toTeleport.getScheduler().run(plugin, tFail -> {
+                            if (toTeleport.isOnline()) {
+                                toTeleport.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
+                            }
+                        }, null);
+                    } catch (Exception ignored) {
+                    }
+                }
             }, null);
         }, null);
     }
@@ -597,9 +670,11 @@ public class TPAManager {
     public void cancelWarmup(Player p, String reason) {
         if (p == null) return;
         ScheduledTask task = activeWarmups.remove(p.getUniqueId());
-        removeWarmupPartner(p.getUniqueId());
         if (task != null) {
             task.cancel();
+            // Anchor mapping is owned by a live warmup: only drop it when a
+            // task was actually cancelled, never on a no-op call.
+            removeWarmupPartner(p.getUniqueId());
             if (p.isOnline()) {
                 p.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport cancelled: " + reason));
             }

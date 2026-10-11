@@ -26,25 +26,37 @@ public class BroadcastManager {
         stopBroadcasts();
         var messagesConfig = plugin.getMessagesConfig();
         if (messagesConfig == null) return;
-        ConfigurationSection section = messagesConfig.getConfigurationSection("broadcasts");
-        if (section == null || !section.getBoolean("enabled", false)) return;
+        // Snapshot flags/texts under synchronized(messagesConfig) (module
+        // configs are guarded per-instance, see PlainBase#getConfigs) — the
+        // scheduling/sending below runs outside the lock so slow scheduler
+        // calls never hold it.
+        record BroadcastDef(String key, String text, long cooldownSeconds) {}
+        List<BroadcastDef> defs = new java.util.ArrayList<>();
+        synchronized (messagesConfig) {
+            ConfigurationSection section = messagesConfig.getConfigurationSection("broadcasts");
+            if (section == null || !section.getBoolean("enabled", false)) return;
 
-        for (String key : section.getKeys(false)) {
-            if (key.equals("enabled")) continue;
+            for (String key : section.getKeys(false)) {
+                if (key.equals("enabled")) continue;
 
-            String text = section.getString(key + ".text");
-            if (text == null || text.isBlank()) {
-                plugin.getLogger().warning("Empty broadcast text for '" + key + "', skipping.");
-                continue;
+                String text = section.getString(key + ".text");
+                if (text == null || text.isBlank()) {
+                    plugin.getLogger().warning("Empty broadcast text for '" + key + "', skipping.");
+                    continue;
+                }
+
+                // Clamp like tpa.request_timeout: negative/huge values must never
+                // leak into the scheduler delay (huge values could overflow ticks).
+                long cooldownSeconds = Math.max(5, Math.min(86400, section.getLong(key + ".cooldown", 60)));
+                defs.add(new BroadcastDef(key, text, cooldownSeconds));
             }
+        }
 
-            // Clamp like tpa.request_timeout: negative/huge values must never
-            // leak into the scheduler delay (huge values could overflow ticks).
-            long cooldownSeconds = Math.max(5, Math.min(86400, section.getLong(key + ".cooldown", 60)));
-            long ticks = cooldownSeconds * 20L; // At least 5 seconds cooldown
+        for (BroadcastDef def : defs) {
+            long ticks = def.cooldownSeconds() * 20L; // At least 5 seconds cooldown
 
-            final String broadcastKey = key;
-            final String broadcastText = text;
+            final String broadcastKey = def.key();
+            final String broadcastText = def.text();
             ScheduledTask task = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, (t) -> {
                 try {
                     // Placeholders are resolved per recipient so player-specific

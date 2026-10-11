@@ -197,7 +197,8 @@ public class PlainBaseCommand implements BasicCommand {
         }
 
         if (args.length >= 1 && args[0].equalsIgnoreCase("update")) {
-            String serverVersion = Bukkit.getMinecraftVersion();
+            final String serverVersionRaw = Bukkit.getMinecraftVersion();
+            final String serverVersion = serverVersionRaw == null ? "unknown" : serverVersionRaw;
             String safeVersion = plugin.getMiniMessage().escapeTags(serverVersion);
             sender.sendMessage(plugin.getMiniMessage().deserialize("<gray>Checking for updates for Minecraft " + safeVersion + "..."));
 
@@ -228,7 +229,9 @@ public class PlainBaseCommand implements BasicCommand {
                     }
 
                     String currentVersion = plugin.getPluginMeta().getVersion();
-                    String safeLatest = plugin.getMiniMessage().escapeTags(latestVersion);
+                    if (currentVersion == null) currentVersion = "unknown";
+                    String latestSafe = latestVersion == null ? "unknown" : latestVersion;
+                    String safeLatest = plugin.getMiniMessage().escapeTags(latestSafe);
                     String safeCurrent = plugin.getMiniMessage().escapeTags(currentVersion);
                     if (compareVersions(currentVersion, latestVersion) >= 0) {
                         sender.sendMessage(plugin.getMiniMessage().deserialize("<green>You are running the latest version! (" + safeCurrent + ")"));
