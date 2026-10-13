@@ -228,19 +228,16 @@ public class ModerationDatabase {
                 HikariDataSource ds = dataSource;
                 if (ds == null || ds.isClosed()) return;
                 try (Connection conn = ds.getConnection()) {
-                    normalizeUuidCase(conn);
-                    normalizeIpSpellings(conn);
+                    boolean uuidDone = normalizeUuidCase(conn);
+                    boolean ipDone = normalizeIpSpellings(conn);
+                    normalizationDone = uuidDone && ipDone;
                 } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().warning("Could not normalize moderation legacy data: " + e.getMessage());
-                } finally {
-                    normalizationDone = true;
                 }
             });
         } catch (RuntimeException e) {
             plugin.getLogger().warning("Could not schedule moderation normalization: " + e.getMessage());
-            // Scheduling failed: normalization will never run, so mark it done
-            // to avoid the per-login LOWER fallback forever.
-            normalizationDone = true;
+            // Keep fallback reads enabled: legacy rows may still be present.
         }
     }
 
@@ -471,7 +468,7 @@ public class ModerationDatabase {
      * Rows created from now on are already lowercase, so this converges to a
      * no-op on the second start.
      */
-    private void normalizeUuidCase(Connection conn) {
+    private boolean normalizeUuidCase(Connection conn) {
         String p = prefix();
         String[] statements = {
                 "UPDATE " + p + "bans SET uuid = lower(uuid) WHERE uuid != lower(uuid)",
@@ -483,13 +480,16 @@ public class ModerationDatabase {
                 "UPDATE " + p + "ip_bans SET unbanned_by_uuid = lower(unbanned_by_uuid) WHERE unbanned_by_uuid IS NOT NULL AND unbanned_by_uuid != lower(unbanned_by_uuid)",
                 "UPDATE " + p + "player_ips SET uuid = lower(uuid) WHERE uuid != lower(uuid)",
         };
+        boolean complete = true;
         for (String sql : statements) {
             try (Statement st = conn.createStatement()) {
                 st.executeUpdate(sql);
             } catch (SQLException e) {
                 plugin.getLogger().warning("Could not normalize UUID case (" + sql + "): " + e.getMessage());
+                complete = false;
             }
         }
+        return complete;
     }
 
     /**
@@ -502,13 +502,13 @@ public class ModerationDatabase {
      * normalizes, no new tables. Rows created from now on are already
      * canonical, so this converges to a no-op on the second start.
      */
-    private void normalizeIpSpellings(Connection conn) {
+    private boolean normalizeIpSpellings(Connection conn) {
         String p;
         try {
             p = prefix();
         } catch (RuntimeException e) {
             plugin.getLogger().warning("Could not normalize IP spellings: " + e.getMessage());
-            return;
+            return false;
         }
         // ip_bans: id -> canonical ip for rows that differ.
         // Collect-then-update on purpose: the SELECT cursor (ResultSet +
@@ -535,8 +535,9 @@ public class ModerationDatabase {
             }
         } catch (SQLException | RuntimeException e) {
             plugin.getLogger().warning("Could not normalize IP ban spellings: " + e.getMessage());
-            return;
+            return false;
         }
+        boolean complete = true;
         try (PreparedStatement upd = conn.prepareStatement("UPDATE " + p + "ip_bans SET ip = ? WHERE id = ?")) {
             for (int i = 0; i < ids.size(); i++) {
                 try {
@@ -545,10 +546,12 @@ public class ModerationDatabase {
                     upd.executeUpdate();
                 } catch (SQLException e) {
                     plugin.getLogger().warning("Could not normalize IP ban id " + ids.get(i)[0] + ": " + e.getMessage());
+                    complete = false;
                 }
             }
         } catch (SQLException | RuntimeException e) {
             plugin.getLogger().warning("Could not normalize IP ban spellings: " + e.getMessage());
+            complete = false;
         }
         // player_ips: uuid -> canonical last_ip for rows that differ.
         // Same collect-then-update split as above (SQLite lock, see above).
@@ -572,7 +575,7 @@ public class ModerationDatabase {
             }
         } catch (SQLException | RuntimeException e) {
             plugin.getLogger().warning("Could not normalize player IP spellings: " + e.getMessage());
-            return;
+            return false;
         }
         try (PreparedStatement upd = conn.prepareStatement("UPDATE " + p + "player_ips SET last_ip = ? WHERE uuid = ?")) {
             for (int i = 0; i < uuids.size(); i++) {
@@ -582,11 +585,14 @@ public class ModerationDatabase {
                     upd.executeUpdate();
                 } catch (SQLException e) {
                     plugin.getLogger().warning("Could not normalize player IP for " + uuids.get(i) + ": " + e.getMessage());
+                    complete = false;
                 }
             }
         } catch (SQLException | RuntimeException e) {
             plugin.getLogger().warning("Could not normalize player IP spellings: " + e.getMessage());
+            complete = false;
         }
+        return complete;
     }
 
     /**
@@ -605,14 +611,9 @@ public class ModerationDatabase {
 
     /**
      * Partial uniqueness: at most one unrevoked row per uuid/ip. SQLite
-     * supports partial indexes natively; MySQL has no partial-index support
-     * (portably), so there this is best-effort only — the application-level
-     * live check inside BanManager's mutationLock plus revoke-by-key (row
-     * count decides success) prevent duplicates on a single server, while a
-     * genuinely simultaneous cross-server race on shared MySQL stays
-     * last-write-wins (documented limitation; a SELECT ... FOR UPDATE
-     * transaction around check-then-insert would be the full fix and is left
-     * out deliberately to avoid a schema/locking behaviour change here).
+     * supports partial indexes natively. MySQL lacks portable partial unique
+     * indexes, so inserts serialize cross-server through a connection-scoped
+     * named lock and recheck active rows before retiring expired rows/inserting.
      */
     private void createPartialUniqueIndex(Statement st, String indexName, String table, String column) {
         if (mysql) return; // no partial-index support — best-effort no-op (see javadoc)
@@ -646,43 +647,118 @@ public class ModerationDatabase {
 
     // ---- Writes ----
 
+    /** Indicates another server already created an active ban while this write waited. */
+    public static final class ActiveBanExistsException extends SQLException {
+        public ActiveBanExistsException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Cross-server serialization for MySQL, which cannot use the partial
+     * unique active-row indexes created for SQLite. Lock names stay below
+     * MySQL's 64-character limit and are stable across plugin instances.
+     */
+    private String advisoryLockName(String kind, String key) throws SQLException {
+        String prefixHash = Integer.toUnsignedString(prefixChecked().hashCode(), 16);
+        String keyToken = UUID.nameUUIDFromBytes(key.getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
+        return "PB:" + prefixHash + ":" + kind + ":" + keyToken;
+    }
+
+    private boolean acquireAdvisoryLock(Connection conn, String name) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT GET_LOCK(?, 10)")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getInt(1) == 1;
+            }
+        }
+    }
+
+    private void releaseAdvisoryLock(Connection conn, String name) {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT RELEASE_LOCK(?)")) {
+            ps.setString(1, name);
+            try (ResultSet ignored = ps.executeQuery()) {
+                // Consume/close the result before returning the connection.
+            }
+        } catch (SQLException e) {
+            // Closing the pooled connection releases connection-scoped locks;
+            // release failures are logged but must not mask the write result.
+            plugin.getLogger().fine("Could not release MySQL moderation lock: " + e.getMessage());
+        }
+    }
+
+    private boolean hasActiveBanForInsert(Connection conn, String table, String uuid, long now) throws SQLException {
+        String sql = "SELECT 1 FROM " + table + "bans WHERE LOWER(uuid) = LOWER(?) AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) LIMIT 1";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, uuid);
+            ps.setLong(2, now);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    private boolean hasActiveIpBanForInsert(Connection conn, String table, String ip, long now) throws SQLException {
+        String sql = "SELECT 1 FROM " + table + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) LIMIT 1";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, ip);
+            ps.setLong(2, now);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
     public BanRecord insertBan(UUID uuid, String name, String reason, UUID staffUuid, String staffName, long duration) throws SQLException {
         ensureConnected();
-        long bannedAt = System.currentTimeMillis();
-        String retireSql = "UPDATE " + prefixChecked() + "bans SET revoked = 1, unbanned_at = ? WHERE uuid = ? AND revoked = 0 AND duration >= 0 AND (? - banned_at >= duration)";
-        String sql = "INSERT INTO " + prefixChecked() + "bans (uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
+        String table = prefixChecked();
+        String retireSql = "UPDATE " + table + "bans SET revoked = 1, unbanned_at = ? WHERE uuid = ? AND revoked = 0 AND duration >= 0 AND (? - banned_at >= duration)";
+        String sql = "INSERT INTO " + table + "bans (uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
         String uuidLower = uuid.toString().toLowerCase(java.util.Locale.ROOT);
-        try (Connection conn = connOrThrow();
-             PreparedStatement retire = conn.prepareStatement(retireSql);
-             PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            // Re-ban after expiry: an expired tempban row stays revoked = 0
-            // (expiry is computed, never written back), so the partial unique
-            // index WHERE revoked = 0 would reject the re-ban even though the
-            // live check correctly reports "not banned". Retire ONLY expired
-            // rows (same expiry predicate as findActiveBan, inverted) — an
-            // actually-active ban is never touched and still collides on the
-            // partial index, which BanManager reports as "already banned".
-            // System expiry, not a staff unban: unbanned_by_* stay NULL, only
-            // unbanned_at is set so the row remains in the recent-history
-            // window. Same SQL on both dialects (no DDL change, no new keys).
-            retire.setLong(1, bannedAt);
-            retire.setString(2, uuidLower);
-            retire.setLong(3, bannedAt);
-            retire.executeUpdate();
-            ps.setString(1, uuidLower);
-            ps.setString(2, name);
-            ps.setString(3, reason);
-            ps.setString(4, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
-            ps.setString(5, staffName);
-            ps.setLong(6, bannedAt);
-            ps.setLong(7, duration);
-            ps.executeUpdate();
-            int id;
-            try (ResultSet keys = ps.getGeneratedKeys()) {
-                id = keys.next() ? keys.getInt(1) : -1;
+        try (Connection conn = connOrThrow()) {
+            String lockName = mysql ? advisoryLockName("ban", uuidLower) : null;
+            boolean locked = false;
+            try {
+                if (mysql) {
+                    locked = acquireAdvisoryLock(conn, lockName);
+                    if (!locked) throw new SQLException("Timed out acquiring MySQL ban lock.");
+                }
+                // Timestamp only after any cross-server lock wait. Otherwise
+                // a short existing ban can expire while this writer waits,
+                // yet still look active to the post-lock recheck.
+                long bannedAt = System.currentTimeMillis();
+                if (mysql) {
+                    // The command-level live check may have raced on another
+                    // server. Recheck while holding the shared MySQL lock.
+                    if (hasActiveBanForInsert(conn, table, uuidLower, bannedAt))
+                        throw new ActiveBanExistsException("An active ban already exists for " + uuidLower);
+                }
+                try (PreparedStatement retire = conn.prepareStatement(retireSql);
+                     PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+                    // Retire only expired rows before inserting a replacement;
+                    // keep this sequence inside the same cross-server lock.
+                    retire.setLong(1, bannedAt);
+                    retire.setString(2, uuidLower);
+                    retire.setLong(3, bannedAt);
+                    retire.executeUpdate();
+                    ps.setString(1, uuidLower);
+                    ps.setString(2, name);
+                    ps.setString(3, reason);
+                    ps.setString(4, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
+                    ps.setString(5, staffName);
+                    ps.setLong(6, bannedAt);
+                    ps.setLong(7, duration);
+                    ps.executeUpdate();
+                    int id;
+                    try (ResultSet keys = ps.getGeneratedKeys()) {
+                        id = keys.next() ? keys.getInt(1) : -1;
+                    }
+                    return new BanRecord(id, uuid, name, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
+                }
+            } finally {
+                if (locked) releaseAdvisoryLock(conn, lockName);
             }
-            return new BanRecord(id, uuid, name, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
         }
     }
 
@@ -725,16 +801,38 @@ public class ModerationDatabase {
      */
     public List<Integer> findActiveBanIds(UUID uuid, long now) throws SQLException {
         ensureConnected();
-        String sql = "SELECT id FROM " + prefixChecked() + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
-        List<Integer> ids = new ArrayList<>();
-        try (Connection conn = connOrThrow(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString().toLowerCase(java.util.Locale.ROOT));
-            ps.setLong(2, now);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) ids.add(rs.getInt(1));
+        String table = prefixChecked();
+        String uuidLower = uuid.toString().toLowerCase(java.util.Locale.ROOT);
+        java.util.Set<Integer> ids = new java.util.LinkedHashSet<>();
+        try (Connection conn = connOrThrow()) {
+            // Exact indexed fast path: all writes store lowercase UUIDs, so
+            // uuid = ? hits the index on every call (wrapping the column in
+            // LOWER() would bypass it on every unban guard check).
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id FROM " + table + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))")) {
+                ps.setString(1, uuidLower);
+                ps.setLong(2, now);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) ids.add(rs.getInt(1));
+                }
+            }
+            // Case-insensitive fallback only until the one-time async legacy
+            // normalization completes (mirrors findActiveBan): a legacy
+            // mixed-case row misses the exact comparison above until its
+            // async pass. Merged into the same id set, so a row matching
+            // both passes is still reported once.
+            if (!normalizationDone) {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT id FROM " + table + "bans WHERE LOWER(uuid) = LOWER(?) AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))")) {
+                    ps.setString(1, uuidLower);
+                    ps.setLong(2, now);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) ids.add(rs.getInt(1));
+                    }
+                }
             }
         }
-        return ids;
+        return new ArrayList<>(ids);
     }
 
     /**
@@ -805,36 +903,51 @@ public class ModerationDatabase {
         // keeps its raw value — no new rejection path here.
         String normalized = ModerationCommandBase.normalizeIp(ip);
         if (normalized != null) ip = normalized;
-        long bannedAt = System.currentTimeMillis();
         // Single storedIp for DB and cache record: the clip255 guard must apply
         // to both, otherwise the in-memory record diverges from the persisted
         // row (lookup by exact IP would miss after a clip).
         String storedIp = clip255(ip, "ip_ban.ip");
-        String retireSql = "UPDATE " + prefixChecked() + "ip_bans SET revoked = 1, unbanned_at = ? WHERE ip = ? AND revoked = 0 AND duration >= 0 AND (? - banned_at >= duration)";
-        String sql = "INSERT INTO " + prefixChecked() + "ip_bans (ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
+        String table = prefixChecked();
+        String retireSql = "UPDATE " + table + "ip_bans SET revoked = 1, unbanned_at = ? WHERE ip = ? AND revoked = 0 AND duration >= 0 AND (? - banned_at >= duration)";
+        String sql = "INSERT INTO " + table + "ip_bans (ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0)";
-        try (Connection conn = connOrThrow();
-             PreparedStatement retire = conn.prepareStatement(retireSql);
-             PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            // Same expired-row retirement as insertBan (see there): an
-            // expired temp-IP-ban would otherwise collide on the partial
-            // unique index WHERE revoked = 0. Active IP bans are untouched.
-            retire.setLong(1, bannedAt);
-            retire.setString(2, storedIp);
-            retire.setLong(3, bannedAt);
-            retire.executeUpdate();
-            ps.setString(1, storedIp);
-            ps.setString(2, reason);
-            ps.setString(3, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
-            ps.setString(4, staffName);
-            ps.setLong(5, bannedAt);
-            ps.setLong(6, duration);
-            ps.executeUpdate();
-            int id;
-            try (ResultSet keys = ps.getGeneratedKeys()) {
-                id = keys.next() ? keys.getInt(1) : -1;
+        try (Connection conn = connOrThrow()) {
+            String lockName = mysql ? advisoryLockName("ipban", storedIp) : null;
+            boolean locked = false;
+            try {
+                if (mysql) {
+                    locked = acquireAdvisoryLock(conn, lockName);
+                    if (!locked) throw new SQLException("Timed out acquiring MySQL IP-ban lock.");
+                }
+                // Exclude time spent waiting for the advisory lock from the
+                // active-ban check and expired-row retirement.
+                long bannedAt = System.currentTimeMillis();
+                if (mysql) {
+                    if (hasActiveIpBanForInsert(conn, table, storedIp, bannedAt))
+                        throw new ActiveBanExistsException("An active IP ban already exists for " + storedIp);
+                }
+                try (PreparedStatement retire = conn.prepareStatement(retireSql);
+                     PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+                    retire.setLong(1, bannedAt);
+                    retire.setString(2, storedIp);
+                    retire.setLong(3, bannedAt);
+                    retire.executeUpdate();
+                    ps.setString(1, storedIp);
+                    ps.setString(2, reason);
+                    ps.setString(3, staffUuid == null ? null : staffUuid.toString().toLowerCase(java.util.Locale.ROOT));
+                    ps.setString(4, staffName);
+                    ps.setLong(5, bannedAt);
+                    ps.setLong(6, duration);
+                    ps.executeUpdate();
+                    int id;
+                    try (ResultSet keys = ps.getGeneratedKeys()) {
+                        id = keys.next() ? keys.getInt(1) : -1;
+                    }
+                    return new IpBanRecord(id, storedIp, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
+                }
+            } finally {
+                if (locked) releaseAdvisoryLock(conn, lockName);
             }
-            return new IpBanRecord(id, storedIp, reason, staffUuid, staffName, bannedAt, duration, false, null, null, 0L);
         }
     }
 
@@ -876,7 +989,7 @@ public class ModerationDatabase {
         if (normalized != null) ip = normalized;
         String table = prefixChecked();
         String sql = "SELECT id FROM " + table + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
-        List<Integer> ids = new ArrayList<>();
+        java.util.Set<Integer> ids = new java.util.LinkedHashSet<>();
         try (Connection conn = connOrThrow()) {
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, ip);
@@ -885,16 +998,16 @@ public class ModerationDatabase {
                     while (rs.next()) ids.add(rs.getInt(1));
                 }
             }
-            if (!ids.isEmpty() || normalizationDone) return ids;
+            if (normalizationDone) return new ArrayList<>(ids);
             // Normalization race fallback (mirrors findActiveBan's LOWER()
             // fallback): the one-time IP-spelling normalization runs async
             // after connect (see scheduleAsyncNormalization), so a legacy
             // non-canonical row ("::ffff:1.2.3.4", leading zeros, "[::1]")
             // misses the exact comparison above until its async pass. SQL
             // cannot normalize spellings, so compare Java-side via
-            // normalizeIp — revoked = 0 plus the same expiry predicate in
-            // SQL, bounded by LIMIT so this stays a small active-set scan.
-            String fallbackSql = "SELECT id, ip FROM " + table + "ip_bans WHERE revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 5000";
+            // normalizeIp. Scan the full active set and merge with exact
+            // matches above so equivalent legacy duplicates are not missed.
+            String fallbackSql = "SELECT id, ip FROM " + table + "ip_bans WHERE revoked = 0 AND (duration < 0 OR (? - banned_at < duration))";
             try (PreparedStatement ps = conn.prepareStatement(fallbackSql)) {
                 ps.setLong(1, now);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -914,7 +1027,7 @@ public class ModerationDatabase {
                 }
             }
         }
-        return ids;
+        return new ArrayList<>(ids);
     }
 
     /**
@@ -1181,6 +1294,68 @@ public class ModerationDatabase {
         }
     }
 
+    /** Returns every active row in the UUID unban guard's authorization set. */
+    public List<BanRecord> findActiveBans(UUID uuid, long now) throws SQLException {
+        ensureConnected();
+        String table = prefixChecked();
+        String uuidLower = uuid.toString().toLowerCase(java.util.Locale.ROOT);
+        String cols = "SELECT id, uuid, name, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM ";
+        List<BanRecord> rows = new ArrayList<>();
+        java.util.Set<Integer> seen = new java.util.HashSet<>();
+        try (Connection conn = connOrThrow()) {
+            // Exact indexed fast path (same reasoning as findActiveBanIds):
+            // lowercase writes + plain uuid = ? keeps the index usable.
+            try (PreparedStatement ps = conn.prepareStatement(cols
+                    + table + "bans WHERE uuid = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))")) {
+                ps.setString(1, uuidLower);
+                ps.setLong(2, now);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) collectActiveBanRow(rs, uuid, now, rows, seen);
+                }
+            }
+            // Case-insensitive fallback only until the one-time async legacy
+            // normalization completes (mirrors findActiveBan). Rows already
+            // collected via the exact pass are skipped by id, so legacy
+            // duplicates keep their multi-row semantics without doubling.
+            if (!normalizationDone) {
+                try (PreparedStatement ps = conn.prepareStatement(cols
+                        + table + "bans WHERE LOWER(uuid) = LOWER(?) AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))")) {
+                    ps.setString(1, uuidLower);
+                    ps.setLong(2, now);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) collectActiveBanRow(rs, uuid, now, rows, seen);
+                    }
+                }
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * Maps one {@code findActiveBans} result row, adding it once per real row
+     * id. Same fail-closed mapping contract as before: a corrupt row logs
+     * loudly and contributes a synthetic permanent record (id -1, deny)
+     * instead of being skipped — the unban shield treats an unknown id as
+     * protected, so skipping would be fail-open.
+     */
+    private void collectActiveBanRow(ResultSet rs, UUID uuid, long now, List<BanRecord> rows, java.util.Set<Integer> seen) throws SQLException {
+        int rowId;
+        try {
+            rowId = rs.getInt(1);
+        } catch (SQLException e) {
+            rowId = -1;
+        }
+        if (!seen.add(rowId)) return;
+        try {
+            rows.add(mapBan(rs));
+        } catch (RuntimeException e) {
+            plugin.getLogger().severe("Corrupt active ban row for " + uuid + ": " + e.getMessage());
+            rows.add(new BanRecord(-1, uuid, null,
+                    "Corrupt ban entry - unban denied for safety. Contact an admin.",
+                    null, null, now, -1, false, null, null, 0L));
+        }
+    }
+
     /**
      * Authoritative, always-fresh IP check — same fail-closed mapping contract
      * as {@link #findActiveBan}: corrupt rows deny (synthetic permanent
@@ -1218,12 +1393,12 @@ public class ModerationDatabase {
             // non-canonical row ("::ffff:1.2.3.4", leading zeros, "[::1]")
             // misses the exact comparison above until its async pass. SQL
             // cannot normalize spellings, so compare Java-side via
-            // normalizeIp — revoked = 0 plus the same expiry predicate in
-            // SQL, bounded by LIMIT so this stays a small active-set scan.
+            // normalizeIp over the full active set. A fixed cap can miss an
+            // older matching legacy row after enough newer active bans.
             // Same fail-closed mapping contract as above.
             if (normalizationDone) return null;
             String fallbackSql = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at " +
-                    "FROM " + table + "ip_bans WHERE revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC LIMIT 5000";
+                    "FROM " + table + "ip_bans WHERE revoked = 0 AND (duration < 0 OR (? - banned_at < duration)) ORDER BY banned_at DESC";
             try (PreparedStatement ps = conn.prepareStatement(fallbackSql)) {
                 ps.setLong(1, now);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1256,6 +1431,76 @@ public class ModerationDatabase {
                     return null;
                 }
             }
+        }
+    }
+
+    /** Returns every active row whose stored IP is canonically equivalent. */
+    public List<IpBanRecord> findActiveIpBans(String ip, long now) throws SQLException {
+        ensureConnected();
+        String canonicalIp = ModerationCommandBase.normalizeIp(ip);
+        if (canonicalIp == null) canonicalIp = ip;
+        String table = prefixChecked();
+        String cols = "SELECT id, ip, reason, staff_uuid, staff_name, banned_at, duration, revoked, unbanned_by_uuid, unbanned_by_name, unbanned_at FROM ";
+        List<IpBanRecord> rows = new ArrayList<>();
+        java.util.Set<Integer> seen = new java.util.HashSet<>();
+        try (Connection conn = connOrThrow()) {
+            // Exact indexed fast path (mirrors findActiveIpBanIds): the
+            // common case — a canonically stored row — resolves via the
+            // index without scanning the full active set.
+            try (PreparedStatement ps = conn.prepareStatement(cols
+                    + table + "ip_bans WHERE ip = ? AND revoked = 0 AND (duration < 0 OR (? - banned_at < duration))")) {
+                ps.setString(1, canonicalIp);
+                ps.setLong(2, now);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) collectActiveIpBanRow(rs, canonicalIp, now, rows, seen);
+                }
+            }
+            // Canonical-equivalence fallback only until the one-time async
+            // legacy normalization completes (mirrors findActiveIpBanIds):
+            // SQL cannot normalize spellings, so compare Java-side via
+            // normalizeIp over the full active set. Rows already collected
+            // via the exact pass are skipped by id, so equivalent legacy
+            // duplicates keep their multi-row semantics without doubling.
+            if (!normalizationDone) {
+                try (PreparedStatement ps = conn.prepareStatement(cols
+                        + table + "ip_bans WHERE revoked = 0 AND (duration < 0 OR (? - banned_at < duration))")) {
+                    ps.setLong(1, now);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            String stored = rs.getString(2);
+                            String storedCanonical = ModerationCommandBase.normalizeIp(stored);
+                            if (storedCanonical == null ? !java.util.Objects.equals(stored, canonicalIp)
+                                    : !storedCanonical.equals(canonicalIp)) continue;
+                            collectActiveIpBanRow(rs, canonicalIp, now, rows, seen);
+                        }
+                    }
+                }
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * Maps one {@code findActiveIpBans} result row, adding it once per real
+     * row id. Same fail-closed mapping contract as before: a corrupt row
+     * logs loudly and contributes a synthetic permanent record (id -1,
+     * deny) instead of being skipped.
+     */
+    private void collectActiveIpBanRow(ResultSet rs, String canonicalIp, long now, List<IpBanRecord> rows, java.util.Set<Integer> seen) throws SQLException {
+        int rowId;
+        try {
+            rowId = rs.getInt(1);
+        } catch (SQLException e) {
+            rowId = -1;
+        }
+        if (!seen.add(rowId)) return;
+        try {
+            rows.add(mapIpBan(rs));
+        } catch (RuntimeException e) {
+            plugin.getLogger().severe("Corrupt active IP-ban row for " + canonicalIp + ": " + e.getMessage());
+            rows.add(new IpBanRecord(-1, canonicalIp,
+                    "Corrupt IP-ban entry - unban denied for safety. Contact an admin.",
+                    null, null, now, -1, false, null, null, 0L));
         }
     }
 

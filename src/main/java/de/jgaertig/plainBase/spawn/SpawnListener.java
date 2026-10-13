@@ -184,8 +184,81 @@ public class SpawnListener implements Listener {
                 player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Spawn location was out of bounds, using world spawn instead. Contact an admin!"));
                 loc = world.getSpawnLocation().clone();
             } else {
-                loc = resolveSafeSpawnLocation(world, new Location(world, rawX, rawY, rawZ, yaw, pitch), player, path);
+                loc = new Location(world, rawX, rawY, rawZ, yaw, pitch);
             }
+            validateSpawnThenTeleport(player, world, loc, path, fallbackToSpawn);
+        } catch (Exception e) {
+            // Runs on a delayed scheduler task after join: must never throw.
+            plugin.getLogger().warning("Spawn teleport failed for "
+                    + (player != null ? player.getName() : "<unknown>") + ": " + e.getMessage());
+        }
+    }
+
+    private void validateSpawnThenTeleport(Player player, World world, Location requested, String path, boolean fallbackToSpawn) {
+        if (player == null || world == null || requested == null) return;
+        Location target = requested.clone();
+        try {
+            Bukkit.getRegionScheduler().execute(plugin, world, target.getBlockX() >> 4, target.getBlockZ() >> 4, () -> {
+                Location safe = resolveSafeSpawnLocation(world, target, path);
+                Location validated = safe == null ? null : safe.clone();
+                try {
+                    player.getScheduler().run(plugin, entityTask -> {
+                        if (!player.isOnline()) return;
+                        if (validated == null) {
+                            player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn location could not be verified as safe. Contact an admin."));
+                            tryFallback(player, fallbackToSpawn);
+                            return;
+                        }
+                        // Re-check enabled on the entity thread immediately
+                        // before initiating teleportAsync (matches Spawn.java
+                        // command path): the module may have been disabled or
+                        // reloaded during the region hop. Never teleport to a
+                        // disabled spawn; never fall back to one either.
+                        boolean stillEnabled = false;
+                        try {
+                            FileConfiguration live = plugin.getSpawnConfig();
+                            if (live != null) {
+                                synchronized (live) {
+                                    if ("spawn.location".equals(path)) {
+                                        stillEnabled = live.getBoolean("spawn.enabled", false);
+                                    } else if ("first-spawn.location".equals(path)) {
+                                        stillEnabled = live.getBoolean("first-spawn.enabled", false);
+                                    } else {
+                                        stillEnabled = live.getBoolean("spawn.enabled", false);
+                                    }
+                                }
+                            } else {
+                                player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+                                return;
+                            }
+                        } catch (Exception e) {
+                            player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn is currently unavailable."));
+                            return;
+                        }
+                        if (!stillEnabled) {
+                            // Disabled mid-hop: abort without fallback — the
+                            // fallback target re-checks enabled itself and may
+                            // also be disabled.
+                            return;
+                        }
+                        initiateSpawnTeleport(player, validated, fallbackToSpawn);
+                    }, null);
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Could not schedule spawn teleport for " + player.getUniqueId() + ": " + e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            try {
+                player.getScheduler().run(plugin, entityTask -> {
+                    if (player.isOnline()) player.sendMessage(plugin.getMiniMessage().deserialize("<red>Spawn location could not be verified as safe. Contact an admin."));
+                }, null);
+            } catch (Exception ignored) {}
+            plugin.getLogger().warning("Could not schedule spawn safety check for " + player.getUniqueId() + ": " + e.getMessage());
+        }
+    }
+
+    private void initiateSpawnTeleport(Player player, Location loc, boolean fallbackToSpawn) {
+        try {
             player.teleportAsync(loc).thenAccept(success -> {
                 // thenAccept runs off the entity thread: hop back onto the
                 // EntityScheduler before any sendMessage/fallback scheduling
@@ -226,20 +299,18 @@ public class SpawnListener implements Listener {
                 }
             });
         } catch (Exception e) {
-            // Runs on a delayed scheduler task after join: must never throw.
-            plugin.getLogger().warning("Spawn teleport failed for "
-                    + (player != null ? player.getName() : "<unknown>") + ": " + e.getMessage());
+            plugin.getLogger().warning("Spawn teleport failed for " + player.getUniqueId() + ": " + e.getMessage());
+            if (fallbackToSpawn) tryFallback(player, true);
         }
     }
 
     /**
      * Spawn safety: when feet/head at the configured location are obstructed,
      * scan up (max +5, same pattern as TPAManager arrival) for feet+head
-     * passable with solid ground below. Never throws and never blocks: when no
-     * safe spot is found the original location is used with a warning, so
-     * existing admin setups keep working.
+     * passable with solid ground below. If no candidate can be verified safe,
+     * fail closed rather than sending the player to an unsafe or unchecked spot.
      */
-    private Location resolveSafeSpawnLocation(World world, Location loc, Player player, String path) {
+    private Location resolveSafeSpawnLocation(World world, Location loc, String path) {
         try {
             if (world == null || loc == null) return loc;
             if (isSpawnSpotSafe(loc)) return loc;
@@ -258,18 +329,14 @@ public class SpawnListener implements Listener {
                 }
             }
             if (found != null) {
-                plugin.getLogger().warning("Spawn teleport for " + player.getName()
-                        + ": configured location at '" + path + "' unsafe (" + reason + "), using safe spot +" + foundOffset + " up.");
-                player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Spawn location was unsafe (" + reason + "), using nearest safe spot instead. Contact an admin!"));
+                plugin.getLogger().fine("Spawn location at '" + path + "' unsafe (" + reason + "), using safe spot +" + foundOffset + " up.");
                 return found;
             }
-            plugin.getLogger().warning("Spawn teleport for " + player.getName()
-                    + ": configured location at '" + path + "' unsafe (" + reason + ") and no safe spot found within +5, teleporting anyway.");
-            player.sendMessage(plugin.getMiniMessage().deserialize("<yellow>Warning: spawn location looks unsafe (" + reason + "). Contact an admin!"));
+            return null;
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to check spawn safety at '" + path + "': " + e.getMessage());
+            return null;
         }
-        return loc;
     }
 
     private boolean isSpawnSpotSafe(Location cand) {
@@ -277,9 +344,7 @@ public class SpawnListener implements Listener {
     }
 
     /**
-     * Null when the spot is safe, otherwise a short human-readable reason
-     * (obstructed / no solid ground / damaging ground). Fail-open: a lookup
-     * error yields null so the teleport is never blocked.
+     * Null when safe; otherwise a reason. Lookup failures are unsafe.
      */
     private String unsafeSpawnReason(Location cand) {
         try {
@@ -293,17 +358,24 @@ public class SpawnListener implements Listener {
                 solid = ground.getType().isSolid();
                 groundName = ground.getType().name();
             } catch (Exception e) {
-                return null;
+                return "unable to verify ground";
             }
             if (!solid) return "no solid ground below";
+            // Leaves are solid safe support (e.g. treehouse spawns): do not
+            // reject them as ground. Damaging/unsafe validation below stays.
             try {
-                if (isDamagingSpawnGround(groundName)) return "damaging ground below";
+                if (isDamagingSpawnGround(groundName)
+                        || isAlwaysUnsafeSpawnBlock(groundName)) return "unsafe ground below";
+                String feetName = feet.getType().name();
+                String headName = head.getType().name();
+                if (isAlwaysUnsafeSpawnBlock(feetName) || isAlwaysUnsafeSpawnBlock(headName)
+                        || isDamagingSpawnGround(feetName) || isDamagingSpawnGround(headName)
+                        || feetName.contains("LEAVES") || headName.contains("LEAVES")) return "unsafe headroom";
             } catch (Exception e) {
-                return null;
+                return "unable to verify blocks";
             }
         } catch (Exception e) {
-            // Fail-open: a lookup error must never block the teleport.
-            return null;
+            return "unable to verify location";
         }
         return null;
     }
@@ -319,6 +391,15 @@ public class SpawnListener implements Listener {
                     "CACTUS", "MAGMA_BLOCK",
                     "CAMPFIRE", "SOUL_CAMPFIRE",
                     "WITHER_ROSE", "SWEET_BERRY_BUSH" -> true;
+            default -> false;
+        };
+    }
+
+    private static boolean isAlwaysUnsafeSpawnBlock(String materialName) {
+        if (materialName == null) return true;
+        return switch (materialName) {
+            case "BEDROCK", "BARRIER", "PORTAL", "NETHER_PORTAL", "END_PORTAL",
+                    "ENDER_PORTAL", "END_GATEWAY", "POWDER_SNOW" -> true;
             default -> false;
         };
     }

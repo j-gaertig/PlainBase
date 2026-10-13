@@ -70,59 +70,73 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
         // (Bukkit online-player/permission APIs are not thread-safe). Same
         // "exempt" message as the ban side — no oracle.
         if (!isAdmin(sender)) {
-            Bukkit.getAsyncScheduler().runNow(plugin, asyncTask -> {
-                IpBanRecord live = null;
+            // Scheduler-rejection guard (disable race): runNow on a
+            // disabled plugin throws — answer fail-closed via the sender
+            // scheduler instead of leaving the sender hanging (same
+            // pattern as IpBanCommand#checkOnlineIpOwners).
+            try {
+                Bukkit.getAsyncScheduler().runNow(plugin, asyncTask -> {
+                List<IpBanRecord> liveRows = List.of();
                 boolean liveOk = false;
                 try {
-                    live = manager.queryActiveIpBanNow(finalIp);
+                    liveRows = manager.queryActiveIpBansNow(finalIp);
                     liveOk = true;
                 } catch (Exception e) {
                     plugin.getLogger().warning("Could not live-check IP ban for unbanip shield '"
-                            + finalIp + "', falling back to cache: " + e.getMessage());
+                            + finalIp + "': " + e.getMessage());
                 }
-                if (!liveOk) {
-                    try {
-                        live = manager.getActiveIpBans().stream()
-                                .filter(r -> r != null && finalIp.equals(r.ip()))
-                                .findFirst().orElse(null);
-                    } catch (RuntimeException cacheEx) {
-                        plugin.getLogger().fine("Failed unbanip shield cache fallback for '"
-                                + finalIp + "': " + cacheEx.getMessage());
-                        live = null;
-                    }
+                final List<IpBanRecord> shieldRows = liveRows;
+                final boolean shieldRead = liveOk;
+                if (!shieldRead) {
+                    // Fail closed, but report the database error distinctly
+                    // from an exempt rejection so staff do not misread an
+                    // outage as target protection.
+                    runOnSender(sender, () -> {
+                        if (isGone(sender)) return;
+                        sender.sendMessage(render(message("db-error", "<red>Database error, please try again later.")));
+                    });
+                    return;
                 }
-                final IpBanRecord shieldRecord = live;
-                Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                if (shieldRows.isEmpty()) {
+                    // Empty allow-list preserves the "not banned" result
+                    // without revoking a ban inserted after the live read.
+                    requestUnbanIp(manager, sender, finalIp, staffUuid, staffName, List.of());
+                    return;
+                }
+                checkProtectedIpBans(shieldRows, finalIp, protectedBan -> runOnSender(sender, () -> {
                     if (isGone(sender)) return;
-                    // Only a present record can be protected; no record lets
-                    // unbanIpAsync decide (not-banned vs db-error fail-closed
-                    // with a hint) instead of a misleading "exempt".
-                    if (shieldRecord != null) {
-                        try {
-                            if (isProtectedIpBan(shieldRecord, finalIp)) {
-                                sender.sendMessage(render(
-                                        message("exempt", "<red>You cannot punish this player.")));
-                                return;
-                            }
-                        } catch (RuntimeException e) {
-                            plugin.getLogger().fine("Failed unbanip shield check for '" + finalIp + "': " + e.getMessage());
-                            sender.sendMessage(render(
-                                    message("exempt", "<red>You cannot punish this player.")));
-                            return;
-                        }
+                    // Only a live, present record can authorize the shield
+                    // decision. Stale cache data or a missing row cannot prove
+                    // that the requested revoke is safe.
+                    if (protectedBan) {
+                        sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
+                        return;
                     }
-                    requestUnbanIp(manager, sender, finalIp, staffUuid, staffName);
+                    List<Integer> authorizedIds = shieldRows.stream()
+                            .map(row -> row == null ? -1 : row.id()).toList();
+                    if (authorizedIds.stream().anyMatch(id -> id < 0)) {
+                        sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
+                        return;
+                    }
+                    requestUnbanIp(manager, sender, finalIp, staffUuid, staffName, authorizedIds);
+                }));
                 });
-            });
+            } catch (RuntimeException e) {
+                plugin.getLogger().fine("Could not schedule unbanip shield check: " + e.getMessage());
+                runOnSender(sender, () -> {
+                    if (isGone(sender)) return;
+                    sender.sendMessage(render(message("db-error", "<red>Database error, please try again later.")));
+                });
+            }
             return;
         }
 
-        requestUnbanIp(manager, sender, finalIp, staffUuid, staffName);
+        requestUnbanIp(manager, sender, finalIp, staffUuid, staffName, null);
     }
 
     private void requestUnbanIp(BanManager manager, CommandSender sender, String finalIp,
-                                UUID staffUuid, String staffName) {
-        manager.unbanIpAsync(finalIp, staffUuid, staffName, (unbanned, dbError) -> {
+                                UUID staffUuid, String staffName, List<Integer> authorizedIds) {
+        manager.unbanIpAsync(finalIp, staffUuid, staffName, authorizedIds, (unbanned, dbError) -> runOnSender(sender, () -> {
             if (isGone(sender)) return;
             if (dbError) {
                 sender.sendMessage(render(
@@ -139,7 +153,7 @@ public class UnbanIpCommand extends ModerationCommandBase implements BasicComman
                     message("unbanip-success", "<green>%ip% has been unbanned.").replace("%ip%", esc(finalIp))));
 
             broadcast(message("unbanip-broadcast", "").replace("%ip%", esc(finalIp)).replace("%staff%", esc(staffName)));
-        });
+        }));
     }
 
     /**

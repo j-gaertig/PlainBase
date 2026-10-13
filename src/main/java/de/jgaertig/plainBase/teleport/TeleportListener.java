@@ -98,14 +98,19 @@ public class TeleportListener implements Listener {
     // gates move/damage/death/interact.
     @EventHandler
     public void onWorldChange(PlayerChangedWorldEvent event) {
+        // A successful cross-world teleport from TPA/RTP raises this event
+        // before teleportAsync's completion callback releases its reservation.
+        if (WarmupReservations.isExpectedWorldChange(event.getPlayer().getUniqueId(),
+                event.getPlayer().getWorld().getUID())) return;
         cancelWarmupsUnconditionally(event.getPlayer());
     }
 
     // Any teleport (ender pearl, chorus, other plugins) breaks the warmup.
-    // Always cancels, including PLUGIN cause: our own teleports only fire
-    // after the warmup entry was already removed, so this is a no-op for them.
+    // The exact destination marked by an in-flight TPA/RTP teleport is exempt;
+    // unrelated teleports, including those initiated by other plugins, cancel.
     @EventHandler(ignoreCancelled = true)
     public void onTeleport(PlayerTeleportEvent event) {
+        if (WarmupReservations.isExpectedTeleport(event.getPlayer().getUniqueId(), event.getTo())) return;
         cancelWarmupsUnconditionally(event.getPlayer());
     }
 

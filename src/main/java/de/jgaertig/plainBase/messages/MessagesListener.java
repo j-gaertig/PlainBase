@@ -12,10 +12,15 @@ import org.bukkit.event.player.PlayerQuitEvent;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
 
 public class MessagesListener implements Listener {
 
     private final PlainBase plugin;
+    // Identity token per connection. Deferred work may run after a quit or a
+    // quick reconnect; only the connection that scheduled it may broadcast.
+    private final Map<UUID, Object> activeJoinSessions = new ConcurrentHashMap<>();
 
     public MessagesListener(PlainBase plugin) {
         this.plugin = plugin;
@@ -24,6 +29,9 @@ public class MessagesListener implements Listener {
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        Object joinSession = new Object();
+        activeJoinSessions.put(uuid, joinSession);
 
         // Defense-in-depth: a vanished player must never get a join message,
         // even if this handler runs before VanishListener. (VanishListener on
@@ -54,7 +62,6 @@ public class MessagesListener implements Listener {
         String joinRaw = config.getString("messages.join", "");
         String firstJoinRaw = config.getString("messages.first-join", "");
         event.joinMessage(null);
-        UUID uuid = player.getUniqueId();
         // Joiner name captured sync: applyPlaceholdersSafe()/getName() must
         // never run off-thread on Folia.
         final String joinerName = player.getName();
@@ -79,7 +86,7 @@ public class MessagesListener implements Listener {
                     // joiner's entity thread on Folia.
                     Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                         try {
-                            if (!player.isOnline()) return;
+                            if (activeJoinSessions.get(uuid) != joinSession) return;
                             Component msg;
                             try {
                                 // B2 MiniMessage-injection guard: the player name is escaped
@@ -163,6 +170,7 @@ public class MessagesListener implements Listener {
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
+        activeJoinSessions.remove(player.getUniqueId());
 
         // Defense-in-depth, mirrors onJoin: vanished quits stay silent.
         // Explicit null-guards, never rely on the catch below.

@@ -43,6 +43,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -53,6 +54,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.jetbrains.annotations.Nullable;
 
 public final class PlainBase extends JavaPlugin {
+
+    public enum ModerationState { DISABLED, INITIALIZING, READY, FAILED }
 
     // ConcurrentHashMap: configs are read off-thread (BanManager refresh task,
     // RTPManager/TPAManager async callbacks, VanishManager/TeamManager scheduler
@@ -77,6 +80,8 @@ public final class PlainBase extends JavaPlugin {
     private final Object configLock = new Object();
     /** Per-file sequence counter to drop stale async writes (lost-update guard). */
     private final Map<String, AtomicLong> configSeq = new ConcurrentHashMap<>();
+    /** Supersedes stale async reload continuations when multiple reloads overlap. */
+    private final AtomicLong moduleReloadSeq = new AtomicLong();
     /** Per-file write locks so sync + async writers of the same file serialize. */
     private final Map<String, Object> fileLocks = new ConcurrentHashMap<>();
     /** Pending async config writes, awaited with timeout in stopModules(). */
@@ -91,6 +96,7 @@ public final class PlainBase extends JavaPlugin {
      * set proceeds with a warning instead of rescheduling again (max 1 hop).
      */
     private final ThreadLocal<Boolean> globalThreadHopGuard = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    private final Object rootConfigReloadLock = new Object();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     // Volatile: read off-thread (VanishManager/TeamManager scheduler hops,
     // PlaceholderAPI expansion, Brigadier suggestions) while reloadModules()
@@ -111,8 +117,23 @@ public final class PlainBase extends JavaPlugin {
      * snapshotting still-vanished flags on re-vanish. Take-and-clear with the IDs.
      */
     private volatile Map<java.util.UUID, VanishManager.PrevSelfState> carriedPrevSelfStates = Map.of();
+    private volatile Set<java.util.UUID> carriedDirtyUnvanished = Set.of();
+    private volatile Set<java.util.UUID> carriedDirtyVanished = Set.of();
     private volatile MenuManager menuManager;
     private volatile BanManager banManager;
+    /** Kept registered across module reloads so moderation never has a listener gap. */
+    private volatile ModerationListener moderationListener;
+    private volatile ModerationState moderationState = ModerationState.DISABLED;
+    /** Serializes reload transitions with the pre-login allow/deny snapshot. */
+    private final Object moderationGateLock = new Object();
+    private volatile CompletableFuture<Void> moderationSetupInFlight = CompletableFuture.completedFuture(null);
+    /** Managers created by async moderation setup but not yet installed. */
+    private final Object pendingModerationManagersLock = new Object();
+    private final Set<BanManager> pendingModerationManagers =
+            Collections.newSetFromMap(new IdentityHashMap<>());
+    private boolean moderationShuttingDown;
+    private volatile Map<String, FileConfiguration> preparedReloadConfigs = Map.of();
+    private volatile Set<String> failedPreparedReloadConfigs = Set.of();
     private volatile TeamManager teamManager;
     private boolean placeholdersRegistered = false;
     private GlobalListener globalListener;
@@ -146,9 +167,18 @@ public final class PlainBase extends JavaPlugin {
 
     @Override
     public void onEnable() {
+        synchronized (pendingModerationManagersLock) {
+            moderationShuttingDown = false;
+        }
         setupPermissions();
 
         saveDefaultConfig();
+        // Initialize JavaPlugin's root-config field before commands become
+        // available. Runtime reloads read it asynchronously below.
+        reloadConfig();
+        moderationState = isModuleEnabled("moderation")
+                ? ModerationState.INITIALIZING : ModerationState.DISABLED;
+        ensureModerationListener();
 
         latestVersions.put("config.yml", "1.7");
         latestVersions.put("spawn.yml", "1.2");
@@ -208,7 +238,7 @@ public final class PlainBase extends JavaPlugin {
             commandsRegistered = true;
         }
 
-        reloadModules();
+        initializeModulesOnEnable();
 
         getLogger().info("Successfully Enabled! (Version " + getVersionSafe() + ")");
     }
@@ -227,11 +257,16 @@ public final class PlainBase extends JavaPlugin {
     }
 
     private void onDisableOnGlobalThread() {
+        moderationState = ModerationState.DISABLED;
+        closePendingModerationManagers();
         // Always reveal vanished players on shutdown, even with
         // persist-on-rejoin=true (persist only covers rejoins, not shutdown —
         // otherwise players stay hidden with no manager left to unvanish them).
         if (vanishManager != null) {
             try {
+                // Preserve the persisted vanished state before resetAll
+                // invalidates queued saves and removes the in-memory entries.
+                vanishManager.flushSync();
                 vanishManager.resetAll();
             } catch (Exception e) {
                 getLogger().fine("Failed to reset vanish state on disable: " + e.getMessage());
@@ -683,33 +718,245 @@ public final class PlainBase extends JavaPlugin {
     }
 
     /**
-     * Must run on the global region thread: unregisters listeners, touches
-     * Bukkit state and does config disk I/O. Command call sites hop via
-     * Bukkit.getGlobalRegionScheduler() before calling this.
+     * Must run on the global region thread: unregisters listeners and touches
+     * Bukkit state. Reload configuration reads run on the async scheduler.
      */
     public void reloadModules() {
-        if (!ensureGlobalThread("reloadModules", this::reloadModules)) return;
-        // F1: reload the main config FIRST so stopModules() below decides on
-        // the NEW module flags (toggle-off must reveal vanished players even
-        // though the old in-memory config still said enabled). Module configs
-        // in the configs map are untouched by reloadConfig(), so the
-        // spawn/menu flush inside stopModules() still sees the old data.
-        // P2: a corrupt config.yml must never kill the whole reload — keep
-        // the old in-memory config on failure (reloadConfig is fail-safe).
-        try {
-            reloadConfig();
-        } catch (Exception e) {
-            getLogger().warning("Failed to reload config.yml, keeping previous config: " + e.getMessage());
-        }
-        // Reload path: never block the global region thread on pending async
-        // writes or synchronous disk I/O (the disable path uses stopModules()).
-        stopModules(false);
+        reloadModulesAsync();
+    }
 
-        // Each module is guarded so one broken module (corrupt config, dead
-        // database, ...) disables only itself instead of killing every module
-        // listed after it. ensureGlobalListener() and the version check below
-        // always run afterwards. Defaults are false to match the shipped
-        // config.yml (all modules off unless explicitly enabled).
+    /**
+     * Installs startup listeners before onEnable returns. Runtime reloads use
+     * async config preparation; the first enable keeps its synchronous setup
+     * ordering so joins cannot arrive before module listeners are registered.
+     */
+    private void initializeModulesOnEnable() {
+        moderationState = isModuleEnabled("moderation")
+                ? ModerationState.INITIALIZING : ModerationState.DISABLED;
+        if (!isOnGlobalThread()) {
+            reloadModulesAsync(false);
+            return;
+        }
+        moduleReloadSeq.incrementAndGet();
+        stopModules(false);
+        finishModuleReload().whenComplete((ignored, error) -> {
+            if (error != null) {
+                getLogger().log(java.util.logging.Level.WARNING,
+                        "Module setup did not fully complete during enable", error);
+            }
+        });
+    }
+
+    /**
+     * Reloads module configuration after async flushes from the previous
+     * generation settle. Bukkit state transitions stay on the global region
+     * thread, while that thread never waits for file I/O.
+     */
+    public CompletableFuture<Void> reloadModulesAsync() {
+        return reloadModulesAsync(true);
+    }
+
+    private CompletableFuture<Void> reloadModulesAsync(boolean reloadRootConfig) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        final long reloadId;
+        final ModerationState previousModerationState;
+        // Close the moderation login gate at the reload request boundary,
+        // before the async root-config read is even scheduled. Previously a
+        // FAILED setup remained fail-open until the global-thread continuation
+        // ran after reloadConfig(), leaving a window in which banned players
+        // could pass AsyncPlayerPreLoginEvent. The persistent listener checks
+        // while the root config itself may still be stale, covering reloads
+        // that enable moderation as well as those already enabled.
+        synchronized (moderationGateLock) {
+            previousModerationState = moderationState;
+            reloadId = moduleReloadSeq.incrementAndGet();
+            // If moderation is currently disabled, keep logins unaffected
+            // until the newly read root config actually enables it. If it is
+            // enabled, close the gate before any asynchronous reload work.
+            if (isModuleEnabled("moderation")) moderationState = ModerationState.INITIALIZING;
+        }
+        Runnable begin = () -> {
+            try {
+                if (!isEnabled() || moduleReloadSeq.get() != reloadId) {
+                    result.complete(null);
+                    return;
+                }
+                synchronized (moderationGateLock) {
+                    moderationState = isModuleEnabled("moderation")
+                            ? ModerationState.INITIALIZING : ModerationState.DISABLED;
+                }
+                stopModules(false);
+                List<String> moduleFiles = enabledModuleConfigFiles();
+                CompletableFuture<?>[] writes;
+                synchronized (pendingSaves) {
+                    writes = pendingSaves.toArray(CompletableFuture[]::new);
+                }
+                CompletableFuture.allOf(writes).whenComplete((ignored, flushError) -> {
+                    prepareReloadConfigsAsync(moduleFiles).whenComplete((prepared, prepareError) -> {
+                        try {
+                            Bukkit.getGlobalRegionScheduler().run(this, task -> {
+                                if (!isEnabled() || moduleReloadSeq.get() != reloadId) {
+                                    result.complete(null);
+                                    return;
+                                }
+                                if (prepareError == null && prepared != null) {
+                                    preparedReloadConfigs = prepared.loaded();
+                                    failedPreparedReloadConfigs = prepared.failed();
+                                } else {
+                                    preparedReloadConfigs = Map.of();
+                                    failedPreparedReloadConfigs = Set.copyOf(moduleFiles);
+                                    getLogger().warning("Could not prepare module configs during reload: "
+                                            + (prepareError == null ? "unknown error" : prepareError.getMessage()));
+                                }
+                                globalThreadHopGuard.set(Boolean.TRUE);
+                                try {
+                                    finishModuleReload().whenComplete((setupIgnored, setupError) -> {
+                                        if (setupError == null) result.complete(null);
+                                        else result.completeExceptionally(setupError);
+                                    });
+                                } catch (Exception e) {
+                                    getLogger().log(java.util.logging.Level.WARNING,
+                                            "Failed to set up modules after reload", e);
+                                    result.completeExceptionally(e);
+                                } finally {
+                                    globalThreadHopGuard.remove();
+                                    preparedReloadConfigs = Map.of();
+                                    failedPreparedReloadConfigs = Set.of();
+                                }
+                            });
+                        } catch (Exception e) {
+                            getLogger().warning("Could not schedule module setup after reload: " + e.getMessage());
+                            result.completeExceptionally(e);
+                        }
+                    });
+                });
+            } catch (Exception e) {
+                result.completeExceptionally(e);
+            }
+        };
+        Runnable scheduleBeginOnGlobal = () -> {
+            if (moduleReloadSeq.get() != reloadId) {
+                result.complete(null);
+                return;
+            }
+            if (isOnGlobalThread()) {
+                globalThreadHopGuard.set(Boolean.TRUE);
+                try {
+                    begin.run();
+                } finally {
+                    globalThreadHopGuard.remove();
+                }
+                return;
+            }
+            try {
+                Bukkit.getGlobalRegionScheduler().run(this, globalTask -> {
+                    globalThreadHopGuard.set(Boolean.TRUE);
+                    try {
+                        begin.run();
+                    } finally {
+                        globalThreadHopGuard.remove();
+                    }
+                });
+            } catch (Exception e) {
+                result.completeExceptionally(e);
+            }
+        };
+        if (!reloadRootConfig) {
+            scheduleBeginOnGlobal.run();
+        } else {
+            try {
+                // Root config reload reads YAML from disk, so do it before the
+                // global-thread state transition. The shared root lock protects
+                // PlainBase readers while reloadConfig() swaps the backing object.
+                Bukkit.getAsyncScheduler().runNow(this, task -> {
+                    try {
+                        synchronized (moderationGateLock) {
+                            synchronized (rootConfigReloadLock) {
+                                if (moduleReloadSeq.get() == reloadId) reloadConfigForGeneration(reloadId);
+                            }
+                            if (moduleReloadSeq.get() == reloadId) {
+                                moderationState = isModuleEnabled("moderation")
+                                        ? ModerationState.INITIALIZING : ModerationState.DISABLED;
+                            }
+                        }
+                    } catch (Exception e) {
+                        getLogger().warning("Failed to reload config.yml, keeping previous config: " + e.getMessage());
+                    }
+                    scheduleBeginOnGlobal.run();
+                });
+            } catch (Exception e) {
+                result.completeExceptionally(e);
+            }
+        }
+        result.whenComplete((ignored, error) -> {
+            if (error != null) settleModerationAfterReloadFailure(reloadId, previousModerationState);
+        });
+        return result;
+    }
+
+    private void settleModerationAfterReloadFailure(long reloadId, ModerationState previousState) {
+        synchronized (moderationGateLock) {
+            if (moduleReloadSeq.get() != reloadId || moderationState != ModerationState.INITIALIZING) return;
+            if (!isEnabled() || !isModuleEnabled("moderation")) {
+                moderationState = ModerationState.DISABLED;
+            } else if (previousState == ModerationState.READY && banManager != null) {
+                // Setup never reached the point of retiring the old manager,
+                // so keep its working login checks after scheduling failure.
+                moderationState = ModerationState.READY;
+            } else {
+                // Preserve fail-open behavior when no usable manager exists;
+                // a scheduler rejection must not strand the listener in the
+                // temporary fail-closed INITIALIZING state forever.
+                moderationState = ModerationState.FAILED;
+            }
+        }
+    }
+
+    private List<String> enabledModuleConfigFiles() {
+        Map<String, String> moduleFiles = Map.of(
+                "spawn", "spawn.yml",
+                "joinitems", "joinitems.yml",
+                "messages", "messages.yml",
+                "teleport", "teleport.yml",
+                "vanish", "vanish.yml",
+                "menu", "menu.yml",
+                "moderation", "moderation.yml",
+                "team", "team.yml");
+        List<String> enabled = new ArrayList<>();
+        moduleFiles.forEach((module, file) -> {
+            if (isModuleEnabled(module)) enabled.add(file);
+        });
+        return List.copyOf(enabled);
+    }
+
+    private record PreparedModuleConfigs(Map<String, FileConfiguration> loaded, Set<String> failed) {}
+
+    private CompletableFuture<PreparedModuleConfigs> prepareReloadConfigsAsync(List<String> moduleFiles) {
+        CompletableFuture<PreparedModuleConfigs> prepared = new CompletableFuture<>();
+        trackPendingSave(prepared.thenApply(ignored -> null));
+        try {
+            Bukkit.getAsyncScheduler().runNow(this, task -> {
+                try {
+                    Map<String, FileConfiguration> loaded = new HashMap<>();
+                    Set<String> failed = new java.util.HashSet<>();
+                    for (String file : moduleFiles) {
+                        FileConfiguration config = loadModuleConfigFromDisk(file);
+                        if (config == null) failed.add(file);
+                        else loaded.put(file, config);
+                    }
+                    prepared.complete(new PreparedModuleConfigs(Map.copyOf(loaded), Set.copyOf(failed)));
+                } catch (Exception e) {
+                    prepared.completeExceptionally(e);
+                }
+            });
+        } catch (Exception e) {
+            prepared.completeExceptionally(e);
+        }
+        return prepared;
+    }
+
+    private CompletableFuture<Void> finishModuleReload() {
+        // Each module is guarded so one broken module disables only itself.
         if (isModuleEnabled("spawn")) runModuleSetup("spawn", this::setupSpawn);
         if (isModuleEnabled("joinitems")) runModuleSetup("joinitems", this::setupJoinItems);
         if (isModuleEnabled("messages")) runModuleSetup("messages", this::setupMessages);
@@ -720,21 +967,15 @@ public final class PlainBase extends JavaPlugin {
         if (isModuleEnabled("team")) runModuleSetup("team", this::setupTeam);
 
         ensureGlobalListenerSafe();
-
-        // PlaceholderAPI may have loaded after our onEnable (soft dependency):
-        // re-register here so /plainbase reload picks it up without a restart.
-        // Idempotent (no-op when already registered or PAPI still absent).
         try {
             registerPlaceholderExpansion();
         } catch (Exception e) {
             getLogger().fine("Failed to register PlaceholderAPI expansion on reload: " + e.getMessage());
         }
-
-        // Warning-only version check, also on every /plainbase reload/toggle:
-        // an outdated module config after an update must be noticed even when
-        // the server was never restarted. (onEnable() reaches this via
-        // reloadModules(), so no separate call there.)
         checkAllConfigVersionsSafe();
+        return isModuleEnabled("moderation")
+                ? moderationSetupInFlight
+                : CompletableFuture.completedFuture(null);
     }
 
     /**
@@ -844,7 +1085,7 @@ public final class PlainBase extends JavaPlugin {
         }
         if (!block) {
             CompletableFuture.allOf(snapshot).orTimeout(5, TimeUnit.SECONDS).whenComplete((v, t) -> {
-                if (t != null) {
+                if (t != null && !isCancellation(t)) {
                     getLogger().warning("Async config writes failed during reload: " + t.getMessage());
                 }
                 synchronized (pendingSaves) {
@@ -868,6 +1109,15 @@ public final class PlainBase extends JavaPlugin {
                 pendingSaves.removeIf(CompletableFuture::isDone);
             }
         }
+    }
+
+    private static boolean isCancellation(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof java.util.concurrent.CancellationException) return true;
+            current = current.getCause();
+        }
+        return false;
     }
 
     /**
@@ -936,6 +1186,8 @@ public final class PlainBase extends JavaPlugin {
         // bounded; reload path continues async without blocking the global
         // region thread.
         awaitPendingSaves(block);
+        VanishManager reloadFlushManager = null;
+        FileConfiguration reloadVanishSnapshot = null;
         // Synchronous vanish flush on the disable path only: per-player
         // vanish saves run async and may have been cancelled on shutdown —
         // rewrite the authoritative in-memory vanish state directly so a kill
@@ -957,46 +1209,13 @@ public final class PlainBase extends JavaPlugin {
                     getLogger().warning("Failed to flush vanish state on shutdown: " + e.getMessage());
                 }
             } else {
-                final VanishManager vm = vanishManager;
+                reloadFlushManager = vanishManager;
                 // Snapshot BEFORE configs.clear() below: the async task runs
                 // after clear() and must not read the live map (would see
                 // null and fall back to the wrong persist default).
-                final FileConfiguration vanishSnapshot = getVanishConfig();
-                if (vanishSnapshot == null) {
+                reloadVanishSnapshot = getVanishConfig();
+                if (reloadVanishSnapshot == null) {
                     getLogger().fine("Skipping async vanish flush on reload: vanish config not loaded.");
-                } else {
-                    // Lost-update guard like spawn/menu (configSeq + fileLock,
-                    // keyed "vanish-flush"): only the newest snapshot flushes,
-                    // stale ones are dropped. flushSync() additionally
-                    // serializes per-UUID via PlayerDataLocks.
-                    final long vanishFlushSeq = configSeq.computeIfAbsent("vanish-flush", k -> new AtomicLong()).incrementAndGet();
-                    final Object vanishFlushLock = getFileLock("vanish-flush");
-                    final CompletableFuture<Void> flushFuture = new CompletableFuture<>();
-                    trackPendingSave(flushFuture);
-                    try {
-                        Bukkit.getAsyncScheduler().runNow(this, task -> {
-                            try {
-                                AtomicLong seq = configSeq.get("vanish-flush");
-                                if (seq != null && seq.get() != vanishFlushSeq) {
-                                    return;
-                                }
-                                synchronized (vanishFlushLock) {
-                                    AtomicLong inner = configSeq.get("vanish-flush");
-                                    if (inner != null && inner.get() != vanishFlushSeq) {
-                                        return;
-                                    }
-                                    vm.flushSync(vanishSnapshot);
-                                }
-                            } catch (Exception e) {
-                                getLogger().warning("Failed to flush vanish state on reload: " + e.getMessage());
-                            } finally {
-                                flushFuture.complete(null);
-                            }
-                        });
-                    } catch (Exception e) {
-                        getLogger().warning("Could not schedule async vanish flush on reload: " + e.getMessage());
-                        flushFuture.complete(null);
-                    }
                 }
             }
         }
@@ -1081,9 +1300,16 @@ public final class PlainBase extends JavaPlugin {
         // The manager reference is always dropped below (even when the module
         // stays enabled) — otherwise the stale manager survives the reload;
         // carry-over is by value via carriedVanishedIds, never a live instance.
+        if (!block && vanishManager != null) {
+            // Fence callbacks synchronously before reset/carry-over. Any
+            // transition already inside the manager lock finishes first;
+            // later callbacks cannot race the reset or the copied state.
+            vanishManager.beginPersistenceFinalization();
+        }
         if (vanishManager != null && (!vanishEnabled || !persist)) {
             try {
-                vanishManager.resetAll();
+                vanishManager.prepareForRevealPersistence();
+                vanishManager.resetAll(block);
             } catch (Exception e) {
                 getLogger().warning("Failed to reset vanish state: " + e.getMessage());
             }
@@ -1102,10 +1328,42 @@ public final class PlainBase extends JavaPlugin {
                 getLogger().fine("Failed to snapshot vanish self states: " + e.getMessage());
                 carriedPrevSelfStates = Map.of();
             }
+            try {
+                VanishManager.DirtyState dirtyState = vanishManager.copyDirtyState();
+                Set<java.util.UUID> dirtyFalse = new java.util.HashSet<>(carriedDirtyUnvanished);
+                dirtyFalse.addAll(dirtyState.unvanished());
+                Set<java.util.UUID> dirtyTrue = new java.util.HashSet<>(carriedDirtyVanished);
+                dirtyTrue.addAll(dirtyState.vanished());
+                // The latest live transition owns the obligation if an earlier
+                // overlapping reload left an opposite carried obligation.
+                dirtyFalse.removeAll(dirtyState.vanished());
+                dirtyTrue.removeAll(dirtyState.unvanished());
+                carriedDirtyUnvanished = Set.copyOf(dirtyFalse);
+                carriedDirtyVanished = Set.copyOf(dirtyTrue);
+            } catch (Exception e) {
+                getLogger().fine("Failed to snapshot pending vanish persistence state: " + e.getMessage());
+            }
+            if (!vanishEnabled || !persist) {
+                // resetAll() has already revealed this manager's live state.
+                // Do not retain carry-over from an earlier overlapping reload.
+                carriedVanishedIds = Set.of();
+                carriedPrevSelfStates = Map.of();
+                carriedDirtyVanished = Set.of();
+            }
             vanishManager = null;
-        } else {
+        } else if (block || !vanishEnabled || !persist) {
+            revealCarriedVanishState(block);
             carriedVanishedIds = Set.of();
             carriedPrevSelfStates = Map.of();
+            carriedDirtyVanished = Set.of();
+        }
+
+        // Start disk work only after the old manager is fenced, reset if
+        // required, and copied into the carry-over snapshots. The tracked
+        // future keeps reloadModulesAsync() from installing the next manager
+        // before this flush completes.
+        if (!block && reloadFlushManager != null && reloadVanishSnapshot != null) {
+            scheduleVanishReloadFlush(reloadFlushManager, reloadVanishSnapshot);
         }
 
         // Close any open menu inventories before the listeners are
@@ -1148,7 +1406,7 @@ public final class PlainBase extends JavaPlugin {
         // tolerate a null config the same way).
         if (banManager != null) {
             try {
-                banManager.shutdown();
+                banManager.shutdown(block);
             } catch (Exception e) {
                 getLogger().warning("Failed to shut down ban manager: " + e.getMessage());
             }
@@ -1196,7 +1454,7 @@ public final class PlainBase extends JavaPlugin {
         // instead of needing a central registry.
         // Vanish config is cached locally above, so unregistering first is safe.
         try {
-            org.bukkit.event.HandlerList.unregisterAll(this);
+            unregisterModuleListeners();
         } catch (Exception e) {
             getLogger().fine("Failed to unregister listeners: " + e.getMessage());
         }
@@ -1218,12 +1476,175 @@ public final class PlainBase extends JavaPlugin {
         // can never throw ConcurrentModificationException mid-iteration.
         try {
             configs.clear();
+            preparedReloadConfigs = Map.of();
+            failedPreparedReloadConfigs = Set.of();
         } catch (Exception e) {
             getLogger().fine("Failed to clear config cache: " + e.getMessage());
         }
         // The unregister above also removed the global listener: drop the
         // reference so reloadModules() re-registers it via ensureGlobalListener().
         globalListener = null;
+    }
+
+    /**
+     * Unregister every module listener except the moderation pre-login guard.
+     * That listener must remain live while module configs and the moderation
+     * database are being rebuilt asynchronously; otherwise banned players can
+     * connect in the reload window.
+     */
+    private void unregisterModuleListeners() {
+        ModerationListener persistentModerationListener = moderationListener;
+        if (persistentModerationListener == null) {
+            org.bukkit.event.HandlerList.unregisterAll(this);
+            return;
+        }
+
+        Set<org.bukkit.event.Listener> listeners = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (org.bukkit.plugin.RegisteredListener registered
+                : org.bukkit.event.HandlerList.getRegisteredListeners(this)) {
+            org.bukkit.event.Listener listener = registered.getListener();
+            if (listener != persistentModerationListener && listeners.add(listener)) {
+                org.bukkit.event.HandlerList.unregisterAll(listener);
+            }
+        }
+    }
+
+    /** Registers the persistent moderation guard once, before any async setup. */
+    private void ensureModerationListener() {
+        if (moderationListener != null && isModerationListenerRegistered(moderationListener)) return;
+        synchronized (this) {
+            ModerationListener listener = moderationListener;
+            if (listener == null) {
+                listener = new ModerationListener(this);
+                moderationListener = listener;
+            }
+            if (!isModerationListenerRegistered(listener)) {
+                getServer().getPluginManager().registerEvents(listener, this);
+            }
+        }
+    }
+
+    private boolean isModerationListenerRegistered(ModerationListener listener) {
+        for (org.bukkit.plugin.RegisteredListener registered
+                : org.bukkit.event.HandlerList.getRegisteredListeners(this)) {
+            if (registered.getListener() == listener) return true;
+        }
+        return false;
+    }
+
+    private void scheduleVanishReloadFlush(VanishManager manager, FileConfiguration snapshot) {
+        // Lost-update guard like spawn/menu (configSeq + fileLock, keyed
+        // "vanish-flush"): only the newest snapshot flushes. flushSync()
+        // additionally serializes updates per UUID.
+        final long sequence = configSeq.computeIfAbsent("vanish-flush", k -> new AtomicLong()).incrementAndGet();
+        final Object flushLock = getFileLock("vanish-flush");
+        final CompletableFuture<Void> flushFuture = new CompletableFuture<>();
+        trackPendingSave(flushFuture);
+        try {
+            Bukkit.getAsyncScheduler().runNow(this, task -> {
+                try {
+                    AtomicLong seq = configSeq.get("vanish-flush");
+                    if (seq != null && seq.get() != sequence) return;
+                    synchronized (flushLock) {
+                        AtomicLong inner = configSeq.get("vanish-flush");
+                        if (inner != null && inner.get() != sequence) return;
+                        manager.flushSync(snapshot);
+                    }
+                } catch (Exception e) {
+                    getLogger().warning("Failed to flush vanish state on reload: " + e.getMessage());
+                } finally {
+                    flushFuture.complete(null);
+                }
+            });
+        } catch (Exception e) {
+            getLogger().warning("Could not schedule async vanish flush on reload: " + e.getMessage());
+            flushFuture.complete(null);
+        }
+    }
+
+    /** Reveals carry-over after an overlapping reload disabled vanish while no manager exists. */
+    private void revealCarriedVanishState(boolean block) {
+        Set<java.util.UUID> ids = carriedVanishedIds;
+        Map<java.util.UUID, VanishManager.PrevSelfState> states = carriedPrevSelfStates;
+        Set<java.util.UUID> clearIds = new java.util.HashSet<>(ids);
+        clearIds.addAll(carriedDirtyVanished);
+        clearIds.addAll(carriedDirtyUnvanished);
+        FileConfiguration cfg = getVanishConfig();
+        boolean persist = cfg == null || cfg.getBoolean("vanish.persist-on-rejoin", true);
+        // Supersede any earlier reload flush and serialize this reveal behind
+        // one that already entered its per-file critical section.
+        configSeq.computeIfAbsent("vanish-flush", k -> new AtomicLong()).incrementAndGet();
+        final Object flushLock = getFileLock("vanish-flush");
+        VanishManager persistence = new VanishManager(this);
+        Runnable clearFiles = () -> {
+            synchronized (flushLock) {
+                Set<java.util.UUID> failed = new java.util.HashSet<>();
+                for (java.util.UUID uuid : clearIds) {
+                    if (uuid == null) continue;
+                    try {
+                        if (!persistence.persistVanishValue(uuid, persist ? false : null)) failed.add(uuid);
+                    } catch (Exception e) {
+                        failed.add(uuid);
+                        getLogger().fine("Could not clear carried vanish state for " + uuid + ": " + e.getMessage());
+                    }
+                }
+                carriedDirtyUnvanished = Set.copyOf(failed);
+            }
+        };
+        if (block) {
+            clearFiles.run();
+        } else {
+            CompletableFuture<Void> pending = new CompletableFuture<>();
+            trackPendingSave(pending);
+            try {
+                Bukkit.getAsyncScheduler().runNow(this, task -> {
+                    try {
+                        clearFiles.run();
+                    } finally {
+                        pending.complete(null);
+                    }
+                });
+            } catch (Exception e) {
+                getLogger().warning("Could not schedule carried vanish cleanup: " + e.getMessage());
+                pending.completeExceptionally(e);
+            }
+        }
+        // Failed false-write obligations remain for the next manager to retry.
+        for (java.util.UUID uuid : ids) {
+            if (uuid == null) continue;
+            Player target = Bukkit.getPlayer(uuid);
+            if (target == null || !target.isOnline()) continue;
+            VanishManager.PrevSelfState previous = states.get(uuid);
+            try {
+                target.getScheduler().run(this, task -> {
+                    if (!target.isOnline()) return;
+                    try {
+                        target.setInvisible(previous != null && previous.invisible());
+                        target.setCollidable(previous == null || previous.collidable());
+                        target.setSilent(previous != null && previous.silent());
+                    } catch (Exception ignored) {
+                    }
+                }, null);
+            } catch (Exception ignored) {
+            }
+            for (Player viewer : Bukkit.getOnlinePlayers()) {
+                if (viewer.equals(target)) continue;
+                try {
+                    viewer.getScheduler().run(this, task -> {
+                        if (!viewer.isOnline() || !target.isOnline()) return;
+                        try {
+                            viewer.showEntity(this, target);
+                            try {
+                                viewer.listPlayer(target);
+                            } catch (Exception ignored) {
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }, null);
+                } catch (Exception ignored) {
+                }
+            }
+        }
     }
 
     /**
@@ -1237,53 +1658,65 @@ public final class PlainBase extends JavaPlugin {
      */
     @Override
     public void reloadConfig() {
-        // Corrupt-config guard: snapshot the in-memory config BEFORE the
-        // disk re-read so a wiped reload (empty/corrupt file parses to an
-        // empty config without throwing) can be detected and restored.
-        // NOTE: must NOT call getConfig() here — JavaPlugin.getConfig()
-        // delegates to this virtual reloadConfig() when the field is still
-        // null (first start), which would recurse infinitely (StackOverflow).
+        reloadConfigForGeneration(-1L);
+    }
+
+    /**
+     * Reloads the root config while fencing asynchronous module reloads by
+     * generation. Disk I/O and YAML parsing happen without holding configLock;
+     * the generation must therefore be checked again at the final in-memory
+     * swap so an older, slower read cannot overwrite a newer reload or toggle.
+     * A negative generation is used by the public Bukkit override when no
+     * module-reload generation owns the call.
+     */
+    private void reloadConfigForGeneration(long expectedGeneration) {
+        // Snapshot under the root-config lock, but do all file access and YAML
+        // parsing outside it so global-region readers never wait on disk I/O.
         final String snapshot;
         synchronized (configLock) {
-            String s = null;
             try {
                 FileConfiguration cur = readRawConfigNoReload();
-                if (cur != null) s = cur.saveToString();
-            } catch (Exception ignored) {
+                snapshot = cur == null ? null : cur.saveToString();
+            } catch (Exception e) {
+                // NOTE: must NOT call getConfig() here; on first startup that
+                // can dispatch back to this override and recurse.
+                getLogger().fine("Could not snapshot config.yml before reload: " + e.getMessage());
+                return;
             }
-            snapshot = s;
         }
-        try {
-            super.reloadConfig();
+
+        FileConfiguration prepared = new YamlConfiguration();
+        try (InputStreamReader reader = new InputStreamReader(
+                new FileInputStream(new File(getDataFolder(), "config.yml")), StandardCharsets.UTF_8)) {
+            prepared.load(reader);
         } catch (Exception e) {
             getLogger().warning("Failed to reload config.yml, keeping previous config: " + e.getMessage());
             return;
         }
-        // A corrupt/empty config.yml may parse to an empty config (no
-        // version/modules) without throwing — that would silently disable
-        // all modules. Detect the wipe and restore the snapshot instead.
-        synchronized (configLock) {
-            try {
-                FileConfiguration live = readRawConfigNoReload();
-                boolean wiped = live == null || !live.contains("modules") || !live.contains("version");
-                if (wiped) {
-                    if (snapshot != null && !snapshot.isBlank()) {
-                        try {
-                            if (live != null) live.loadFromString(snapshot);
-                        } catch (Exception restoreEx) {
-                            getLogger().warning("Failed to restore previous config.yml snapshot: " + restoreEx.getMessage());
-                        }
-                    }
-                    getLogger().severe("config.yml appears corrupt (missing version/modules after reload), restored previous in-memory config. Fix or regenerate config.yml!");
+
+        boolean wiped = !prepared.contains("modules") || !prepared.contains("version");
+        if (wiped) {
+            getLogger().severe("config.yml appears corrupt (missing version/modules after reload), restored previous in-memory config. Fix or regenerate config.yml!");
+            if (snapshot != null && !snapshot.isBlank()) {
+                try {
+                    prepared.loadFromString(snapshot);
+                } catch (Exception restoreEx) {
+                    getLogger().warning("Failed to restore previous config.yml snapshot: " + restoreEx.getMessage());
+                    return;
                 }
-            } catch (Exception e) {
-                getLogger().warning("Failed to verify config.yml after reload: " + e.getMessage());
             }
         }
         try {
-            mergeMissingRootDefaults();
+            mergeMissingRootDefaults(prepared);
         } catch (Exception e) {
             getLogger().warning("Failed to merge defaults for config.yml: " + e.getMessage());
+        }
+
+        synchronized (configLock) {
+            if (expectedGeneration >= 0 && moduleReloadSeq.get() != expectedGeneration) return;
+            if (!replaceRawConfigNoReload(prepared)) {
+                getLogger().warning("Could not replace the in-memory config.yml after reload.");
+            }
         }
     }
 
@@ -1313,24 +1746,34 @@ public final class PlainBase extends JavaPlugin {
         return null;
     }
 
-    private void mergeMissingRootDefaults() {
+    private boolean replaceRawConfigNoReload(FileConfiguration config) {
+        boolean replaced = false;
+        for (Class<?> type = JavaPlugin.class; type != null; type = type.getSuperclass()) {
+            for (String name : new String[]{"config", "newConfig"}) {
+                try {
+                    java.lang.reflect.Field field = type.getDeclaredField(name);
+                    if (!FileConfiguration.class.isAssignableFrom(field.getType())) continue;
+                    field.setAccessible(true);
+                    field.set(this, config);
+                    replaced = true;
+                } catch (NoSuchFieldException ignored) {
+                } catch (Exception e) {
+                    getLogger().fine("Could not replace raw config field " + name + ": " + e.getMessage());
+                }
+            }
+        }
+        return replaced;
+    }
+
+    private void mergeMissingRootDefaults(FileConfiguration target) {
         try (InputStream in = getResource("config.yml")) {
             if (in == null) return;
             try (InputStreamReader reader = new InputStreamReader(in, StandardCharsets.UTF_8)) {
                 FileConfiguration defaults = YamlConfiguration.loadConfiguration(reader);
-                // Root mutation under the central configLock (same monitor as
-                // toggle/suggest/GlobalListener/checkAllConfigVersions): the
-                // live instance is fetched INSIDE the lock since reloadConfig()
-                // may swap it. Lock order stays configLock-only (no nested
-                // config monitor), so no new deadlock is introduced.
-                synchronized (configLock) {
-                    FileConfiguration live = readRawConfigNoReload();
-                    if (live == null) return;
-                    live.setDefaults(defaults);
-                    for (String key : defaults.getKeys(true)) {
-                        if (!live.isSet(key)) {
-                            live.set(key, defaults.get(key));
-                        }
+                target.setDefaults(defaults);
+                for (String key : defaults.getKeys(true)) {
+                    if (!target.isSet(key)) {
+                        target.set(key, defaults.get(key));
                     }
                 }
             }
@@ -1340,6 +1783,19 @@ public final class PlainBase extends JavaPlugin {
     }
 
     public @Nullable FileConfiguration loadModuleConfig(String fileName) {
+        if (failedPreparedReloadConfigs.contains(fileName)) return null;
+        FileConfiguration prepared = preparedReloadConfigs.get(fileName);
+        if (prepared != null) {
+            configs.put(fileName, prepared);
+            return prepared;
+        }
+        FileConfiguration loaded = loadModuleConfigFromDisk(fileName);
+        if (loaded != null) configs.put(fileName, loaded);
+        return loaded;
+    }
+
+    /** Reads and merges one module YAML file. Reload calls this on the async scheduler. */
+    private @Nullable FileConfiguration loadModuleConfigFromDisk(String fileName) {
         File file = new File(getDataFolder(), "modules/" + fileName);
         if (!file.exists()) {
             File parent = file.getParentFile();
@@ -1363,7 +1819,6 @@ public final class PlainBase extends JavaPlugin {
         try (InputStreamReader reader = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
             FileConfiguration config = YamlConfiguration.loadConfiguration(reader);
             mergeMissingDefaults(config, fileName);
-            configs.put(fileName, config);
             return config;
         } catch (Exception e) {
             getLogger().warning("Could not load " + fileName + ": " + e.getMessage());
@@ -1653,6 +2108,12 @@ public final class PlainBase extends JavaPlugin {
         rtpManager = new RTPManager(this);
 
         getServer().getPluginManager().registerEvents(new TeleportListener(this), this);
+
+        // Join events do not fire for players who are already online during
+        // a module reload. Register the listener first so players joining
+        // around this snapshot are handled either by the snapshot or by the
+        // join event, then restore through each player's Folia scheduler.
+        tpaManager.loadOnlinePlayerData();
     }
 
     public void setupVanish() {
@@ -1669,12 +2130,18 @@ public final class PlainBase extends JavaPlugin {
         // stopModules() must never re-hide a stale set.
         Set<java.util.UUID> previousVanished = carriedVanishedIds;
         carriedVanishedIds = Set.of();
+        Set<java.util.UUID> previousDirtyUnvanished = carriedDirtyUnvanished;
+        Set<java.util.UUID> previousDirtyVanished = carriedDirtyVanished;
         // BUG-1: take the carried pre-vanish self states alongside the IDs.
         Map<java.util.UUID, VanishManager.PrevSelfState> previousSelfStates = carriedPrevSelfStates;
         carriedPrevSelfStates = Map.of();
 
         FileConfiguration vanishCfg = loadModuleConfig("vanish.yml");
         if (vanishCfg == null) {
+            Set<java.util.UUID> retryFalseWrites = new java.util.HashSet<>(previousDirtyUnvanished);
+            retryFalseWrites.addAll(previousDirtyVanished);
+            retryFalseWrites.addAll(previousVanished);
+            carriedDirtyVanished = Set.of();
             getLogger().severe("Could not load vanish.yml! The vanish module stays disabled until this is fixed.");
             // Error path: no manager exists to resetAll with (stopModules()
             // always drops it), so reveal the carried players best-effort —
@@ -1684,29 +2151,36 @@ public final class PlainBase extends JavaPlugin {
             // Folia: entity visibility/state is entity-thread-only — every call
             // hops via the viewer/player scheduler (same pattern as
             // VanishManager.showTo/resetSelfState), never direct on this thread.
-            for (java.util.UUID uuid : previousVanished) {
-                try {
-                    // No manager left to persist unvanish: clear the persisted
-                    // flag best-effort so a later re-enable does not re-vanish
-                    // via stale vanished:true (offline players included).
+            VanishManager persistence = new VanishManager(this);
+            // Player-data load/merge/write is disk I/O. Keep it off the
+            // global region thread and make reload setup wait for completion.
+            CompletableFuture<Void> falseWrites = new CompletableFuture<>();
+            trackPendingSave(falseWrites);
+            try {
+                Bukkit.getAsyncScheduler().runNow(this, task -> {
+                    Set<java.util.UUID> failed = new java.util.HashSet<>();
                     try {
-                        synchronized (PlayerDataLocks.lockFor(uuid)) {
-                            File pdFile = new File(getDataFolder(), "data/playerdata/" + uuid + ".yml");
-                            if (pdFile.isFile()) {
-                                YamlConfiguration pd = new YamlConfiguration();
-                                try {
-                                    pd.load(pdFile);
-                                } catch (Exception ignored) {
-                                }
-                                pd.set("vanished", false);
-                                try {
-                                    pd.save(pdFile);
-                                } catch (Exception ignored) {
-                                }
+                        for (java.util.UUID uuid : retryFalseWrites) {
+                            if (uuid == null) continue;
+                            try {
+                                if (!persistence.persistVanishValue(uuid, false)) failed.add(uuid);
+                            } catch (Exception e) {
+                                failed.add(uuid);
+                                getLogger().fine("Could not clear carried vanish state for " + uuid + ": " + e.getMessage());
                             }
                         }
-                    } catch (Exception ignored) {
+                    } finally {
+                        carriedDirtyUnvanished = Set.copyOf(failed);
+                        falseWrites.complete(null);
                     }
+                });
+            } catch (Exception e) {
+                getLogger().warning("Could not schedule carried vanish state cleanup: " + e.getMessage());
+                carriedDirtyUnvanished = Set.copyOf(retryFalseWrites);
+                falseWrites.completeExceptionally(e);
+            }
+            for (java.util.UUID uuid : retryFalseWrites) {
+                try {
                     Player player = Bukkit.getPlayer(uuid);
                     if (player == null || !player.isOnline()) continue;
                     final Player target = player;
@@ -1759,11 +2233,22 @@ public final class PlainBase extends JavaPlugin {
                     getLogger().warning("Failed to reveal vanished player " + uuid + " without vanish config: " + e.getMessage());
                 }
             }
+            carriedVanishedIds = Set.of();
+            carriedPrevSelfStates = Map.of();
+            carriedDirtyVanished = Set.of();
             return;
         }
 
         vanishManager = new VanishManager(this);
-        restoreVanishState(previousVanished, previousSelfStates);
+        vanishManager.restorePrevSelfStates(previousSelfStates);
+        vanishManager.restoreDirtyUnvanished(previousDirtyUnvanished);
+        vanishManager.restoreDirtyVanished(previousDirtyVanished);
+        carriedDirtyUnvanished = Set.of();
+        carriedDirtyVanished = Set.of();
+        Set<java.util.UUID> restoredVanished = new java.util.HashSet<>(previousVanished);
+        restoredVanished.addAll(previousDirtyVanished);
+        restoredVanished.removeAll(previousDirtyUnvanished);
+        restoreVanishState(restoredVanished, previousSelfStates, previousDirtyVanished);
 
         getServer().getPluginManager().registerEvents(new VanishListener(this), this);
 
@@ -1784,7 +2269,8 @@ public final class PlainBase extends JavaPlugin {
      * snapshotting the still-vanished flags.
      */
     private void restoreVanishState(Set<java.util.UUID> previousVanished,
-                                    Map<java.util.UUID, VanishManager.PrevSelfState> previousSelfStates) {
+                                    Map<java.util.UUID, VanishManager.PrevSelfState> previousSelfStates,
+                                    Set<java.util.UUID> dirtyVanished) {
         if (vanishManager == null) return;
         try {
             vanishManager.restorePrevSelfStates(previousSelfStates);
@@ -1797,7 +2283,11 @@ public final class PlainBase extends JavaPlugin {
                 if (vanishManager.isVanished(uuid)) continue;
                 Player player = Bukkit.getPlayer(uuid);
                 if (player != null && player.isOnline()) {
-                    vanishManager.vanish(player);
+                    if (dirtyVanished != null && dirtyVanished.contains(uuid)) {
+                        vanishManager.restoreVanishedPlayer(player);
+                    } else {
+                        vanishManager.vanish(player);
+                    }
                 }
             } catch (Exception e) {
                 getLogger().fine("Failed to restore vanish state for " + uuid + ": " + e.getMessage());
@@ -1822,34 +2312,133 @@ public final class PlainBase extends JavaPlugin {
 
     public void setupModeration() {
         if (!ensureGlobalThread("setupModeration", this::setupModeration)) return;
+        final long setupGeneration = moduleReloadSeq.get();
         FileConfiguration moderationCfg = loadModuleConfig("moderation.yml");
         if (moderationCfg == null) {
             getLogger().severe("Could not load moderation.yml! The moderation module stays disabled until this is fixed.");
-            return;
-        }
-
-        try {
-            banManager = new BanManager(this);
-        } catch (Exception e) {
-            FileConfiguration moderationConfig = getModerationConfig();
-            String storageType = moderationConfig != null ? moderationConfig.getString("storage.type", "sqlite") : "<unknown>";
-            getLogger().log(java.util.logging.Level.SEVERE, "Could not connect the moderation database (storage.type=" +
-                    storageType + ")", e);
-            getLogger().severe("The moderation module is disabled until this is fixed and /plainbase reload is run.");
-            // Constructor may have partially allocated (open pool, scheduled
-            // refresh) before throwing — shut down best-effort when present.
-            if (banManager != null) {
-                try {
-                    banManager.shutdown();
-                } catch (Exception shutdownEx) {
-                    getLogger().fine("Failed to shut down partially constructed ban manager: " + shutdownEx.getMessage());
+            moderationSetupInFlight = CompletableFuture.completedFuture(null);
+            synchronized (moderationGateLock) {
+                if (moduleReloadSeq.get() == setupGeneration) {
+                    moderationState = ModerationState.FAILED;
                 }
             }
-            banManager = null;
             return;
         }
+        ensureModerationListener();
+        final CompletableFuture<Void> setup = new CompletableFuture<>();
+        moderationSetupInFlight = setup;
+        try {
+            Bukkit.getAsyncScheduler().runNow(this, task -> {
+                BanManager created = null;
+                Throwable failure = null;
+                try {
+                    created = new BanManager(this);
+                } catch (Throwable e) {
+                    failure = e;
+                }
+                final BanManager completedManager = created;
+                final Throwable setupFailure = failure;
+                if (completedManager != null && !registerPendingModerationManager(completedManager)) {
+                    completedManager.shutdown(true);
+                    setup.complete(null);
+                    return;
+                }
+                try {
+                    Bukkit.getGlobalRegionScheduler().run(this, globalTask -> {
+                        boolean retireManager = false;
+                        Throwable callbackError = null;
+                        synchronized (moderationGateLock) {
+                            if (!isEnabled() || moduleReloadSeq.get() != setupGeneration
+                                    || !isModuleEnabled("moderation")) {
+                                retireManager = completedManager != null;
+                            } else if (setupFailure != null) {
+                                FileConfiguration moderationConfig = getModerationConfig();
+                                String storageType = moderationConfig != null
+                                        ? moderationConfig.getString("storage.type", "sqlite") : "<unknown>";
+                                getLogger().log(java.util.logging.Level.SEVERE,
+                                        "Could not connect the moderation database (storage.type=" + storageType + ")",
+                                        setupFailure);
+                                getLogger().severe("The moderation module is disabled until this is fixed and /plainbase reload is run.");
+                                banManager = null;
+                                moderationState = ModerationState.FAILED;
+                            } else {
+                                try {
+                                    if (completedManager != null
+                                            && !installPendingModerationManager(completedManager)) {
+                                        retireManager = true;
+                                    } else {
+                                        moderationState = ModerationState.READY;
+                                    }
+                                } catch (Throwable e) {
+                                    retireManager = completedManager != null;
+                                    banManager = null;
+                                    moderationState = ModerationState.FAILED;
+                                    callbackError = e;
+                                }
+                            }
+                        }
+                        if (retireManager) retirePendingModerationManager(completedManager, true);
+                        if (callbackError == null) setup.complete(null);
+                        else setup.completeExceptionally(callbackError);
+                    });
+                } catch (Exception scheduleError) {
+                    retirePendingModerationManager(completedManager, true);
+                    synchronized (moderationGateLock) {
+                        if (moduleReloadSeq.get() == setupGeneration) moderationState = ModerationState.FAILED;
+                    }
+                    setup.completeExceptionally(scheduleError);
+                }
+            });
+        } catch (Exception scheduleError) {
+            getLogger().log(java.util.logging.Level.SEVERE, "Could not schedule moderation database setup", scheduleError);
+            synchronized (moderationGateLock) {
+                if (moduleReloadSeq.get() == setupGeneration) moderationState = ModerationState.FAILED;
+            }
+            setup.completeExceptionally(scheduleError);
+        }
+    }
 
-        getServer().getPluginManager().registerEvents(new ModerationListener(this), this);
+    private boolean registerPendingModerationManager(BanManager manager) {
+        synchronized (pendingModerationManagersLock) {
+            if (moderationShuttingDown) return false;
+            pendingModerationManagers.add(manager);
+            return true;
+        }
+    }
+
+    /**
+     * Atomically transfers a completed setup manager into the live slot.
+     * Disable closes pending managers under the same lock, so there is never
+     * an unowned pool between async construction and the live field.
+     */
+    private boolean installPendingModerationManager(BanManager manager) {
+        synchronized (pendingModerationManagersLock) {
+            if (moderationShuttingDown) return false;
+            pendingModerationManagers.remove(manager);
+            banManager = manager;
+            return true;
+        }
+    }
+
+    private void retirePendingModerationManager(BanManager manager, boolean force) {
+        if (manager == null) return;
+        synchronized (pendingModerationManagersLock) {
+            pendingModerationManagers.remove(manager);
+            manager.shutdown(force);
+        }
+    }
+
+    /** Closes pools whose global-thread install callbacks may be cancelled by disable. */
+    private void closePendingModerationManagers() {
+        List<BanManager> pending;
+        synchronized (pendingModerationManagersLock) {
+            moderationShuttingDown = true;
+            pending = new ArrayList<>(pendingModerationManagers);
+            pendingModerationManagers.clear();
+        }
+        for (BanManager manager : pending) {
+            manager.shutdown(true);
+        }
     }
 
     public void setupTeam() {
@@ -1929,6 +2518,14 @@ public final class PlainBase extends JavaPlugin {
 
     public @Nullable BanManager getBanManager() {
         return banManager;
+    }
+
+    public ModerationState getModerationState() {
+        return moderationState;
+    }
+
+    public Object getModerationGateLock() {
+        return moderationGateLock;
     }
 
     public @Nullable FileConfiguration getModerationConfig() {
@@ -2076,13 +2673,14 @@ public final class PlainBase extends JavaPlugin {
             FileConfiguration rootCfg = getConfig();
             if (rootCfg == null) {
                 getLogger().warning("Cannot save config.yml: config is not loaded.");
-                return CompletableFuture.completedFuture(null);
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("config.yml is not loaded"));
             }
             try {
                 data = rootCfg.saveToString();
             } catch (Exception e) {
                 getLogger().log(java.util.logging.Level.SEVERE, "Could not save config.yml!", e);
-                return CompletableFuture.completedFuture(null);
+                return CompletableFuture.failedFuture(e);
             }
         }
         final long mySeq = configSeq.computeIfAbsent("config.yml", k -> new AtomicLong()).incrementAndGet();
@@ -2097,16 +2695,19 @@ public final class PlainBase extends JavaPlugin {
             try {
                 AtomicLong seq = configSeq.get("config.yml");
                 if (seq != null && seq.get() != mySeq) {
+                    future.completeExceptionally(new java.util.concurrent.CancellationException(
+                            "A newer config save superseded this write."));
                     return;
                 }
                 synchronized (fileLock) {
                     if (seq != null && seq.get() != mySeq) {
+                        future.completeExceptionally(new java.util.concurrent.CancellationException(
+                                "A newer config save superseded this write."));
                         return;
                     }
                     File parent = target.getParentFile();
                     if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
-                        getLogger().warning("Could not create directory: " + parent);
-                        return;
+                        throw new IOException("Could not create directory: " + parent);
                     }
                     java.nio.file.Path tmp = target.toPath().resolveSibling(target.getName() + ".tmp");
                     Files.writeString(tmp, data, StandardCharsets.UTF_8);
@@ -2119,8 +2720,12 @@ public final class PlainBase extends JavaPlugin {
                 }
             } catch (Exception e) {
                 getLogger().log(java.util.logging.Level.SEVERE, "Could not save config.yml!", e);
+                future.completeExceptionally(e);
             } finally {
-                future.complete(null);
+                // Preserve failure state for callers (notably /plainbase
+                // toggle); a failed or superseded write must never look like
+                // a successful persistence operation.
+                if (!future.isDone()) future.complete(null);
             }
         };
         try {
@@ -2128,7 +2733,7 @@ public final class PlainBase extends JavaPlugin {
         } catch (Exception e) {
             getLogger().warning("Could not schedule async save of config.yml"
                     + ", changes will be flushed on shutdown: " + e.getMessage());
-            future.complete(null);
+            future.completeExceptionally(e);
         }
         return future;
     }

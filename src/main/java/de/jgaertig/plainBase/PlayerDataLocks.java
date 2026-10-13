@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase;
 
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Shared per-UUID file locks for {@code data/playerdata/<uuid>.yml}.
@@ -18,6 +19,12 @@ import java.util.UUID;
 public final class PlayerDataLocks {
 
     private static final Object[] STRIPES = init(64);
+    private static final ConcurrentHashMap<UUID, TpAutoSaveState> TP_AUTO_SAVES = new ConcurrentHashMap<>();
+
+    private static final class TpAutoSaveState {
+        private long latestVersion;
+        private int activeSaves;
+    }
 
     private PlayerDataLocks() {
     }
@@ -31,5 +38,32 @@ public final class PlayerDataLocks {
     public static Object lockFor(UUID uuid) {
         int hash = uuid == null ? 0 : uuid.hashCode();
         return STRIPES[(hash & 0x7fffffff) % STRIPES.length];
+    }
+
+    /** Register a save generation shared by manager instances across reload. */
+    public static long beginTpAutoSave(UUID uuid) {
+        synchronized (lockFor(uuid)) {
+            TpAutoSaveState state = TP_AUTO_SAVES.computeIfAbsent(uuid, ignored -> new TpAutoSaveState());
+            state.latestVersion++;
+            state.activeSaves++;
+            return state.latestVersion;
+        }
+    }
+
+    /** True only while this is the newest TP-Auto save for this UUID. */
+    public static boolean isCurrentTpAutoSave(UUID uuid, long version) {
+        synchronized (lockFor(uuid)) {
+            TpAutoSaveState state = TP_AUTO_SAVES.get(uuid);
+            return state != null && state.latestVersion == version;
+        }
+    }
+
+    /** Release a registered save; discard per-player tracking when no task remains. */
+    public static void finishTpAutoSave(UUID uuid) {
+        synchronized (lockFor(uuid)) {
+            TpAutoSaveState state = TP_AUTO_SAVES.get(uuid);
+            if (state == null) return;
+            if (--state.activeSaves <= 0) TP_AUTO_SAVES.remove(uuid, state);
+        }
     }
 }

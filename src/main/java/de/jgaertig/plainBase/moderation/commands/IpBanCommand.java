@@ -8,6 +8,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
+import net.kyori.adventure.text.Component;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
@@ -62,8 +63,10 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
         UUID staffUuid = (sender instanceof Player p) ? p.getUniqueId() : null;
         String staffName = sender.getName();
+        String selfIp = (sender instanceof Player self) ? normalizeIp(addressIp(self)) : null;
+        boolean adminSender = isAdmin(sender);
 
-        resolveIp(sender, target, (ip, dbError) -> {
+        resolveIp(sender, target, (ip, dbError) -> runOnSender(sender, () -> {
             if (isGone(sender)) return;
             if (manager == null || moderationConfig == null) {
                 sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
@@ -85,47 +88,35 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
                 return;
             }
 
-            // Self-IP warning: banning your own address locks YOU out on next login.
-            // Both sides are canonical (normalizeIp), never raw spellings.
-            String selfIp = (sender instanceof Player self) ? normalizeIp(addressIp(self)) : null;
+            // Self-IP warning: captured on the sender's entity thread before
+            // resolveIp can hop through async/global schedulers.
             if (selfIp != null && ip.equals(selfIp)) {
                 sender.sendMessage(render(
                         message("self-ip-warning", "<yellow>Warning: this is your own IP address — you will lock yourself out.")));
             }
 
-            // Exempt/admin check for online players currently on this IP.
-            // Offline owners of the IP cannot be permission-checked, so
-            // non-admins may only ban an IP that belongs to a currently-online
-            // (verifiable) player — anything else is hard-rejected. Admins
-            // bypass (their own audit responsibility).
-            if (!isAdmin(sender)) {
-                boolean protectedOwner = false;
-                boolean anyOnlineOnIp = false;
-                for (Player online : Bukkit.getOnlinePlayers()) {
-                    // Canonical comparison: a raw spelling must never dodge
-                    // (or accidentally match) the stored ban address.
-                    String onlineIp = normalizeIp(addressIp(online));
-                    if (onlineIp != null && ip.equals(onlineIp)) {
-                        anyOnlineOnIp = true;
-                        if (isProtectedTarget(online, sender)) {
-                            protectedOwner = true;
-                            break;
-                        }
+            // Exempt/admin checks inspect each owner's IP and permissions on
+            // that player's Folia region. Non-admins still need at least one
+            // online, verifiable owner and may not target a protected one.
+            if (adminSender) {
+                applyIpBan(manager, sender, ip, reason, staffUuid, staffName);
+            } else {
+                checkOnlineIpOwners(sender, ip, (foundOwner, protectedOwner) -> {
+                    if (isGone(sender)) return;
+                    if (protectedOwner || !foundOwner) {
+                    sender.sendMessage(render(
+                            message("exempt", "<red>You cannot punish this player.")));
+                        return;
                     }
-                }
-                if (protectedOwner) {
-                    sender.sendMessage(render(
-                            message("exempt", "<red>You cannot punish this player.")));
-                    return;
-                }
-                if (!anyOnlineOnIp) {
-                    sender.sendMessage(render(
-                            message("exempt", "<red>You cannot punish this player.")));
-                    return;
-                }
+                    applyIpBan(manager, sender, ip, reason, staffUuid, staffName);
+                });
             }
+        }));
+    }
 
-            manager.tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, (result, banDbError) -> {
+    private void applyIpBan(BanManager manager, CommandSender sender, String ip, String reason,
+                            UUID staffUuid, String staffName) {
+            manager.tryBanIpAsync(ip, reason, staffUuid, staffName, -1L, (result, banDbError) -> runOnSender(sender, () -> {
                 if (isGone(sender)) return;
                 if (banDbError) {
                     sender.sendMessage(render(
@@ -140,13 +131,18 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
                 // Kick any currently-online player connecting from this IP.
                 // Canonical comparison (see above): raw spellings included.
-                for (Player online : Bukkit.getOnlinePlayers()) {
-                    if (ip.equals(normalizeIp(addressIp(online)))) {
-                        kickSafely(online, render(
-                                message("ipban-screen", "<red>Your IP address is banned.\n<gray>Reason: %reason%")
-                                        .replace("%reason%", esc(reason)).replace("%staff%", esc(staffName))
-                                        .replace("%remaining%", "permanent")));
-                    }
+                Component kickMessage = render(
+                        message("ipban-screen", "<red>Your IP address is banned.\n<gray>Reason: %reason%")
+                                .replace("%reason%", esc(reason)).replace("%staff%", esc(staffName))
+                                .replace("%remaining%", "permanent"));
+                try {
+                    Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
+                        for (Player online : List.copyOf(Bukkit.getOnlinePlayers())) {
+                            scheduleIpKickCheck(online, ip, kickMessage);
+                        }
+                    });
+                } catch (RuntimeException e) {
+                    plugin.getLogger().fine("Could not snapshot online players for IP-ban kicks: " + e.getMessage());
                 }
 
                 sender.sendMessage(render(
@@ -155,8 +151,81 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
 
                 broadcast(message("banip-broadcast", "")
                         .replace("%ip%", esc(ip)).replace("%staff%", esc(staffName)).replace("%reason%", esc(reason)));
-            });
-        });
+            }));
+    }
+
+    private void checkOnlineIpOwners(CommandSender sender, String ip, BiConsumer<Boolean, Boolean> callback) {
+        try {
+            Bukkit.getGlobalRegionScheduler().run(plugin, task -> checkOnlineIpOwnersOnSnapshot(sender, ip, callback));
+        } catch (RuntimeException e) {
+            plugin.getLogger().fine("Could not schedule /banip owner snapshot: " + e.getMessage());
+            runOnSender(sender, () -> callback.accept(false, true));
+        }
+    }
+
+    private void checkOnlineIpOwnersOnSnapshot(CommandSender sender, String ip, BiConsumer<Boolean, Boolean> callback) {
+        List<Player> onlinePlayers = List.copyOf(Bukkit.getOnlinePlayers());
+        if (onlinePlayers.isEmpty()) {
+            runOnSender(sender, () -> callback.accept(false, false));
+            return;
+        }
+        java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(onlinePlayers.size());
+        java.util.concurrent.atomic.AtomicBoolean found = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean protectedOwner = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable finish = () -> {
+            if (remaining.decrementAndGet() == 0) {
+                try {
+                    Bukkit.getGlobalRegionScheduler().run(plugin,
+                            task -> runOnSender(sender, () -> callback.accept(found.get(), protectedOwner.get())));
+                } catch (RuntimeException e) {
+                    plugin.getLogger().fine("Could not complete /banip owner check: " + e.getMessage());
+                    // Disable race: the global scheduler is gone, but the
+                    // answer must still reach the sender — route it via the
+                    // sender scheduler instead of leaving them unanswered.
+                    runOnSender(sender, () -> callback.accept(found.get(), protectedOwner.get()));
+                }
+            }
+        };
+        for (Player player : onlinePlayers) {
+            try {
+                player.getScheduler().run(plugin, task -> {
+                    try {
+                        String onlineIp = normalizeIp(addressIp(player));
+                        if (onlineIp == null) {
+                            // An address we cannot read could be the target IP.
+                            protectedOwner.set(true);
+                        } else if (ip.equals(onlineIp)) {
+                            found.set(true);
+                            if (player.hasPermission("plainbase.moderation.exempt")
+                                    || player.hasPermission("plainbase.moderation.admin")
+                                    || player.hasPermission("plainbase.admin")) protectedOwner.set(true);
+                        }
+                    } catch (RuntimeException e) {
+                        // An online owner whose status cannot be checked is
+                        // treated as protected for this non-admin operation.
+                        protectedOwner.set(true);
+                    } finally {
+                        finish.run();
+                    }
+                }, () -> {
+                    protectedOwner.set(true);
+                    finish.run();
+                });
+            } catch (RuntimeException e) {
+                protectedOwner.set(true);
+                finish.run();
+            }
+        }
+    }
+
+    private void scheduleIpKickCheck(Player player, String ip, net.kyori.adventure.text.Component message) {
+        try {
+            player.getScheduler().run(plugin, task -> {
+                if (player.isOnline() && ip.equals(normalizeIp(addressIp(player)))) kickSafely(player, message);
+            }, null);
+        } catch (RuntimeException e) {
+            plugin.getLogger().fine("Could not schedule IP-ban kick check: " + e.getMessage());
+        }
     }
 
     /**
@@ -182,16 +251,24 @@ public class IpBanCommand extends ModerationCommandBase implements BasicCommand 
         // resolve (and ban the IP of) the wrong player on a typo.
         Player online = onlinePlayerExactFirst(arg, sender);
         if (online != null) {
-            String onlineIp = normalizeIp(addressIp(online));
-            if (onlineIp != null) {
-                callback.accept(onlineIp, false);
-                return;
+            Player exact = online;
+            Runnable storedFallback = () -> runOnSender(sender, () -> resolveStoredIp(sender, arg, callback));
+            try {
+                exact.getScheduler().run(plugin, task -> {
+                    String onlineIp = normalizeIp(addressIp(exact));
+                    if (onlineIp != null) callback.accept(onlineIp, false);
+                    else storedFallback.run();
+                }, storedFallback);
+            } catch (RuntimeException e) {
+                storedFallback.run();
             }
-            // Online but the address is currently unavailable (e.g. unresolved)
-            // — fall through to the DB lookup instead of NPE-ing or resolving
-            // garbage.
+            return;
         }
 
+        resolveStoredIp(sender, arg, callback);
+    }
+
+    private void resolveStoredIp(CommandSender sender, String arg, BiConsumer<String, Boolean> callback) {
         // Offline: resolve the exact profile first (phantom-guard via
         // resolveTarget), then look up the last IP by UUID (stable across
         // name changes). The name-based lookup is only the fallback when no

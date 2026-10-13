@@ -13,6 +13,8 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Shared helpers for the moderation commands (ban/tempban/unban/kick/banip/unbanip/
@@ -119,6 +121,19 @@ public abstract class ModerationCommandBase {
         return sender instanceof Player player && !player.isOnline();
     }
 
+    /** Run sender-facing work on the player's entity scheduler (or globally for console). */
+    protected void runOnSender(CommandSender sender, Runnable action) {
+        try {
+            if (sender instanceof Player player) {
+                player.getScheduler().run(plugin, task -> action.run(), () -> { });
+            } else {
+                Bukkit.getGlobalRegionScheduler().run(plugin, task -> action.run());
+            }
+        } catch (RuntimeException e) {
+            plugin.getLogger().fine("Could not schedule moderation sender callback: " + e.getMessage());
+        }
+    }
+
     /**
      * Escapes a user-controlled value (player name, reason, staff name, IP)
      * so it can be safely substituted into a MiniMessage template via
@@ -144,6 +159,35 @@ public abstract class ModerationCommandBase {
         return target.hasPermission("plainbase.moderation.exempt")
                 || target.hasPermission("plainbase.moderation.admin")
                 || target.hasPermission("plainbase.admin");
+    }
+
+    /**
+     * Checks protection permissions on the target's entity scheduler, then
+     * returns the result on the sender's scheduler. Call from sender context
+     * so the sender's admin permissions are read safely before hopping.
+     * Scheduler failure is fail-closed: the punishment is rejected.
+     */
+    protected void checkProtectedTarget(Player target, CommandSender sender, Consumer<Boolean> callback) {
+        if (isAdmin(sender)) {
+            callback.accept(false);
+            return;
+        }
+        try {
+            target.getScheduler().run(plugin, task -> {
+                boolean protectedTarget;
+                try {
+                    protectedTarget = target.hasPermission("plainbase.moderation.exempt")
+                            || target.hasPermission("plainbase.moderation.admin")
+                            || target.hasPermission("plainbase.admin");
+                } catch (RuntimeException e) {
+                    protectedTarget = true;
+                }
+                boolean result = protectedTarget;
+                runOnSender(sender, () -> callback.accept(result));
+            }, () -> runOnSender(sender, () -> callback.accept(true)));
+        } catch (RuntimeException e) {
+            runOnSender(sender, () -> callback.accept(true));
+        }
     }
 
     /**
@@ -547,55 +591,101 @@ public abstract class ModerationCommandBase {
      * (mutations update it synchronously); a cross-server row not yet synced
      * is a documented staleness limitation, same as banlist/baninfo.
      */
-    protected boolean isProtectedBan(de.jgaertig.plainBase.moderation.BanRecord record,
-                                     OfflinePlayer target, CommandSender sender) {
-        Player online = target.getPlayer();
-        if (online != null) {
-            if (isExempt(target, sender) || isProtectedTarget(online, sender)) return true;
-        } else {
-            return true;
-        }
-        if (record == null) return false;
-        // Console-issued bans (null staff) were admin-issued by definition.
-        if (record.staffUuid() == null) return true;
-        // Staff-issued: protected when the staffer currently holds admin perms
-        // (best-effort live check; offline staff cannot be verified).
-        try {
-            Player staff = Bukkit.getPlayer(record.staffUuid());
-            if (staff != null && (staff.hasPermission("plainbase.admin")
-                    || staff.hasPermission("plainbase.moderation.admin"))) return true;
-        } catch (RuntimeException ignored) {
-        }
-        return false;
+    protected void checkProtectedBans(List<de.jgaertig.plainBase.moderation.BanRecord> records,
+                                      OfflinePlayer target, Consumer<Boolean> callback) {
+        checkProtectedRows(records, target, null, callback);
     }
 
     /**
      * R3 unban shield for IP bans: true when lifting this IP ban requires an
      * admin sender — console/admin-staff-issued, or a currently-online player
-     * on that exact IP is protected (exempt/admin). Unlike the ban side there
-     * is deliberately NO "must have a verifiable online owner" requirement:
-     * unbanning punishes nobody, so unverifiable owners fail open here while
-     * the admin-issued shield above stays the hard guard.
+     * on that exact IP is protected (exempt/admin). Each current online
+     * player's address is read on its own entity scheduler; any unavailable
+     * address or failed check is treated as protected.
      */
-    protected boolean isProtectedIpBan(de.jgaertig.plainBase.moderation.IpBanRecord record, String ip) {
-        if (record == null || ip == null) return false;
-        if (record.staffUuid() == null) return true;
+    protected void checkProtectedIpBans(List<de.jgaertig.plainBase.moderation.IpBanRecord> records,
+                                        String ip, Consumer<Boolean> callback) {
+        checkProtectedRows(null, null, new IpShield(records, ip), callback);
+    }
+
+    private record IpShield(List<de.jgaertig.plainBase.moderation.IpBanRecord> records, String ip) { }
+
+    /** All Bukkit player lookups/snapshots happen globally; all player state is read on its own entity scheduler. */
+    private void checkProtectedRows(List<de.jgaertig.plainBase.moderation.BanRecord> banRows,
+                                   OfflinePlayer target, IpShield ipShield, Consumer<Boolean> callback) {
         try {
-            Player staff = Bukkit.getPlayer(record.staffUuid());
-            if (staff != null && (staff.hasPermission("plainbase.admin")
-                    || staff.hasPermission("plainbase.moderation.admin"))) return true;
-        } catch (RuntimeException ignored) {
+            Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
+                try {
+                    List<Player> online = List.copyOf(Bukkit.getOnlinePlayers());
+                    List<Player> required = new java.util.ArrayList<>();
+                    boolean initiallyProtected = false;
+                    if (banRows != null) {
+                        Player targetPlayer = target == null ? null : target.getPlayer();
+                        if (targetPlayer == null) initiallyProtected = true;
+                        else required.add(targetPlayer);
+                        for (var row : banRows) {
+                            if (row == null || row.staffUuid() == null) { initiallyProtected = true; continue; }
+                            Player staff = Bukkit.getPlayer(row.staffUuid());
+                            if (staff == null) initiallyProtected = true;
+                            else required.add(staff);
+                        }
+                    } else {
+                        if (ipShield == null || ipShield.ip() == null || ipShield.records() == null || ipShield.records().isEmpty()) initiallyProtected = true;
+                        else for (var row : ipShield.records()) {
+                            if (row == null || row.staffUuid() == null) { initiallyProtected = true; continue; }
+                            Player staff = Bukkit.getPlayer(row.staffUuid());
+                            if (staff == null) initiallyProtected = true;
+                            else required.add(staff);
+                        }
+                        required.addAll(online);
+                    }
+                    final boolean protectedByLookup = initiallyProtected;
+                    if (required.isEmpty()) { callback.accept(true); return; }
+                    AtomicInteger remaining = new AtomicInteger(required.size());
+                    AtomicBoolean protectedResult = new AtomicBoolean(protectedByLookup);
+                    Runnable done = () -> {
+                        if (remaining.decrementAndGet() == 0) {
+                            try { Bukkit.getGlobalRegionScheduler().run(plugin, t -> callback.accept(protectedResult.get())); }
+                            catch (RuntimeException e) {
+                                plugin.getLogger().fine("Could not complete moderation shield check: " + e.getMessage());
+                                callback.accept(true);
+                            }
+                        }
+                    };
+                    for (Player player : required) {
+                        try {
+                            player.getScheduler().run(plugin, t -> {
+                                try {
+                                    if (!player.isOnline()) protectedResult.set(true);
+                                    else if (banRows != null) {
+                                        boolean isTarget = target != null && player.getUniqueId().equals(target.getUniqueId());
+                                        if (isTarget && (player.hasPermission("plainbase.moderation.exempt")
+                                                || player.hasPermission("plainbase.moderation.admin")
+                                                || player.hasPermission("plainbase.admin"))) protectedResult.set(true);
+                                        if (!isTarget && (player.hasPermission("plainbase.admin")
+                                                || player.hasPermission("plainbase.moderation.admin"))) protectedResult.set(true);
+                                    } else {
+                                        String playerIp = normalizeIp(addressIpOf(player));
+                                        if (playerIp == null) protectedResult.set(true);
+                                        else if (ipShield.ip().equals(playerIp)
+                                                && (player.hasPermission("plainbase.moderation.exempt")
+                                                || player.hasPermission("plainbase.moderation.admin")
+                                                || player.hasPermission("plainbase.admin"))) protectedResult.set(true);
+                                    }
+                                } catch (RuntimeException e) { protectedResult.set(true); }
+                                finally { done.run(); }
+                            }, () -> { protectedResult.set(true); done.run(); });
+                        } catch (RuntimeException e) { protectedResult.set(true); done.run(); }
+                    }
+                } catch (RuntimeException e) {
+                    plugin.getLogger().fine("Could not inspect moderation shield players: " + e.getMessage());
+                    callback.accept(true);
+                }
+            });
+        } catch (RuntimeException e) {
+            plugin.getLogger().fine("Could not schedule moderation shield check: " + e.getMessage());
+            callback.accept(true);
         }
-        try {
-            for (Player online : Bukkit.getOnlinePlayers()) {
-                String onlineIp = normalizeIp(addressIpOf(online));
-                if (ip.equals(onlineIp) && (online.hasPermission("plainbase.moderation.exempt")
-                        || online.hasPermission("plainbase.moderation.admin")
-                        || online.hasPermission("plainbase.admin"))) return true;
-            }
-        } catch (RuntimeException ignored) {
-        }
-        return false;
     }
 
     /**
@@ -646,14 +736,33 @@ public abstract class ModerationCommandBase {
         boolean staffOnly = cfg != null && cfg.getBoolean("broadcast.staff-only", false);
         Component component = render(message);
 
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            if (staffOnly && !p.hasPermission("plainbase.moderation.notify")
-                    && !p.hasPermission("plainbase.moderation.admin") && !p.hasPermission("plainbase.admin")) {
-                continue;
-            }
-            p.sendMessage(component);
+        try {
+            // Bukkit's online-player collection is global state on Folia.
+            // Snapshot it on the global scheduler, then inspect and message
+            // each player only on that player's entity scheduler.
+            Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
+                for (Player player : List.copyOf(Bukkit.getOnlinePlayers())) {
+                    try {
+                        player.getScheduler().run(plugin, recipientTask -> {
+                            try {
+                                if (!player.isOnline()) return;
+                                if (staffOnly && !player.hasPermission("plainbase.moderation.notify")
+                                        && !player.hasPermission("plainbase.moderation.admin")
+                                        && !player.hasPermission("plainbase.admin")) return;
+                                player.sendMessage(component);
+                            } catch (RuntimeException e) {
+                                plugin.getLogger().fine("Could not deliver moderation broadcast to player: " + e.getMessage());
+                            }
+                        }, null);
+                    } catch (RuntimeException e) {
+                        plugin.getLogger().fine("Could not schedule moderation broadcast for player: " + e.getMessage());
+                    }
+                }
+                Bukkit.getConsoleSender().sendMessage(component);
+            });
+        } catch (RuntimeException e) {
+            plugin.getLogger().fine("Could not snapshot moderation broadcast recipients: " + e.getMessage());
         }
-        Bukkit.getConsoleSender().sendMessage(component);
     }
 
     /**

@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Scanner;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.stream.Stream;
 
@@ -34,6 +35,7 @@ public class PlainBaseCommand implements BasicCommand {
     private static final int MODRINTH_MAX_BYTES = 256 * 1024;
 
     private final PlainBase plugin;
+    private final AtomicBoolean toggleInFlight = new AtomicBoolean();
 
     public PlainBaseCommand(PlainBase plugin) {
         this.plugin = plugin;
@@ -49,11 +51,16 @@ public class PlainBaseCommand implements BasicCommand {
         }
 
         if (args.length >= 2 && args[0].equalsIgnoreCase("toggle")) {
+            if (!toggleInFlight.compareAndSet(false, true)) {
+                sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>A module toggle is already being saved. Try again shortly."));
+                return;
+            }
             String moduleName = args[1];
             String safeModule = plugin.getMiniMessage().escapeTags(moduleName);
 
             if (moduleName.isEmpty()) {
                 sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
+                toggleInFlight.set(false);
                 return;
             }
 
@@ -61,7 +68,10 @@ public class PlainBaseCommand implements BasicCommand {
             // reload run on the global region thread, success message in callback.
             try {
                 Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
-                    if (!plugin.isEnabled()) return;
+                    if (!plugin.isEnabled()) {
+                        toggleInFlight.set(false);
+                        return;
+                    }
                     try {
                         // G3 whitelist: only exact top-level keys under "modules"
                         // may be toggled. The old contains("modules."+name) check
@@ -87,8 +97,8 @@ public class PlainBaseCommand implements BasicCommand {
                             // so a reference taken before the lock can be stale.
                             org.bukkit.configuration.file.FileConfiguration rootCfg = plugin.getConfig();
                             if (rootCfg == null) {
-                                if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
-                                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
+                                sendToSender(sender, "<red>Could not toggle module!");
+                                toggleInFlight.set(false);
                                 return;
                             }
                             try {
@@ -111,8 +121,8 @@ public class PlainBaseCommand implements BasicCommand {
                             }
                         }
                         if (!found) {
-                            if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
-                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>This module does not exist!"));
+                            sendToSender(sender, "<red>This module does not exist!");
+                            toggleInFlight.set(false);
                             return;
                         }
                         // NOTE: saveConfigAsync() rewrites config.yml WITHOUT comments
@@ -123,29 +133,51 @@ public class PlainBaseCommand implements BasicCommand {
                         // the reload (which re-reads config.yml from disk) is
                         // chained after the write completed, then the message.
                         final boolean appliedStatus = newStatus;
+                        final boolean previousStatus = !appliedStatus;
+                        final String appliedKey = actualKey;
                         plugin.saveConfigAsync().whenComplete((v, saveError) -> {
                             if (saveError != null) {
                                 plugin.getLogger().warning("Async save of config.yml failed: " + saveError.getMessage());
+                                try {
+                                    Bukkit.getGlobalRegionScheduler().run(plugin, rollbackTask -> {
+                                        synchronized (plugin.getConfigLock()) {
+                                            org.bukkit.configuration.file.FileConfiguration current = plugin.getConfig();
+                                            String path = "modules." + appliedKey;
+                                            if (current != null && current.getBoolean(path) == appliedStatus) {
+                                                current.set(path, previousStatus);
+                                            }
+                                        }
+                                        sendToSender(sender, "<red>Could not save config.yml; the module toggle was reverted.");
+                                        toggleInFlight.set(false);
+                                    });
+                                } catch (Exception rollbackScheduleError) {
+                                    plugin.getLogger().warning("Could not schedule in-memory toggle rollback: "
+                                            + rollbackScheduleError.getMessage());
+                                    sendToSender(sender, "<red>Could not save config.yml; module state may need a reload.");
+                                    toggleInFlight.set(false);
+                                }
+                                return;
                             }
                             try {
                                 Bukkit.getGlobalRegionScheduler().run(plugin, reloadTask -> {
-                                    if (!plugin.isEnabled()) return;
-                                    try {
-                                        plugin.reloadModules();
-                                        if (sender instanceof Player player && !player.isOnline()) return;
-                                        String statusColor = appliedStatus ? "<green>enabled" : "<red>disabled";
-                                        sender.sendMessage(plugin.getMiniMessage().deserialize(
-                                                "<gray>The module <yellow>" + safeModule + "</yellow> has been " + statusColor + "<gray>."
-                                                        + " <dark_gray>(Note: saving removed comments from config.yml.)"
-                                        ));
-                                    } catch (Exception e) {
-                                        plugin.getLogger().log(Level.WARNING, "Failed to reload after toggle of " + moduleName, e);
-                                        try {
-                                            if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
-                                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
-                                        } catch (Exception ignored) {
-                                        }
+                                    if (!plugin.isEnabled()) {
+                                        toggleInFlight.set(false);
+                                        return;
                                     }
+                                    plugin.reloadModulesAsync().whenComplete((ignored, reloadError) -> {
+                                        if (reloadError != null) {
+                                            plugin.getLogger().log(Level.WARNING,
+                                                    "Failed to reload after toggle of " + moduleName, reloadError);
+                                            sendToSender(sender, "<red>Could not toggle module!");
+                                            toggleInFlight.set(false);
+                                            return;
+                                        }
+                                        String statusColor = appliedStatus ? "<green>enabled" : "<red>disabled";
+                                        sendToSender(sender, "<gray>The module <yellow>" + safeModule
+                                                + "</yellow> has been " + statusColor + "<gray>."
+                                                + " <dark_gray>(Note: saving removed comments from config.yml.)");
+                                        toggleInFlight.set(false);
+                                    });
                                 });
                             } catch (Exception e) {
                                 plugin.getLogger().warning("Failed to schedule reload after toggle: " + e.getMessage());
@@ -153,46 +185,32 @@ public class PlainBaseCommand implements BasicCommand {
                                     sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
                                 } catch (Exception ignored) {
                                 }
+                                toggleInFlight.set(false);
                             }
                         });
                     } catch (Exception e) {
                         plugin.getLogger().log(Level.WARNING, "Failed to toggle module " + moduleName, e);
-                        try {
-                            if (sender instanceof Player toggleOffline && !toggleOffline.isOnline()) return;
-                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
-                        } catch (Exception ignored) {
-                        }
+                        sendToSender(sender, "<red>Could not toggle module!");
+                        toggleInFlight.set(false);
                     }
                 });
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to schedule module toggle: " + e.getMessage());
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not toggle module!"));
+                sendToSender(sender, "<red>Could not toggle module!");
+                toggleInFlight.set(false);
             }
             return;
         }
 
         if (args.length >= 1 && args[0].equalsIgnoreCase("reload")) {
-            // Folia: reloadModules() touches Bukkit state — hop to the global
-            // region thread, success message in callback.
-            try {
-                Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
-                    if (!plugin.isEnabled()) return;
-                    try {
-                        plugin.reloadModules();
-                        if (sender instanceof Player player && !player.isOnline()) return;
-                        sender.sendMessage(plugin.getMiniMessage().deserialize("<green>Config reloaded and modules updated!"));
-                    } catch (Exception e) {
-                        plugin.getLogger().log(Level.WARNING, "Failed to reload modules", e);
-                        try {
-                            sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reload modules!"));
-                        } catch (Exception ignored) {
-                        }
-                    }
-                });
-            } catch (Exception e) {
-                plugin.getLogger().warning("Failed to schedule reload: " + e.getMessage());
-                sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reload modules!"));
-            }
+            plugin.reloadModulesAsync().whenComplete((ignored, error) -> {
+                if (error != null) {
+                    plugin.getLogger().log(Level.WARNING, "Failed to reload modules", error);
+                    sendToSender(sender, "<red>Could not reload modules!");
+                } else {
+                    sendToSender(sender, "<green>Config reloaded and modules updated!");
+                }
+            });
             return;
         }
 
@@ -200,7 +218,7 @@ public class PlainBaseCommand implements BasicCommand {
             final String serverVersionRaw = Bukkit.getMinecraftVersion();
             final String serverVersion = serverVersionRaw == null ? "unknown" : serverVersionRaw;
             String safeVersion = plugin.getMiniMessage().escapeTags(serverVersion);
-            sender.sendMessage(plugin.getMiniMessage().deserialize("<gray>Checking for updates for Minecraft " + safeVersion + "..."));
+            sendToSender(sender, "<gray>Checking for updates for Minecraft " + safeVersion + "...");
 
             try {
                 Bukkit.getAsyncScheduler().runNow(plugin, task -> {
@@ -215,16 +233,13 @@ public class PlainBaseCommand implements BasicCommand {
                 try {
                     Bukkit.getGlobalRegionScheduler().run(plugin, scheduledTask -> {
                         if (!plugin.isEnabled()) return;
-                        if (sender instanceof Player player && !player.isOnline()) {
-                            return;
-                        }
                     if (latestVersion == null) {
-                        sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not reach Modrinth. Please try again later."));
+                        sendToSender(sender, "<red>Could not reach Modrinth. Please try again later.");
                         return;
                     }
 
                     if (latestVersion.equals("NOT_FOUND")) {
-                        sender.sendMessage(plugin.getMiniMessage().deserialize("<yellow>No compatible version found for Minecraft " + safeVersion + "."));
+                        sendToSender(sender, "<yellow>No compatible version found for Minecraft " + safeVersion + ".");
                         return;
                     }
 
@@ -234,12 +249,10 @@ public class PlainBaseCommand implements BasicCommand {
                     String safeLatest = plugin.getMiniMessage().escapeTags(latestSafe);
                     String safeCurrent = plugin.getMiniMessage().escapeTags(currentVersion);
                     if (compareVersions(currentVersion, latestVersion) >= 0) {
-                        sender.sendMessage(plugin.getMiniMessage().deserialize("<green>You are running the latest version! (" + safeCurrent + ")"));
+                        sendToSender(sender, "<green>You are running the latest version! (" + safeCurrent + ")");
                     } else {
-                        sender.sendMessage(plugin.getMiniMessage().deserialize(
-                                "<yellow>A new version is available: <bold>" + safeLatest + "</bold>\n" +
-                                        "<gray>Download here: <click:open_url:'https://modrinth.com/plugin/plainbase'><underlined><blue>modrinth.com/plugin/plainbase</blue></underlined></click>"
-                        ));
+                        sendToSender(sender, "<yellow>A new version is available: <bold>" + safeLatest + "</bold>\n" +
+                                "<gray>Download here: <click:open_url:'https://modrinth.com/plugin/plainbase'><underlined><blue>modrinth.com/plugin/plainbase</blue></underlined></click>");
                     }
                     });
                 } catch (Exception e) {
@@ -248,10 +261,7 @@ public class PlainBaseCommand implements BasicCommand {
                 });
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to schedule update check: " + e.getMessage());
-                try {
-                    sender.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not check for updates!"));
-                } catch (Exception ignored) {
-                }
+                sendToSender(sender, "<red>Could not check for updates!");
             }
             return;
         }
@@ -466,6 +476,28 @@ public class PlainBaseCommand implements BasicCommand {
             } catch (NumberFormatException e2) {
                 return 0;
             }
+        }
+    }
+
+    private void sendToSender(CommandSender sender, String miniMessage) {
+        try {
+            Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
+                if (!plugin.isEnabled()) return;
+                net.kyori.adventure.text.Component component = plugin.getMiniMessage().deserialize(miniMessage);
+                if (sender instanceof Player player) {
+                    try {
+                        player.getScheduler().run(plugin, entityTask -> {
+                            if (player.isOnline()) player.sendMessage(component);
+                        }, null);
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("Could not schedule command response for player: " + e.getMessage());
+                    }
+                } else {
+                    sender.sendMessage(component);
+                }
+            });
+        } catch (Exception e) {
+            plugin.getLogger().fine("Could not schedule command response: " + e.getMessage());
         }
     }
 }

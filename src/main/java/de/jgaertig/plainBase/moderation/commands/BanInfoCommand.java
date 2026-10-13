@@ -42,7 +42,7 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
         // keeps the callback working instead of NPE-ing.
         BanManager manager = plugin.getBanManager();
 
-        resolveTarget(sender, targetName, offlinePlayer -> {
+        resolveTarget(sender, targetName, offlinePlayer -> runOnSender(sender, () -> {
             // Async hop (uncached names resolve off-thread): the sender may
             // have logged off while we waited — skip instead of messaging
             // a stale/gone sender.
@@ -117,7 +117,7 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                     dbError = true;
                 }
                 if (dbError) {
-                    org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                    runOnSender(sender, () -> {
                         if (isGone(sender)) return;
                         sender.sendMessage(render(
                                 message("db-error", "<red>Database error, please try again later.")));
@@ -138,7 +138,7 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                     ipBanned = manager.queryActiveIpBanNow(normLast) != null;
                 } catch (SQLException | RuntimeException e) {
                     plugin.getLogger().warning("Could not check IP ban for " + name + ": " + e.getMessage());
-                    org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                    runOnSender(sender, () -> {
                         if (isGone(sender)) return;
                         sender.sendMessage(render(
                                 message("db-error", "<red>Database error, please try again later.")));
@@ -147,13 +147,13 @@ public class BanInfoCommand extends ModerationCommandBase implements BasicComman
                 }
                 if (!ipBanned) return;
 
-                org.bukkit.Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                runOnSender(sender, () -> {
                     if (isGone(sender)) return;
                     sender.sendMessage(render(
                             message("baninfo-ip-banned", "<gray>Note: their last known IP address is currently banned too.")));
                 });
             });
-        });
+        }));
     }
 
     @Override

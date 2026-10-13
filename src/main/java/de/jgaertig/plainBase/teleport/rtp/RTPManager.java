@@ -1,6 +1,7 @@
 package de.jgaertig.plainBase.teleport.rtp;
 
 import de.jgaertig.plainBase.PlainBase;
+import de.jgaertig.plainBase.teleport.WarmupReservations;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -41,15 +42,43 @@ public class RTPManager {
     // and searches), so pending RTP cooldowns reset on reload. No persistence —
     // documented behaviour, not a leak; entries of players who never return are
     // purged opportunistically on read (isOnCooldown) and on quit/cancel.
-    private final Map<UUID, Long> cooldowns = new ConcurrentHashMap<>();
+    private record CooldownEntry(long expiresAt, Object operationIdentity) {}
+
+    private final Map<UUID, CooldownEntry> cooldowns = new ConcurrentHashMap<>();
     private final Map<UUID, ScheduledTask> activeWarmups = new ConcurrentHashMap<>();
-    private final Set<UUID> searching = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, Object> searching = new ConcurrentHashMap<>();
+    private final Map<UUID, Object> warmupIdentities = new ConcurrentHashMap<>();
+    private final Object warmupLock = new Object();
+    private volatile boolean shuttingDown;
 
     public RTPManager(PlainBase plugin) {
         this.plugin = plugin;
     }
 
+    private void notifyPlayer(Player player, String message) {
+        if (player == null) return;
+        try {
+            player.getScheduler().run(plugin, task -> {
+                if (player.isOnline()) player.sendMessage(plugin.getMiniMessage().deserialize(message));
+            }, null);
+        } catch (RuntimeException e) {
+            plugin.getLogger().fine("Could not schedule RTP notification: " + e.getMessage());
+        }
+    }
+
     public void startRTPProcess(Player player) {
+        if (player == null) return;
+        // Brigadier may invoke command bodies on the global region thread.
+        // Snapshot entity-owned state and send replies only on this player's
+        // scheduler, which is also valid on a conventional Paper server.
+        try {
+            player.getScheduler().run(plugin, task -> startRTPProcessOnEntity(player), null);
+        } catch (RuntimeException e) {
+            plugin.getLogger().fine("Could not schedule RTP start for player: " + e.getMessage());
+        }
+    }
+
+    private void startRTPProcessOnEntity(Player player) {
         if (player == null || !player.isOnline()) return;
         // Dead players must never start a search (warmup death always cancels
         // via TeleportListener, this is the early reject for /rtp while dead).
@@ -63,6 +92,10 @@ public class RTPManager {
             return;
         }
         if (isOnCooldown(player)) return;
+        if (WarmupReservations.isReserved(player.getUniqueId())) {
+            player.sendMessage(plugin.getMiniMessage().deserialize("<red>You are already part of a teleport in progress."));
+            return;
+        }
 
         // Early TPA-warmup precheck (before setCooldown): a running TPA warmup
         // wins. Aborting here avoids consuming the RTP cooldown and starting
@@ -77,12 +110,24 @@ public class RTPManager {
         }
 
         UUID uuid = player.getUniqueId();
-        if (activeWarmups.containsKey(uuid) || !searching.add(uuid)) {
-            player.sendMessage(plugin.getMiniMessage().deserialize("<red>You are already searching for a safe location!"));
+        Object searchIdentity = new Object();
+        boolean alreadyActive;
+        boolean unavailable;
+        synchronized (warmupLock) {
+            // Search publication and its cooldown are one operation relative
+            // to cancelSearch/quit. Otherwise cancellation can refund before
+            // setCooldown publishes, leaving a cooldown for a dead search.
+            unavailable = shuttingDown || plugin.getRTPManager() != this;
+            alreadyActive = unavailable || activeWarmups.containsKey(uuid) || warmupIdentities.containsKey(uuid)
+                    || searching.putIfAbsent(uuid, searchIdentity) != null;
+            if (!alreadyActive) setCooldown(player, searchIdentity);
+        }
+        if (alreadyActive) {
+            player.sendMessage(plugin.getMiniMessage().deserialize(unavailable
+                    ? "<red>RTP is reloading. Try again shortly."
+                    : "<red>You are already searching for a safe location!"));
             return;
         }
-
-        setCooldown(player);
 
         player.sendMessage(plugin.getMiniMessage().deserialize("<gray>Searching for a safe location..."));
 
@@ -95,51 +140,49 @@ public class RTPManager {
 
         try {
             Bukkit.getAsyncScheduler().runNow(plugin, (task) -> {
-                tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, 0);
+                tryNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, 0);
             });
         } catch (Exception e) {
             // Scheduler rejected (e.g. plugin disabling): never leak the
             // searching entry or a cooldown for a search that never ran.
-            searching.remove(uuid);
-            cooldowns.remove(uuid);
+            searching.remove(uuid, searchIdentity);
+            refundSearchCooldown(uuid, searchIdentity);
             plugin.getLogger().warning("Could not start RTP search for " + player.getName() + ": " + e.getMessage());
         }
     }
 
-    private void scheduleNextAttempt(Player player, World world, double centerX, double centerZ,
+    private void scheduleNextAttempt(Player player, UUID uuid, Object searchIdentity, World world, double centerX, double centerZ,
                                        double halfSize, Location spawnLoc, Location originLoc, int nextAttempt) {
-        if (player == null) return;
-        UUID uuid;
-        try {
-            uuid = player.getUniqueId();
-        } catch (Exception e) {
-            return;
-        }
+        if (player == null || uuid == null || !isCurrentSearch(uuid, searchIdentity)) return;
         try {
             Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                    tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+                    tryNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
         } catch (Exception e) {
-            searching.remove(uuid);
-            cooldowns.remove(uuid);
-            plugin.getLogger().warning("Could not continue RTP search for " + player.getName() + ": " + e.getMessage());
+            searching.remove(uuid, searchIdentity);
+            refundSearchCooldown(uuid, searchIdentity);
+            plugin.getLogger().warning("Could not continue RTP search for " + uuid + ": " + e.getMessage());
         }
+    }
+
+    private boolean isCurrentSearch(UUID uuid, Object identity) {
+        return uuid != null && identity != null && searching.get(uuid) == identity;
     }
 
     private boolean isInsideBorder(World world, Location loc) {
         if (world == null || loc == null) return false;
         try {
             var border = world.getWorldBorder();
-            if (border == null) return true;
+            if (border == null) return false;
             double centerX = border.getCenter().getX();
             double centerZ = border.getCenter().getZ();
             double half = border.getSize() / 2.0;
-            if (!Double.isFinite(centerX) || !Double.isFinite(centerZ) || !Double.isFinite(half)) return true;
+            if (!Double.isFinite(centerX) || !Double.isFinite(centerZ) || !Double.isFinite(half)) return false;
             double x = loc.getX();
             double z = loc.getZ();
             if (!Double.isFinite(x) || !Double.isFinite(z)) return false;
             return Math.abs(x - centerX) <= half && Math.abs(z - centerZ) <= half;
         } catch (Exception e) {
-            return true;
+            return false;
         }
     }
 
@@ -176,25 +219,20 @@ public class RTPManager {
         return true;
     }
 
-    private void tryNextAttempt(Player player, World world, double centerX, double centerZ,
+    private void tryNextAttempt(Player player, UUID uuid, Object searchIdentity, World world, double centerX, double centerZ,
                                 double halfSize, Location spawnLoc, Location originLoc, int attempt) {
-        if (player == null) return;
-        UUID uuid = player.getUniqueId();
+        if (player == null || uuid == null) return;
         // Stale async chain: the search was cancelled (quit, TPA start,
         // cancelAll) while this attempt was queued — never continue.
-        if (!searching.contains(uuid)) return;
-        if (!player.isOnline()) {
-            searching.remove(uuid);
-            return;
-        }
+        if (!isCurrentSearch(uuid, searchIdentity)) return;
 
         if (attempt >= MAX_ATTEMPTS) {
             // A failed search must not punish with a cooldown.
-            cooldowns.remove(uuid);
+            refundSearchCooldown(uuid, searchIdentity);
             try {
                 player.getScheduler().run(plugin, (t) -> {
-                    if (!searching.contains(uuid)) return;
-                    searching.remove(uuid);
+                    if (!isCurrentSearch(uuid, searchIdentity)) return;
+                    searching.remove(uuid, searchIdentity);
                     if (player.isOnline()) {
                         player.sendMessage(plugin.getMiniMessage().deserialize("<red>Could not find a safe location. Try again later!"));
                     }
@@ -202,7 +240,7 @@ public class RTPManager {
             } catch (Exception e) {
                 // Scheduler rejected (player gone / plugin disabling):
                 // still release the searching entry so it can never leak.
-                searching.remove(uuid);
+                searching.remove(uuid, searchIdentity);
             }
             return;
         }
@@ -229,24 +267,24 @@ public class RTPManager {
         try {
             Bukkit.getRegionScheduler().execute(plugin, world, chunkX, chunkZ, () -> {
                 try {
-                    runAttemptOnRegion(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, uuid, finalX, finalZ, nextAttempt);
+                runAttemptOnRegion(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, uuid, searchIdentity, finalX, finalZ, nextAttempt);
                 } catch (Exception e) {
                     // Unexpected failure on the region thread: retry once via
                     // async unless the search already ended or attempts are up.
-                    if (!searching.contains(uuid)) return;
+                    if (!isCurrentSearch(uuid, searchIdentity)) return;
                     try {
                         Bukkit.getAsyncScheduler().runNow(plugin, (t) ->
-                                tryNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
+                                tryNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt));
                     } catch (Exception ignored) {
-                        searching.remove(uuid);
-                        cooldowns.remove(uuid);
+                        searching.remove(uuid, searchIdentity);
+                        refundSearchCooldown(uuid, searchIdentity);
                     }
                 }
             });
         } catch (Exception e) {
-            searching.remove(uuid);
-            cooldowns.remove(uuid);
-            plugin.getLogger().warning("Could not continue RTP search for " + player.getName() + ": " + e.getMessage());
+            searching.remove(uuid, searchIdentity);
+            refundSearchCooldown(uuid, searchIdentity);
+            plugin.getLogger().warning("Could not continue RTP search for " + uuid + ": " + e.getMessage());
             try {
                 player.getScheduler().run(plugin, (t) -> {
                     if (player.isOnline()) {
@@ -260,36 +298,11 @@ public class RTPManager {
 
     private void runAttemptOnRegion(Player player, World world, double centerX, double centerZ,
                                     double halfSize, Location spawnLoc, Location originLoc,
-                                    UUID uuid, int finalX, int finalZ, int nextAttempt) {
+                                    UUID uuid, Object searchIdentity, int finalX, int finalZ, int nextAttempt) {
         // Stale async chain: the search was cancelled (quit, TPA start, death,
         // cancelAll) while this attempt was queued — never continue.
-        if (uuid == null || !searching.contains(uuid)) return;
-        if (!player.isOnline()) {
-            searching.remove(uuid);
-            return;
-        }
-        // The world was snapshotted at search start; the player may have
-        // changed worlds while attempts were queued. Never teleport across
-        // the stale snapshot — abort with a cooldown refund.
-        try {
-            if (world == null || !player.getWorld().equals(world)) {
-                searching.remove(uuid);
-                cooldowns.remove(uuid);
-                try {
-                    player.getScheduler().run(plugin, (t) -> {
-                        if (player.isOnline()) {
-                            player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
-                        }
-                    }, null);
-                } catch (Exception ignored) {
-                }
-                return;
-            }
-        } catch (Exception e) {
-            searching.remove(uuid);
-            cooldowns.remove(uuid);
-            return;
-        }
+        if (uuid == null || !isCurrentSearch(uuid, searchIdentity)) return;
+        if (world == null) return;
 
         int y;
         try {
@@ -301,12 +314,12 @@ public class RTPManager {
             // documented option, no risky refactor.
             y = world.getHighestBlockYAt(finalX, finalZ);
         } catch (Exception e) {
-            scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
+            scheduleNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
             return;
         }
 
         if (y <= world.getMinHeight() || y + 1 >= world.getMaxHeight() - 2) {
-            scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
+            scheduleNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
             return;
         }
 
@@ -316,7 +329,7 @@ public class RTPManager {
             double dx = (finalX + 0.5) - spawnLoc.getX();
             double dz = (finalZ + 0.5) - spawnLoc.getZ();
             if (dx * dx + dz * dz < 256 * 256) {
-                scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
+                scheduleNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
                 return;
             }
         }
@@ -325,22 +338,8 @@ public class RTPManager {
             double dx = (finalX + 0.5) - originLoc.getX();
             double dz = (finalZ + 0.5) - originLoc.getZ();
             if (dx * dx + dz * dz < 500 * 500) {
-                scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
+                scheduleNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
                 return;
-            }
-            // Re-check distance against the player's current position: they may
-            // have moved since the search started (originLoc is a snapshot).
-            try {
-                Location current = player.getLocation();
-                if (current != null && current.getWorld() != null && current.getWorld().equals(world)) {
-                    double cdx = (finalX + 0.5) - current.getX();
-                    double cdz = (finalZ + 0.5) - current.getZ();
-                    if (cdx * cdx + cdz * cdz < 500 * 500) {
-                        scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
-                        return;
-                    }
-                }
-            } catch (Exception ignored) {
             }
         }
 
@@ -353,31 +352,50 @@ public class RTPManager {
 
         if (safe) {
             Location dest = loc.clone();
-            player.getScheduler().run(plugin, (t) -> {
-                try {
-                    if (!searching.contains(uuid)) return;
-                    if (!player.isOnline()) return;
-                    proceedToWarmup(player, dest);
-                } finally {
-                    searching.remove(uuid);
-                }
-            }, null);
+            try {
+                player.getScheduler().run(plugin, (t) -> {
+                    try {
+                        if (!isCurrentSearch(uuid, searchIdentity) || !player.isOnline()) return;
+                        if (!player.getWorld().equals(dest.getWorld())) {
+                            refundSearchCooldown(uuid, searchIdentity);
+                            player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
+                            return;
+                        }
+                        Location current = player.getLocation();
+                        if (current.getWorld() != null && current.getWorld().equals(dest.getWorld())) {
+                            double dx = dest.getX() - current.getX();
+                            double dz = dest.getZ() - current.getZ();
+                            if (dx * dx + dz * dz < 500 * 500) {
+                                refundSearchCooldown(uuid, searchIdentity);
+                                player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer far enough away. Try again!"));
+                                return;
+                            }
+                        }
+                        proceedToWarmup(player, dest, uuid, searchIdentity);
+                    } finally {
+                        searching.remove(uuid, searchIdentity);
+                    }
+                }, null);
+            } catch (Exception e) {
+                if (searching.remove(uuid, searchIdentity)) refundSearchCooldown(uuid, searchIdentity);
+                plugin.getLogger().fine("Failed to schedule RTP safe-location continuation for " + uuid + ": " + e.getMessage());
+            }
         } else {
-            scheduleNextAttempt(player, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
+            scheduleNextAttempt(player, uuid, searchIdentity, world, centerX, centerZ, halfSize, spawnLoc, originLoc, nextAttempt);
         }
     }
 
-    private void proceedToWarmup(Player player, Location foundLoc) {
-        if (player == null || !player.isOnline()) return;
+    private void proceedToWarmup(Player player, Location foundLoc, UUID uuid, Object searchIdentity) {
+        if (player == null || uuid == null || !isCurrentSearch(uuid, searchIdentity) || !player.isOnline()) return;
         // Dead players must never enter a warmup (race guard when death lands
         // between search and warmup). Refunds the cooldown like other aborts.
         try {
             if (player.isDead()) {
-                cooldowns.remove(player.getUniqueId());
+                refundSearchCooldown(uuid, searchIdentity);
                 return;
             }
         } catch (Exception e) {
-            cooldowns.remove(player.getUniqueId());
+            refundSearchCooldown(uuid, searchIdentity);
             return;
         }
 
@@ -386,45 +404,25 @@ public class RTPManager {
         // Never deref fresh or abort silently — tell the player.
         org.bukkit.configuration.file.FileConfiguration teleportConfig = plugin.getTeleportConfig();
         if (teleportConfig == null) {
-            cooldowns.remove(player.getUniqueId());
+            refundSearchCooldown(uuid, searchIdentity);
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport is currently unavailable."));
             return;
         }
 
-        // Double-warmup guard (RTP side): a pending TPA warmup for the same player
-        // must not fire after this RTP teleport. cancelWarmup is a no-op with no
-        // message when no TPA warmup exists. Mirror direction (TPA start cancels
-        // RTP) lives in TPAManager.
-        // Priority: a running warmup wins. If a TPA warmup is already pending,
-        // the new RTP search aborts (with a cooldown refund) instead of
-        // killing the TPA warmup.
-        try {
-            if (plugin.getTPAManager() != null && plugin.getTPAManager().hasWarmup(player)) {
-                cooldowns.remove(player.getUniqueId());
-                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: a teleport is already in progress."));
-                return;
-            }
-        } catch (Exception e) {
-            plugin.getLogger().fine("Failed to check TPA warmup for " + player.getName() + ": " + e.getMessage());
-        }
-        try {
-            if (plugin.getTPAManager() != null) {
-                plugin.getTPAManager().cancelWarmup(player, "RTP started.");
-            }
-        } catch (Exception e) {
-            plugin.getLogger().fine("Failed to cancel TPA warmup for " + player.getName() + ": " + e.getMessage());
-        }
+        // TPA and RTP claim the shared reservation atomically below, after
+        // validation. Never cancel another manager's token here: that would
+        // reopen the race between checking and reserving.
 
         // World re-check: the player may have changed worlds during the async
         // search. Never warm up towards a stale world snapshot.
         try {
             if (foundLoc == null || foundLoc.getWorld() == null || !player.getWorld().equals(foundLoc.getWorld())) {
-                cooldowns.remove(player.getUniqueId());
+                refundSearchCooldown(uuid, searchIdentity);
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
                 return;
             }
         } catch (Exception e) {
-            cooldowns.remove(player.getUniqueId());
+            refundSearchCooldown(uuid, searchIdentity);
             return;
         }
 
@@ -432,12 +430,12 @@ public class RTPManager {
         // async search — never warm up towards a spot outside the CURRENT border.
         try {
             if (!isInsideBorder(player.getWorld(), foundLoc)) {
-                cooldowns.remove(player.getUniqueId());
+                refundSearchCooldown(uuid, searchIdentity);
                 player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: location is outside the world border. Try again!"));
                 return;
             }
         } catch (Exception e) {
-            cooldowns.remove(player.getUniqueId());
+            refundSearchCooldown(uuid, searchIdentity);
             return;
         }
 
@@ -449,13 +447,13 @@ public class RTPManager {
                 double dx = foundLoc.getX() - current.getX();
                 double dz = foundLoc.getZ() - current.getZ();
                 if (dx * dx + dz * dz < 500 * 500) {
-                    cooldowns.remove(player.getUniqueId());
+                    refundSearchCooldown(uuid, searchIdentity);
                     player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer far enough away. Try again!"));
                     return;
                 }
             }
         } catch (Exception e) {
-            cooldowns.remove(player.getUniqueId());
+            refundSearchCooldown(uuid, searchIdentity);
             return;
         }
 
@@ -463,49 +461,94 @@ public class RTPManager {
         // Clamp like tpa.counter.seconds: negative/huge values must never
         // leak into the scheduler delay or the displayed countdown.
         seconds = Math.max(0, Math.min(30, seconds));
+        Object warmupIdentity = new Object();
+        synchronized (warmupLock) {
+            if (shuttingDown || plugin.getRTPManager() != this) {
+                refundSearchCooldown(uuid, searchIdentity);
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP is reloading. Try again shortly."));
+                return;
+            }
+            if (!WarmupReservations.reserve(uuid, warmupIdentity)) {
+                refundSearchCooldown(uuid, searchIdentity);
+                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: a teleport is already in progress."));
+                return;
+            }
+            // Reservation publication and cancelAll's shutdown barrier share
+            // this lock, so reload cannot miss this identity.
+            warmupIdentities.put(uuid, warmupIdentity);
+            transferSearchCooldown(uuid, searchIdentity, warmupIdentity);
+        }
         if (!teleportConfig.getBoolean("rtp.counter.enabled", true) || seconds <= 0) {
-            executeTeleport(player, foundLoc);
+            executeTeleport(player, foundLoc, uuid, warmupIdentity);
             return;
         }
-
-        ScheduledTask old = activeWarmups.remove(player.getUniqueId());
-        if (old != null) old.cancel();
 
         player.sendMessage(plugin.getMiniMessage().deserialize("<green>Safe location found!"));
         player.sendMessage(plugin.getMiniMessage().deserialize("<gray>Teleporting in <yellow>" + seconds + " <gray>seconds. Do not move, take damage or interact!"));
 
         final long capturedGeneration = generation;
-        ScheduledTask warmupTask = player.getScheduler().runDelayed(plugin, (wt) -> {
-            // Generation guard: a stale task of a previous manager instance
-            // (reload) must never teleport.
-            if (capturedGeneration != GENERATION.get() || plugin.getRTPManager() != this) return;
-            activeWarmups.remove(player.getUniqueId());
-            executeTeleport(player, foundLoc);
-        }, null, seconds * 20L);
-
-        // Atomic reservation: a concurrent TPA warmup for the same player may
-        // have been registered after the remove() above — putIfAbsent lets the
-        // already-running warmup win instead of overwriting it (TOCTOU with
-        // TPAManager.startTeleportProcedure, which mirrors this). Cooldown is
-        // refunded, same as the TPA-warmup-present abort above.
-        if (activeWarmups.putIfAbsent(player.getUniqueId(), warmupTask) != null) {
-            warmupTask.cancel();
-            cooldowns.remove(player.getUniqueId());
-            player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: a teleport is already in progress."));
+        final ScheduledTask warmupTask;
+        try {
+            warmupTask = player.getScheduler().runDelayed(plugin, (wt) -> {
+                // Generation and identity guards keep stale callbacks from an
+                // old manager/search from clearing or using a newer warmup.
+                if (!WarmupReservations.isOwner(uuid, warmupIdentity)) return;
+                if (capturedGeneration != GENERATION.get() || plugin.getRTPManager() != this) {
+                    refundWarmupCooldown(uuid, warmupIdentity);
+                    finishWarmup(uuid, warmupIdentity);
+                    return;
+                }
+                activeWarmups.remove(uuid);
+                executeTeleport(player, foundLoc, uuid, warmupIdentity);
+            }, null, seconds * 20L);
+        } catch (Exception e) {
+            warmupIdentities.remove(uuid, warmupIdentity);
+            WarmupReservations.release(uuid, warmupIdentity);
+            refundWarmupCooldown(uuid, warmupIdentity);
+            player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP failed to start. Try again later."));
             return;
+        }
+
+        synchronized (warmupLock) {
+            if (WarmupReservations.isOwner(uuid, warmupIdentity)
+                    && warmupIdentities.get(uuid) == warmupIdentity) {
+                activeWarmups.put(uuid, warmupTask);
+                if (!WarmupReservations.isOwner(uuid, warmupIdentity)
+                        || warmupIdentities.get(uuid) != warmupIdentity) {
+                    activeWarmups.remove(uuid, warmupTask);
+                    warmupTask.cancel();
+                }
+            } else {
+                warmupTask.cancel();
+            }
         }
     }
 
-    private void executeTeleport(Player player, Location loc) {
-        if (player == null || !player.isOnline()) return;
+    private void executeTeleport(Player player, Location loc, UUID uuid, Object warmupIdentity) {
+        if (player == null || !WarmupReservations.isOwner(uuid, warmupIdentity)) return;
         // Dead players must never be teleported (warmup death always cancels,
         // this is the race guard when death lands after the warmup fired).
         try {
             if (player.isDead()) {
-                cooldowns.remove(player.getUniqueId());
+                refundWarmupCooldown(uuid, warmupIdentity);
+                finishWarmup(uuid, warmupIdentity);
                 return;
             }
         } catch (Exception ignored) {
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
+            return;
+        }
+        try {
+            if (!player.isOnline()) {
+                refundWarmupCooldown(uuid, warmupIdentity);
+                finishWarmup(uuid, warmupIdentity);
+                return;
+            }
+        } catch (Exception e) {
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
+            return;
         }
         // Runs on the entity thread: re-validate world and safety — the spot
         // was checked seconds ago at search time and the terrain or the
@@ -519,27 +562,31 @@ public class RTPManager {
         final Location dest = loc.clone();
         try {
             if (dest.getWorld() == null || !player.getWorld().equals(dest.getWorld())) {
-                cooldowns.remove(player.getUniqueId());
+                refundWarmupCooldown(uuid, warmupIdentity);
+                finishWarmup(uuid, warmupIdentity);
                 if (player.isOnline()) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: you changed worlds."));
                 }
                 return;
             }
         } catch (Exception e) {
-            cooldowns.remove(player.getUniqueId());
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
             return;
         }
         // Border re-validation: the border may have changed during the warmup.
         try {
             if (!isInsideBorder(dest.getWorld(), dest)) {
-                cooldowns.remove(player.getUniqueId());
+                refundWarmupCooldown(uuid, warmupIdentity);
+                finishWarmup(uuid, warmupIdentity);
                 if (player.isOnline()) {
                     player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: location is outside the world border. Try again!"));
                 }
                 return;
             }
         } catch (Exception e) {
-            cooldowns.remove(player.getUniqueId());
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
             return;
         }
         // Distance re-check against the CURRENT position (warmup move).
@@ -549,7 +596,8 @@ public class RTPManager {
                 double dx = dest.getX() - current.getX();
                 double dz = dest.getZ() - current.getZ();
                 if (dx * dx + dz * dz < 500 * 500) {
-                    cooldowns.remove(player.getUniqueId());
+                    refundWarmupCooldown(uuid, warmupIdentity);
+                    finishWarmup(uuid, warmupIdentity);
                     if (player.isOnline()) {
                         player.sendMessage(plugin.getMiniMessage().deserialize("<red>The location is no longer far enough away. Try again!"));
                     }
@@ -557,15 +605,16 @@ public class RTPManager {
                 }
             }
         } catch (Exception e) {
-            cooldowns.remove(player.getUniqueId());
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
             return;
         }
         final World destWorld = dest.getWorld();
         final int chunkX = dest.getBlockX() >> 4;
         final int chunkZ = dest.getBlockZ() >> 4;
-        final UUID uuid = player.getUniqueId();
         try {
             Bukkit.getRegionScheduler().execute(plugin, destWorld, chunkX, chunkZ, () -> {
+                if (!WarmupReservations.isOwner(uuid, warmupIdentity)) return;
                 boolean safe;
                 try {
                     safe = isLocationSafe(dest);
@@ -573,7 +622,8 @@ public class RTPManager {
                     safe = false;
                 }
                 if (!safe) {
-                    cooldowns.remove(uuid);
+                    refundWarmupCooldown(uuid, warmupIdentity);
+                    finishWarmup(uuid, warmupIdentity);
                     try {
                         player.getScheduler().run(plugin, t -> {
                             if (player.isOnline()) {
@@ -584,11 +634,12 @@ public class RTPManager {
                     }
                     return;
                 }
-                teleportValidated(player, dest, uuid);
+                teleportValidated(player, dest, uuid, warmupIdentity);
             });
         } catch (Exception e) {
-            cooldowns.remove(uuid);
-            plugin.getLogger().warning("Could not validate RTP destination for " + player.getName() + ": " + e.getMessage());
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
+            plugin.getLogger().warning("Could not validate RTP destination for " + uuid + ": " + e.getMessage());
             try {
                 player.getScheduler().run(plugin, t -> {
                     if (player.isOnline()) {
@@ -602,73 +653,105 @@ public class RTPManager {
 
     /**
      * Teleports after the destination region validated the spot (see
-     * {@link #executeTeleport}). Runs on the dest region thread; teleportAsync
-     * is thread-safe, result messaging hops back onto the entity thread.
+     * {@link #executeTeleport}). Destination validation runs on the destination
+     * region; player state and teleport initiation run on the entity thread.
      */
-    private void teleportValidated(Player player, Location dest, UUID uuid) {
-        // isOnline guard before teleportAsync (TPA TPAManager 436-443 pattern):
-        // the dest region thread may run after the player quit — never
-        // teleport an offline player, refund the cooldown instead.
-        if (player == null || !player.isOnline()) {
-            if (uuid != null) cooldowns.remove(uuid);
+    private void teleportValidated(Player player, Location dest, UUID uuid, Object warmupIdentity) {
+        if (!WarmupReservations.isOwner(uuid, warmupIdentity)) return;
+        if (player == null || dest == null || dest.getWorld() == null) {
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
             return;
         }
         try {
-            if (player.isDead()) {
-                if (uuid != null) cooldowns.remove(uuid);
-                return;
-            }
-        } catch (Exception ignored) {
-        }
-        if (dest == null || dest.getWorld() == null) {
-            if (uuid != null) cooldowns.remove(uuid);
-            return;
-        }
-        try {
-            player.teleportAsync(dest.clone().add(0, 1, 0)).thenAccept(success -> {
+            player.getScheduler().run(plugin, t -> {
+                if (!WarmupReservations.isOwner(uuid, warmupIdentity)) return;
+                try {
+                    if (!player.isOnline()) {
+                        refundWarmupCooldown(uuid, warmupIdentity);
+                        finishWarmup(uuid, warmupIdentity);
+                        return;
+                    }
+                } catch (Exception e) {
+                    refundWarmupCooldown(uuid, warmupIdentity);
+                    finishWarmup(uuid, warmupIdentity);
+                    return;
+                }
+                try {
+                    if (player.isDead()) {
+                        refundWarmupCooldown(uuid, warmupIdentity);
+                        finishWarmup(uuid, warmupIdentity);
+                        return;
+                    }
+                } catch (Exception ignored) {
+                    refundWarmupCooldown(uuid, warmupIdentity);
+                    finishWarmup(uuid, warmupIdentity);
+                    return;
+                }
+                synchronized (warmupLock) {
+                  if (shuttingDown || plugin.getRTPManager() != this
+                          || warmupIdentities.get(uuid) != warmupIdentity
+                          || !WarmupReservations.isOwner(uuid, warmupIdentity)) return;
+                  try {
+                    Location teleportDestination = dest.clone().add(0, 1, 0);
+                    if (!WarmupReservations.expectTeleport(uuid, warmupIdentity, teleportDestination)) {
+                        refundWarmupCooldown(uuid, warmupIdentity);
+                        finishWarmup(uuid, warmupIdentity);
+                        return;
+                    }
+                    player.teleportAsync(teleportDestination)
+                            .handle((success, error) -> error == null && Boolean.TRUE.equals(success))
+                            .thenAccept(success -> {
+            if (!WarmupReservations.isOwner(uuid, warmupIdentity)) return;
             // thenAccept runs off the entity thread: hop back onto the
             // EntityScheduler for sendMessage (Folia scheduler retained).
             if (Boolean.TRUE.equals(success)) {
+                finishWarmup(uuid, warmupIdentity);
                 try {
-                    player.getScheduler().run(plugin, t -> {
+                    player.getScheduler().run(plugin, successTask -> {
                         if (player.isOnline()) {
                             player.sendMessage(plugin.getMiniMessage().deserialize("<green>Teleported to a safe random location!"));
                         }
                     }, null);
                 } catch (Exception e) {
-                    plugin.getLogger().fine("Failed to notify RTP teleport success for " + player.getName() + ": " + e.getMessage());
+                    plugin.getLogger().fine("Failed to notify RTP teleport success for " + uuid + ": " + e.getMessage());
                 }
                 return;
             }
             // A failed teleport must not consume the cooldown.
-            if (uuid != null) cooldowns.remove(uuid);
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
             try {
-                player.getScheduler().run(plugin, t -> {
+                player.getScheduler().run(plugin, failureTask -> {
                     if (!player.isOnline()) return;
                     try {
                         player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
                     } catch (Exception e) {
-                        plugin.getLogger().fine("Failed to notify RTP teleport failure for " + player.getName() + ": " + e.getMessage());
+                        plugin.getLogger().fine("Failed to notify RTP teleport failure for " + uuid + ": " + e.getMessage());
                     }
                 }, null);
             } catch (Exception e) {
-                plugin.getLogger().fine("Failed to schedule RTP teleport failure notify for " + player.getName() + ": " + e.getMessage());
+                plugin.getLogger().fine("Failed to schedule RTP teleport failure notify for " + uuid + ": " + e.getMessage());
             }
-            });
+                    });
+                  } catch (Exception e) {
+                    refundWarmupCooldown(uuid, warmupIdentity);
+                    finishWarmup(uuid, warmupIdentity);
+                    plugin.getLogger().fine("Failed to start RTP teleport for " + uuid + ": " + e.getMessage());
+                  }
+                }
+            }, null);
         } catch (Exception e) {
-            // Scheduler/teleport threw synchronously (player gone, plugin
-            // disabling): a search that never teleported must refund the
-            // cooldown, like the failure path above.
-            if (uuid != null) cooldowns.remove(uuid);
-            plugin.getLogger().fine("Failed to start RTP teleport for " + player.getName() + ": " + e.getMessage());
-            try {
-                player.getScheduler().run(plugin, t -> {
-                    if (player.isOnline()) {
-                        player.sendMessage(plugin.getMiniMessage().deserialize("<red>Teleport failed. Try again!"));
-                    }
-                }, null);
-            } catch (Exception ignored) {
-            }
+            refundWarmupCooldown(uuid, warmupIdentity);
+            finishWarmup(uuid, warmupIdentity);
+            plugin.getLogger().fine("Failed to schedule RTP teleport for " + uuid + ": " + e.getMessage());
+        }
+    }
+
+    private void finishWarmup(UUID uuid, Object identity) {
+        synchronized (warmupLock) {
+            warmupIdentities.remove(uuid, identity);
+            WarmupReservations.release(uuid, identity);
         }
     }
 
@@ -757,19 +840,20 @@ public class RTPManager {
     }
 
     private boolean isOnCooldown(Player player) {
-        Long expiry = cooldowns.get(player.getUniqueId());
-        if (expiry == null) return false;
-        long timeLeft = (expiry - System.currentTimeMillis()) / 1000;
+        UUID uuid = player.getUniqueId();
+        CooldownEntry entry = cooldowns.get(uuid);
+        if (entry == null) return false;
+        long timeLeft = (entry.expiresAt() - System.currentTimeMillis()) / 1000;
         if (timeLeft > 0) {
             player.sendMessage(plugin.getMiniMessage().deserialize("<red>Wait " + timeLeft + "s before using RTP again."));
             return true;
         }
         // Expired entries are purged on read so the map cannot grow without bounds.
-        cooldowns.remove(player.getUniqueId(), expiry);
+        cooldowns.remove(uuid, entry);
         return false;
     }
 
-    private void setCooldown(Player player) {
+    private void setCooldown(Player player, Object searchIdentity) {
         org.bukkit.configuration.file.FileConfiguration teleportConfig = plugin.getTeleportConfig();
         if (teleportConfig == null) {
             cooldowns.remove(player.getUniqueId());
@@ -783,7 +867,28 @@ public class RTPManager {
             cooldowns.remove(player.getUniqueId());
             return;
         }
-        cooldowns.put(player.getUniqueId(), System.currentTimeMillis() + (seconds * 1000));
+        cooldowns.put(player.getUniqueId(), new CooldownEntry(System.currentTimeMillis() + (seconds * 1000), searchIdentity));
+    }
+
+    private void transferSearchCooldown(UUID uuid, Object searchIdentity, Object warmupIdentity) {
+        if (uuid == null || searchIdentity == null || warmupIdentity == null) return;
+        cooldowns.computeIfPresent(uuid, (id, entry) -> entry.operationIdentity() == searchIdentity
+                ? new CooldownEntry(entry.expiresAt(), warmupIdentity) : entry);
+    }
+
+    /** Transfer the cooldown ownership as a search enters its teleport warmup. */
+    private void refundSearchCooldown(UUID uuid, Object searchIdentity) {
+        if (uuid == null || searchIdentity == null) return;
+        refundCooldownOwnedBy(uuid, searchIdentity);
+    }
+
+    private void refundWarmupCooldown(UUID uuid, Object warmupIdentity) {
+        if (uuid == null || warmupIdentity == null) return;
+        refundCooldownOwnedBy(uuid, warmupIdentity);
+    }
+
+    private void refundCooldownOwnedBy(UUID uuid, Object operationIdentity) {
+        cooldowns.computeIfPresent(uuid, (id, entry) -> entry.operationIdentity() == operationIdentity ? null : entry);
     }
 
     /**
@@ -801,22 +906,35 @@ public class RTPManager {
         } catch (Exception e) {
             return;
         }
-        ScheduledTask warmup = activeWarmups.remove(uuid);
-        boolean hadWarmup = warmup != null;
+        ScheduledTask warmup;
+        Object warmupIdentity;
+        Object searchIdentity;
+        synchronized (warmupLock) {
+            warmup = activeWarmups.remove(uuid);
+            warmupIdentity = warmupIdentities.remove(uuid);
+            WarmupReservations.release(uuid, warmupIdentity);
+            searchIdentity = searching.remove(uuid);
+            if (searchIdentity != null) refundSearchCooldown(uuid, searchIdentity);
+        }
+        // The timer removes activeWarmups before the destination-region and
+        // teleport scheduler hops finish. The identity remains the authority
+        // during that pipeline, so count it as a warmup for quit cleanup too.
+        boolean hadWarmup = warmup != null || warmupIdentity != null;
         if (warmup != null) {
             try {
                 warmup.cancel();
             } catch (Exception ignored) {
             }
         }
-        boolean hadSearch = searching.remove(uuid);
-        if (hadWarmup || hadSearch) {
-            cooldowns.remove(uuid);
+        boolean hadSearch = searchIdentity != null;
+        if (hadWarmup) {
+            refundWarmupCooldown(uuid, warmupIdentity);
         }
+        if (hadSearch) refundSearchCooldown(uuid, searchIdentity);
         // Opportunistic purge of expired entries (same as cancelSearch) so
         // cooldowns of players who never return cannot accumulate.
         try {
-            cooldowns.entrySet().removeIf(e -> e.getValue() == null || e.getValue() <= System.currentTimeMillis());
+            cooldowns.entrySet().removeIf(e -> e.getValue() == null || e.getValue().expiresAt() <= System.currentTimeMillis());
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to purge expired RTP cooldowns: " + e.getMessage());
         }
@@ -834,96 +952,109 @@ public class RTPManager {
         } catch (Exception e) {
             return;
         }
-        boolean wasSearching = searching.remove(uuid);
+        Object searchIdentity;
+        synchronized (warmupLock) {
+            searchIdentity = searching.remove(uuid);
+            if (searchIdentity != null) refundSearchCooldown(uuid, searchIdentity);
+        }
+        boolean wasSearching = searchIdentity != null;
         if (wasSearching) {
             // A search that never reached a warmup/teleport must not consume
             // the cooldown (same as handleQuit/cancelAll).
-            cooldowns.remove(uuid);
-            try {
-                if (player.isOnline()) {
-                    String msg = (reason != null && !reason.isEmpty())
-                            ? "<red>RTP cancelled: " + reason
-                            : "<red>RTP search cancelled.";
-                    player.sendMessage(plugin.getMiniMessage().deserialize(msg));
-                }
-            } catch (Exception ignored) {
-            }
+            String msg = (reason != null && !reason.isEmpty())
+                    ? "<red>RTP cancelled: " + reason
+                    : "<red>RTP search cancelled.";
+            notifyPlayer(player, msg);
         }
         // Opportunistic purge of this player's entry on quit/cancel so stale
         // entries of players who never come back cannot accumulate. Only
         // expired entries are removed — an active cooldown is never deleted.
         long now = System.currentTimeMillis();
-        Long expiry = cooldowns.get(uuid);
-        if (expiry != null && expiry <= now) {
-            cooldowns.remove(uuid, expiry);
+        CooldownEntry entry = cooldowns.get(uuid);
+        if (entry != null && entry.expiresAt() <= now) {
+            cooldowns.remove(uuid, entry);
         }
         // Global opportunistic purge of all expired cooldowns (quit/cancel
         // path): without this, cooldowns of players who quit with an active
         // cooldown and never return would linger until a map-sized cleanup.
         // Active (unexpired) entries are never touched.
         try {
-            cooldowns.entrySet().removeIf(e -> e.getValue() == null || e.getValue() <= System.currentTimeMillis());
+            cooldowns.entrySet().removeIf(e -> e.getValue() == null || e.getValue().expiresAt() <= System.currentTimeMillis());
         } catch (Exception e) {
             plugin.getLogger().fine("Failed to purge expired RTP cooldowns: " + e.getMessage());
         }
     }
 
     /**
-     * Removes the RTP cooldown unconditionally. Called by
-     * TPAManager.startTeleportProcedure after cancelSearch(): a search
-     * cancelled in favour of a TPA teleport must refund the cooldown, mirroring
-     * the reverse direction (RTP start aborts with a cooldown refund).
+     * Refunds the current in-flight RTP's cooldown, if any. Completed RTP
+     * cooldowns are not cleared by an unrelated stale cancellation.
      */
     public void refundCooldown(UUID uuid) {
         if (uuid == null) return;
-        cooldowns.remove(uuid);
+        Object warmupIdentity = warmupIdentities.get(uuid);
+        if (warmupIdentity != null) {
+            refundWarmupCooldown(uuid, warmupIdentity);
+            return;
+        }
+        refundSearchCooldown(uuid, searching.get(uuid));
     }
 
     public void cancelWarmup(Player player, String reason) {
         if (player == null) return;
-        ScheduledTask task = activeWarmups.remove(player.getUniqueId());
-        if (task != null) {
-            task.cancel();
-            if (player.isOnline()) {
-                player.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: " + reason));
-            }
+        UUID uuid = player.getUniqueId();
+        ScheduledTask task;
+        Object identity;
+        synchronized (warmupLock) {
+            identity = warmupIdentities.get(uuid);
+            // teleportAsync cannot be reliably revoked after initiation. Keep
+            // ownership until its completion callback reports the outcome.
+            if (WarmupReservations.isTeleportInFlight(uuid, identity)) return;
+            task = activeWarmups.remove(uuid);
+            identity = warmupIdentities.remove(uuid);
+            WarmupReservations.release(uuid, identity);
+        }
+        refundWarmupCooldown(uuid, identity);
+        if (task != null || identity != null) {
+            if (task != null) task.cancel();
+            notifyPlayer(player, "<red>RTP cancelled: " + reason);
         }
     }
 
     public void cancelAll() {
-        java.util.Set<UUID> hadWarmup = new java.util.HashSet<>(activeWarmups.keySet());
-        for (ScheduledTask task : new ArrayList<>(activeWarmups.values())) {
+        Map<UUID, Object> warmupOwners;
+        java.util.List<ScheduledTask> warmupTasks;
+        java.util.Set<UUID> hadWarmup;
+        synchronized (warmupLock) {
+            shuttingDown = true;
+            warmupOwners = new java.util.HashMap<>(warmupIdentities);
+            hadWarmup = new java.util.HashSet<>(warmupOwners.keySet());
+            warmupTasks = new ArrayList<>(activeWarmups.values());
+            warmupIdentities.forEach(WarmupReservations::release);
+            warmupIdentities.clear();
+            activeWarmups.clear();
+        }
+        for (ScheduledTask task : warmupTasks) {
             if (task != null) task.cancel();
         }
         for (UUID uuid : hadWarmup) {
             Player p = Bukkit.getPlayer(uuid);
-            if (p != null && p.isOnline()) {
-                try {
-                    p.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: server reloading."));
-                } catch (Exception ignored) {
-                }
-            }
+            if (p != null) notifyPlayer(p, "<red>RTP cancelled: server reloading.");
         }
-        activeWarmups.clear();
-        // Warmup cooldowns must be refunded too: a reload-cancelled warmup
-        // never teleported, so keeping its cooldown would punish the player.
-        for (UUID uuid : hadWarmup) {
-            cooldowns.remove(uuid);
+        // Warmup cooldowns must be refunded too, including a teleport pipeline
+        // whose timer already fired and therefore no longer has a task entry.
+        for (Map.Entry<UUID, Object> entry : warmupOwners.entrySet()) {
+            refundWarmupCooldown(entry.getKey(), entry.getValue());
         }
         // A stuck search must not vanish silently: notify every searcher and
         // refund the cooldown when the search never reached a warmup — same
         // as TPAManager.cancelAll notifies both sides of pending sessions.
-        for (UUID uuid : new ArrayList<>(searching)) {
+        for (Map.Entry<UUID, Object> entry : new ArrayList<>(searching.entrySet())) {
+            UUID uuid = entry.getKey();
+            Object searchIdentity = entry.getValue();
             Player p = Bukkit.getPlayer(uuid);
-            if (p != null && p.isOnline()) {
-                try {
-                    p.sendMessage(plugin.getMiniMessage().deserialize("<red>RTP cancelled: server reloading."));
-                } catch (Exception ignored) {
-                }
-            }
-            if (!hadWarmup.contains(uuid)) {
-                cooldowns.remove(uuid);
-            }
+            if (p != null) notifyPlayer(p, "<red>RTP cancelled: server reloading.");
+            if (searching.remove(uuid, searchIdentity) && !hadWarmup.contains(uuid))
+                refundSearchCooldown(uuid, searchIdentity);
         }
         searching.clear();
     }

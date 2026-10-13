@@ -62,14 +62,28 @@ public class BanManager {
     private volatile Map<UUID, List<BanRecord>> bansByUuid = new ConcurrentHashMap<>();
     private volatile Map<UUID, List<KickRecord>> kicksByUuid = new ConcurrentHashMap<>();
 
-    // Guards check-then-act ban/unban mutations on THIS server instance so two
-    // near-simultaneous /ban calls on the same target can't both pass the
-    // "not already banned" check. Does NOT protect against a genuinely
-    // simultaneous ban from a second server on a shared MySQL backend — that
-    // is an accepted, documented limitation for this beta (last-write-wins).
+    // Guards short in-memory cache mutations and refresh swaps. JDBC
+    // check-then-insert sequences use striped per-key locks below so same-
+    // server async requests for one target serialize without blocking bans
+    // for unrelated targets.
     private final Object mutationLock = new Object();
+    private final Object[] banOperationLocks = createBanOperationLocks();
+
+    private static Object[] createBanOperationLocks() {
+        Object[] locks = new Object[64];
+        for (int i = 0; i < locks.length; i++) locks[i] = new Object();
+        return locks;
+    }
+
+    private Object banOperationLock(Object key) {
+        return banOperationLocks[Math.floorMod(key.hashCode(), banOperationLocks.length)];
+    }
 
     private ScheduledTask refreshTask;
+    private final Object loginCheckLock = new Object();
+    private int activeLoginChecks;
+    private boolean shutdownRequested;
+    private boolean databaseClosed;
 
     /**
      * Opens the pool (bounded, fail-fast connect — a broken/unreachable
@@ -93,6 +107,14 @@ public class BanManager {
     }
 
     public void shutdown() {
+        shutdown(false);
+    }
+
+    /**
+     * Retires this manager. A reload defers DB close until active login checks
+     * release their leases; plugin disable may force close during teardown.
+     */
+    public void shutdown(boolean force) {
         ScheduledTask task = refreshTask;
         refreshTask = null;
         if (task != null) {
@@ -102,6 +124,40 @@ public class BanManager {
                 plugin.getLogger().fine("Could not cancel moderation refresh task: " + e.getMessage());
             }
         }
+        boolean closeDatabase;
+        synchronized (loginCheckLock) {
+            shutdownRequested = true;
+            closeDatabase = (force || activeLoginChecks == 0) && !databaseClosed;
+            if (closeDatabase) databaseClosed = true;
+        }
+        if (closeDatabase) closeDatabase();
+    }
+
+    /** Acquires a short-lived lease so reload cannot close the DB mid-login-check. */
+    public boolean beginLoginCheck() {
+        synchronized (loginCheckLock) {
+            if (shutdownRequested || databaseClosed) return false;
+            activeLoginChecks++;
+            return true;
+        }
+    }
+
+    /** Releases a login-check lease and closes a retired DB once the last check exits. */
+    public void endLoginCheck() {
+        boolean closeDatabase;
+        synchronized (loginCheckLock) {
+            if (activeLoginChecks <= 0) {
+                plugin.getLogger().warning("Unbalanced moderation login-check lease release.");
+                return;
+            }
+            activeLoginChecks--;
+            closeDatabase = shutdownRequested && activeLoginChecks == 0 && !databaseClosed;
+            if (closeDatabase) databaseClosed = true;
+        }
+        if (closeDatabase) closeDatabase();
+    }
+
+    private void closeDatabase() {
         try {
             db.close();
         } catch (Exception e) {
@@ -248,8 +304,16 @@ public class BanManager {
         return db.findActiveBan(uuid, System.currentTimeMillis());
     }
 
+    public List<BanRecord> queryActiveBansNow(UUID uuid) throws SQLException {
+        return db.findActiveBans(uuid, System.currentTimeMillis());
+    }
+
     public IpBanRecord queryActiveIpBanNow(String ip) throws SQLException {
         return db.findActiveIpBan(ip, System.currentTimeMillis());
+    }
+
+    public List<IpBanRecord> queryActiveIpBansNow(String ip) throws SQLException {
+        return db.findActiveIpBans(ip, System.currentTimeMillis());
     }
 
     /**
@@ -317,12 +381,10 @@ public class BanManager {
             return;
         }
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            // Blocking JDBC stays OUTSIDE mutationLock: the lock only guards
-            // the short in-memory cache add below, never the I/O. The lost
-            // check-then-act atomicity is recovered via re-check on insert
-            // failure (SQLite's partial-unique index rejects the loser of a
-            // genuine race; a simultaneous cross-server race on shared MySQL
-            // stays documented last-write-wins).
+            // Serialize the live-check and insert for this UUID. MySQL has no
+            // portable partial unique index, so without this per-key lock two
+            // commands on this server could both insert an active row.
+            synchronized (banOperationLock(uuid)) {
             BanRecord live = null;
             boolean liveOk = false;
             try {
@@ -346,6 +408,9 @@ public class BanManager {
             BanRecord record;
             try {
                 record = db.insertBan(uuid, name, reason, staffUuid, staffName, durationMillis);
+            } catch (ModerationDatabase.ActiveBanExistsException e) {
+                complete(() -> callback.accept(Optional.empty(), false));
+                return;
             } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().severe("Could not insert ban for " + name + ": " + e.getMessage());
                 // Lost race: someone else may have banned concurrently while
@@ -379,6 +444,7 @@ public class BanManager {
                 }
             }
             complete(() -> callback.accept(Optional.of(inserted), false));
+            }
         });
     }
 
@@ -388,6 +454,17 @@ public class BanManager {
      * means genuinely not banned.
      */
     public void unbanPlayerAsync(UUID uuid, UUID staffUuid, String staffName, BiConsumer<Boolean, Boolean> callback) {
+        unbanPlayerAsync(uuid, staffUuid, staffName, null, callback);
+    }
+
+    /**
+     * Revokes active rows from the live guard, optionally restricted to rows
+     * whose protection status was checked by the command. This keeps the
+     * authorization snapshot and the eventual revoke set aligned if a new row
+     * appears between the command's shield check and this async mutation.
+     */
+    public void unbanPlayerAsync(UUID uuid, UUID staffUuid, String staffName,
+                                 List<Integer> authorizedIds, BiConsumer<Boolean, Boolean> callback) {
         if (!plugin.isEnabled()) {
             callback.accept(false, true);
             return;
@@ -403,25 +480,16 @@ public class BanManager {
             // inserted between guard and revoke has a new id, is not in the
             // list, and therefore survives the unban.
             List<Integer> guardIds = new ArrayList<>();
-            boolean guardFailed = false;
             try {
                 guardIds.addAll(db.findActiveBanIds(uuid, now));
+                if (authorizedIds != null) guardIds.retainAll(authorizedIds);
             } catch (SQLException | RuntimeException e) {
-                plugin.getLogger().warning("Could not live-check ban for " + uuid + ", falling back to cache: " + e.getMessage());
-                guardFailed = true;
-                List<BanRecord> history = bansByUuid.get(uuid);
-                if (history != null) {
-                    for (BanRecord r : history) {
-                        if (r.isActive(now)) guardIds.add(r.id());
-                    }
-                }
+                plugin.getLogger().warning("Could not live-check ban for " + uuid + ": " + e.getMessage());
+                complete(() -> callback.accept(false, true));
+                return;
             }
             if (guardIds.isEmpty()) {
-                // A failed guard with an empty (possibly stale) cache cannot
-                // tell "not banned" from "DB down" — report a database error
-                // instead of a misleading "not banned".
-                boolean dbError = guardFailed;
-                complete(() -> callback.accept(false, dbError));
+                complete(() -> callback.accept(false, false));
                 return;
             }
             // Per-ID revoke: only the guard-time IDs, never a freshly
@@ -491,9 +559,9 @@ public class BanManager {
         String normalizedEntrance = ModerationCommandBase.normalizeIp(ip);
         final String targetIp = normalizedEntrance != null ? normalizedEntrance : ip;
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            // Live check first (same reasoning as tryBanAsync); cache is
-            // only the fallback when the DB itself is unreachable. Blocking
-            // JDBC outside the lock, cache add inside (see tryBanAsync).
+            // Serialize check-then-insert for this canonical IP on this
+            // server; cross-server MySQL races remain a database-level limit.
+            synchronized (banOperationLock(targetIp)) {
             long now = System.currentTimeMillis();
             IpBanRecord live = null;
             boolean liveOk = false;
@@ -518,6 +586,9 @@ public class BanManager {
             IpBanRecord record;
             try {
                 record = db.insertIpBan(targetIp, reason, staffUuid, staffName, durationMillis);
+            } catch (ModerationDatabase.ActiveBanExistsException e) {
+                complete(() -> callback.accept(Optional.empty(), false));
+                return;
             } catch (SQLException | RuntimeException e) {
                 plugin.getLogger().severe("Could not insert IP ban for " + targetIp + ": " + e.getMessage());
                 // Lost race (see tryBanAsync): re-check before crying DB error.
@@ -546,6 +617,7 @@ public class BanManager {
                 }
             }
             complete(() -> callback.accept(Optional.of(inserted), false));
+            }
         });
     }
 
@@ -554,6 +626,12 @@ public class BanManager {
      * {@link #unbanPlayerAsync}.
      */
     public void unbanIpAsync(String ip, UUID staffUuid, String staffName, BiConsumer<Boolean, Boolean> callback) {
+        unbanIpAsync(ip, staffUuid, staffName, null, callback);
+    }
+
+    /** IP equivalent of the authorized-row restriction on player unbans. */
+    public void unbanIpAsync(String ip, UUID staffUuid, String staffName,
+                             List<Integer> authorizedIds, BiConsumer<Boolean, Boolean> callback) {
         if (!plugin.isEnabled()) {
             callback.accept(false, true);
             return;
@@ -571,19 +649,16 @@ public class BanManager {
             // snapshots the active row IDs; the revoke below touches ONLY
             // these IDs so an IP ban inserted in between survives.
             List<Integer> guardIds = new ArrayList<>();
-            boolean guardFailed = false;
             try {
                 guardIds.addAll(db.findActiveIpBanIds(targetIp, now));
+                if (authorizedIds != null) guardIds.retainAll(authorizedIds);
             } catch (SQLException | RuntimeException e) {
-                plugin.getLogger().warning("Could not live-check IP ban for " + targetIp + ", falling back to cache: " + e.getMessage());
-                guardFailed = true;
-                for (IpBanRecord r : ipBansCache) {
-                    if (r.ip() != null && r.ip().equals(targetIp) && r.isActive(now)) guardIds.add(r.id());
-                }
+                plugin.getLogger().warning("Could not live-check IP ban for " + targetIp + ": " + e.getMessage());
+                complete(() -> callback.accept(false, true));
+                return;
             }
             if (guardIds.isEmpty()) {
-                boolean dbError = guardFailed;
-                complete(() -> callback.accept(false, dbError));
+                complete(() -> callback.accept(false, false));
                 return;
             }
             // Same per-ID pattern as unbanPlayerAsync: only guard-time IDs,

@@ -60,10 +60,17 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
             return;
         }
 
-        if (isExempt(target, sender) || isProtectedTarget(target, sender)) {
-            sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
-            return;
-        }
+        checkProtectedTarget(target, sender, protectedTarget -> {
+            if (isGone(sender)) return;
+            if (protectedTarget) {
+                sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
+                return;
+            }
+            kickTarget(banManager, sender, target, args);
+        });
+    }
+
+    private void kickTarget(BanManager banManager, CommandSender sender, Player target, String[] args) {
 
         String reason = defaultReason(args.length > 1
                 ? String.join(" ", Arrays.copyOfRange(args, 1, args.length))
@@ -84,7 +91,7 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
             return;
         }
 
-        banManager.recordKickAsync(targetUuid, targetName, reason, staffUuid, staffName, () -> {
+        banManager.recordKickAsync(targetUuid, targetName, reason, staffUuid, staffName, () -> runOnSender(sender, () -> {
             // Re-check AFTER the DB write: the target may have logged off
             // during the async hop. A kick that never landed must not report
             // success — tell staff the player left instead (the kick is still
@@ -107,7 +114,7 @@ public class KickCommand extends ModerationCommandBase implements BasicCommand {
 
             broadcast(message("kick-broadcast", "")
                     .replace("%player%", esc(targetName)).replace("%staff%", esc(staffName)).replace("%reason%", esc(reason)));
-        });
+        }));
     }
 
     @Override

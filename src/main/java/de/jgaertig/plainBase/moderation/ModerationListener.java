@@ -37,35 +37,71 @@ public class ModerationListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPreLogin(AsyncPlayerPreLoginEvent event) {
-        // This event runs OFF the main thread and the config object is
-        // reload-mutable — a concurrent /plainbase reload can throw here.
-        // Fail open (allow the login), never block all logins on a config race.
-        // Root-config read under the central configLock: the instance is
-        // fetched INSIDE the lock since reloadConfig() may swap it.
-        try {
-            boolean moduleEnabled;
-            synchronized (plugin.getConfigLock()) {
-                FileConfiguration rootCfg = plugin.getConfig();
-                moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+        final boolean banEnabled;
+        final boolean ipBanEnabled;
+        final String banTemplate;
+        final String tempbanTemplate;
+        final String ipbanTemplate;
+        PlainBase.ModerationState moderationState;
+        // Decide the state, current root-module flag and ban toggles under one
+        // short gate lock. A reload either starts after this login decision or
+        // the handler observes INITIALIZING; it cannot flip the state between
+        // the snapshot and an early allow for disabled/stale flags.
+        synchronized (plugin.getModerationGateLock()) {
+            moderationState = plugin.getModerationState();
+            if (moderationState == PlainBase.ModerationState.INITIALIZING) {
+                denyTemporarily(event);
+                return;
             }
-            if (!moduleEnabled) return;
-        } catch (RuntimeException e) {
-            return;
+            try {
+                boolean moduleEnabled;
+                synchronized (plugin.getConfigLock()) {
+                    FileConfiguration rootCfg = plugin.getConfig();
+                    moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+                }
+                if (!moduleEnabled) return;
+            } catch (RuntimeException e) {
+                return;
+            }
+
+            // During reload stopModules() clears configs. Keep the persistent
+            // listener fail-closed while config/manager state is unavailable.
+            FileConfiguration modConfig = plugin.getModerationConfig();
+            if (modConfig == null) {
+                if (moderationState == PlainBase.ModerationState.FAILED) return;
+                plugin.getLogger().warning("Moderation config unavailable during pre-login for "
+                        + Objects.toString(event.getName(), "?") + " — denying login until moderation is ready.");
+                event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                        Component.text("Moderation is temporarily unavailable. Please try again shortly."));
+                return;
+            }
+
+            try {
+                banEnabled = modConfig.getBoolean("ban.enabled", true);
+                ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
+                banTemplate = Objects.toString(
+                        modConfig.getString("messages.ban-screen", "<red>You are banned."), "<red>You are banned.");
+                tempbanTemplate = Objects.toString(
+                        modConfig.getString("messages.tempban-screen", "<red>You are banned."), "<red>You are banned.");
+                ipbanTemplate = Objects.toString(
+                        modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
+                        "<red>Your IP address is banned.");
+            } catch (RuntimeException e) {
+                plugin.getLogger().warning("Could not read moderation config during pre-login for "
+                        + Objects.toString(event.getName(), "?") + " — allowing login (fail-open).");
+                return;
+            }
+            if (!banEnabled && !ipBanEnabled) return;
+            if (moderationState == PlainBase.ModerationState.FAILED) return;
         }
 
         BanManager manager = plugin.getBanManager();
-        if (manager == null) return;
-
-        // Fail-open: during /plainbase reload (stopModules() clears configs,
-        // setupModeration() re-loads them right after) getModerationConfig()
-        // can briefly be null — and this event runs async, so the reload can
-        // land mid-check. A missing config must allow the login, never NPE.
-        FileConfiguration modConfig = plugin.getModerationConfig();
-        if (modConfig == null) {
-            plugin.getLogger().warning("Moderation config unavailable during pre-login for "
-                    + Objects.toString(event.getName(), "?") + " — allowing login (fail-open).");
+        if (manager == null || !manager.beginLoginCheck()) {
+            denyTemporarily(event);
             return;
         }
+
+        try {
 
         // getAddress()/getHostAddress() can be null on some proxies/edge cases.
         // Never persist the literal "unknown" (or null/blank) in the DB — it
@@ -96,36 +132,6 @@ public class ModerationListener implements Listener {
                         + Objects.toString(event.getName(), "?") + ": " + e.getMessage());
             }
         }
-
-        // Snapshot every config value this check needs up front: a reload can
-        // mutate the config mid-check (this event runs async), so locals keep
-        // one consistent decision instead of half-old/half-new behavior. The
-        // config object is never touched again below — message helpers take
-        // plain snapshot strings, so no FileConfiguration access ever happens
-        // off-thread past this point.
-        // Separate guards: an IP ban must still be enforced when the UUID ban
-        // is disabled (and vice versa) — never return early on one flag.
-        final boolean banEnabled;
-        final boolean ipBanEnabled;
-        final String banTemplate;
-        final String tempbanTemplate;
-        final String ipbanTemplate;
-        try {
-            banEnabled = modConfig.getBoolean("ban.enabled", true);
-            ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
-            banTemplate = Objects.toString(
-                    modConfig.getString("messages.ban-screen", "<red>You are banned."), "<red>You are banned.");
-            tempbanTemplate = Objects.toString(
-                    modConfig.getString("messages.tempban-screen", "<red>You are banned."), "<red>You are banned.");
-            ipbanTemplate = Objects.toString(
-                    modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
-                    "<red>Your IP address is banned.");
-        } catch (RuntimeException e) {
-            plugin.getLogger().warning("Could not read moderation config during pre-login for "
-                    + Objects.toString(event.getName(), "?") + " — allowing login (fail-open).");
-            return;
-        }
-        if (!banEnabled && !ipBanEnabled) return;
 
         try {
             if (banEnabled) {
@@ -167,6 +173,9 @@ public class ModerationListener implements Listener {
             // #findActiveIpBan, which log loudly and return a synthetic active
             // record (deny) instead of throwing.
         }
+        } finally {
+            manager.endLoginCheck();
+        }
     }
 
     /**
@@ -180,40 +189,57 @@ public class ModerationListener implements Listener {
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onJoin(PlayerJoinEvent event) {
-        // Root-config read under the central configLock (see onPreLogin).
-        try {
-            boolean moduleEnabled;
-            synchronized (plugin.getConfigLock()) {
-                FileConfiguration rootCfg = plugin.getConfig();
-                moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+        final boolean banEnabled;
+        final boolean ipBanEnabled;
+        final PlainBase.ModerationState moderationState;
+        final String banTemplate;
+        final String tempbanTemplate;
+        final String ipbanTemplate;
+        synchronized (plugin.getModerationGateLock()) {
+            moderationState = plugin.getModerationState();
+            if (moderationState == PlainBase.ModerationState.INITIALIZING) {
+                kickTemporarilyUnavailable(event.getPlayer());
+                return;
             }
-            if (!moduleEnabled) return;
-        } catch (RuntimeException e) {
+            // Root-config read under the central configLock (see onPreLogin).
+            try {
+                boolean moduleEnabled;
+                synchronized (plugin.getConfigLock()) {
+                    FileConfiguration rootCfg = plugin.getConfig();
+                    moduleEnabled = rootCfg != null && rootCfg.getBoolean("modules.moderation", false);
+                }
+                if (!moduleEnabled) return;
+            } catch (RuntimeException e) {
+                return;
+            }
+
+            FileConfiguration modConfig = plugin.getModerationConfig();
+            if (modConfig == null) {
+                if (moderationState != PlainBase.ModerationState.FAILED) kickTemporarilyUnavailable(event.getPlayer());
+                return;
+            }
+            // Snapshot the reload-mutable config before hopping async. The
+            // join-thread decision shares the gate lock with reload start so it
+            // cannot pass using flags from an obsolete generation.
+            banEnabled = modConfig.getBoolean("ban.enabled", true);
+            ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
+            if (!banEnabled && !ipBanEnabled) return;
+            if (moderationState == PlainBase.ModerationState.FAILED) return;
+            banTemplate = Objects.toString(
+                    modConfig.getString("messages.ban-screen", "<red>You are banned."), "<red>You are banned.");
+            tempbanTemplate = Objects.toString(
+                    modConfig.getString("messages.tempban-screen", "<red>You are banned."), "<red>You are banned.");
+            ipbanTemplate = Objects.toString(
+                    modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
+                    "<red>Your IP address is banned.");
+        }
+        BanManager manager = plugin.getBanManager();
+        if (manager == null) {
+            kickTemporarilyUnavailable(event.getPlayer());
             return;
         }
-
-        BanManager manager = plugin.getBanManager();
-        if (manager == null) return;
-
-        FileConfiguration modConfig = plugin.getModerationConfig();
-        if (modConfig == null) return;
-        // Config snapshot on the MAIN/join thread BEFORE hopping async: the
-        // reload-mutable config object is never touched off-thread — every
-        // boolean/string this check needs is copied into locals here.
-        // Separate guards (see onPreLogin): either check can run while the
-        // other is disabled.
-        boolean banEnabled = modConfig.getBoolean("ban.enabled", true);
-        boolean ipBanEnabled = modConfig.getBoolean("ip-ban.enabled", true);
-        if (!banEnabled && !ipBanEnabled) return;
         final boolean banEnabledAsync = banEnabled;
         final boolean ipBanEnabledAsync = ipBanEnabled;
-        String banTemplate = Objects.toString(
-                modConfig.getString("messages.ban-screen", "<red>You are banned."), "<red>You are banned.");
-        String tempbanTemplate = Objects.toString(
-                modConfig.getString("messages.tempban-screen", "<red>You are banned."), "<red>You are banned.");
-        String ipbanTemplate = Objects.toString(
-                modConfig.getString("messages.ipban-screen", "<red>Your IP address is banned."),
-                "<red>Your IP address is banned.");
         final String banTemplateAsync = banTemplate;
         final String tempbanTemplateAsync = tempbanTemplate;
         final String ipbanTemplateAsync = ipbanTemplate;
@@ -232,6 +258,11 @@ public class ModerationListener implements Listener {
         final String playerName = player.getName();
         final String ipAsync = ip;
 
+        if (!manager.beginLoginCheck()) {
+            kickTemporarilyUnavailable(player);
+            return;
+        }
+
         // Live re-check off the join thread (blocking JDBC must never run on
         // it, and no full cache scan per join). Pre-login already covered the
         // normal case, so a DB failure here fails open with a warning — with a
@@ -240,7 +271,9 @@ public class ModerationListener implements Listener {
         // ModerationDatabase#findActiveBan/findActiveIpBan, which return a
         // synthetic active record instead of throwing — only genuine DB
         // failures reach the fail-open path here.)
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+        try {
+            Bukkit.getAsyncScheduler().runNow(plugin, task -> {
+                try {
             BanRecord ban = null;
             if (banEnabledAsync) {
                 try {
@@ -321,7 +354,24 @@ public class ModerationListener implements Listener {
                 plugin.getLogger().warning("Could not schedule join kick for "
                         + Objects.toString(playerName, "?") + ": " + e.getMessage());
             }
-        });
+                } finally {
+                    manager.endLoginCheck();
+                }
+            });
+        } catch (RuntimeException e) {
+            manager.endLoginCheck();
+            plugin.getLogger().warning("Could not schedule join moderation check for "
+                    + Objects.toString(playerName, "?") + ": " + e.getMessage());
+        }
+    }
+
+    private void denyTemporarily(AsyncPlayerPreLoginEvent event) {
+        event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                Component.text("Moderation is temporarily unavailable. Please try again shortly."));
+    }
+
+    private void kickTemporarilyUnavailable(Player player) {
+        player.kick(Component.text("Moderation is temporarily unavailable. Please try again shortly."));
     }
 
     /**

@@ -83,6 +83,8 @@ public class TeamManager {
     // invites and requests persist for offline players (offline targeting by
     // UUID keeps working), so per-player team state does linger by design.
     private final Map<UUID, String> scoreboardTeamOf = new ConcurrentHashMap<>();
+    // Fences join reminders queued for a connection that has since quit.
+    private final Map<UUID, Object> notificationSessions = new ConcurrentHashMap<>();
 
     // Scoreboard teams created by THIS manager instance (vanilla names "pb_<id>").
     // Cleanup (sync/shutdown) only ever unregisters names in this set, so stale
@@ -438,7 +440,7 @@ public class TeamManager {
             // onlinePlayerExactFirst and fall through to offline lookup.
             Player maybe = Bukkit.getPlayerExact(targetName);
             if (maybe != null && vanishManager.isVanished(maybe) && !vanishManager.canSee(viewer, maybe)) {
-                staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", targetName));
+                sendToSender(staff, msg(cfgSnapshot, "player-not-found", "player", targetName));
                 return true;
             }
         } catch (Exception e) {
@@ -459,7 +461,7 @@ public class TeamManager {
             if (target instanceof Player targetPlayer
                     && vanishManager.isVanished(targetPlayer)
                     && !vanishManager.canSee(viewer, targetPlayer)) {
-                staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", targetName));
+                sendToSender(staff, msg(cfgSnapshot, "player-not-found", "player", targetName));
                 return true;
             }
         } catch (Exception e) {
@@ -508,7 +510,7 @@ public class TeamManager {
 
     private boolean denyUnknownTeamStaff(CommandSender staff, FileConfiguration cfgSnapshot, String id) {
         if (id != null && teamExists(id)) return false;
-        staff.sendMessage(msg(cfgSnapshot, "unknown-team", "team", String.valueOf(id)));
+        sendToSender(staff, msg(cfgSnapshot, "unknown-team", "team", String.valueOf(id)));
         return true;
     }
 
@@ -532,7 +534,7 @@ public class TeamManager {
                 // manager with fresh maps — mutating this old instance would
                 // report success while the entry vanishes. Fail with retry.
                 if (capturedGeneration != GENERATION.get()) {
-                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    sendToSender(staff, safeDeserialize("<red>Team data was reloaded, please retry your command."));
                     return;
                 }
                 if (denyVanishedOracleResolved(staff, target, targetName, cfgSnapshot)) return;
@@ -540,15 +542,15 @@ public class TeamManager {
                 Component receivedNotice = null;
                 synchronized (lockFor(uuid)) {
                     if (isMember(uuid, id)) {
-                        staff.sendMessage(msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
+                        sendToSender(staff, msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
                         return;
                     }
                     if (invites.getOrDefault(uuid, Set.of()).contains(id)) {
-                        staff.sendMessage(msg(cfgSnapshot, "invite-already-pending", "player", targetName, "team", id));
+                        sendToSender(staff, msg(cfgSnapshot, "invite-already-pending", "player", targetName, "team", id));
                         return;
                     }
                     if (getPlayerTeams(uuid).size() >= maxTeams) {
-                        staff.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
+                        sendToSender(staff, msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
                         return;
                     }
 
@@ -559,7 +561,7 @@ public class TeamManager {
                         invites.computeIfAbsent(uuid, k -> ConcurrentHashMap.newKeySet()).add(id);
                     }
                     saveInvites();
-                    staff.sendMessage(msg(cfgSnapshot, "invite-sent", "player", targetName, "team", id));
+                    sendToSender(staff, msg(cfgSnapshot, "invite-sent", "player", targetName, "team", id));
 
                     receivedNotice = msg(cfgSnapshot, "invite-received", "team", id);
                 }
@@ -649,7 +651,7 @@ public class TeamManager {
             try {
                 // Stale-instance guard (see invite): never mutate after reload.
                 if (capturedGeneration != GENERATION.get()) {
-                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    sendToSender(staff, safeDeserialize("<red>Team data was reloaded, please retry your command."));
                     return;
                 }
                 if (denyVanishedOracleResolved(staff, target, targetName, cfgSnapshot)) return;
@@ -659,11 +661,11 @@ public class TeamManager {
                 synchronized (lockFor(uuid)) {
                     synchronized (teamLockFor(id)) {
                         if (isMember(uuid, id)) {
-                            staff.sendMessage(msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
+                            sendToSender(staff, msg(cfgSnapshot, "already-in-team", "player", targetName, "team", id));
                             return;
                         }
                         if (getPlayerTeams(uuid).size() >= maxTeams) {
-                            staff.sendMessage(msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
+                            sendToSender(staff, msg(cfgSnapshot, "max-teams-reached", "player", targetName, "max", String.valueOf(maxTeams)));
                             return;
                         }
 
@@ -692,13 +694,8 @@ public class TeamManager {
                         if (assigned == Role.ADMIN) {
                             plugin.getLogger().info("Team '" + id + "': " + targetName + " added as ADMIN (team had no admins).");
                         }
-                        staff.sendMessage(msg(cfgSnapshot, "add-success", "player", targetName, "team", id));
+                        sendToSender(staff, msg(cfgSnapshot, "add-success", "player", targetName, "team", id));
 
-                        try {
-                            Player onlineLookup = Bukkit.getPlayer(uuid);
-                            if (onlineLookup != null) onlineName = onlineLookup.getName();
-                        } catch (Exception ignored) {
-                        }
                         addedNotice = msg(cfgSnapshot, "add-success", "player", onlineName, "team", id);
                     }
                 }
@@ -718,7 +715,7 @@ public class TeamManager {
             try {
                 // Stale-instance guard (see invite): never mutate after reload.
                 if (capturedGeneration != GENERATION.get()) {
-                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    sendToSender(staff, safeDeserialize("<red>Team data was reloaded, please retry your command."));
                     return;
                 }
                 UUID uuid = target.getUniqueId();
@@ -727,19 +724,14 @@ public class TeamManager {
                 synchronized (lockFor(uuid)) {
                     synchronized (teamLockFor(id)) {
                         if (!isMember(uuid, id)) {
-                            staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
+                            sendToSender(staff, msg(cfgSnapshot, "not-in-team", "team", id));
                             return;
                         }
                         if (denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
 
                         removeMember(uuid, id);
-                        staff.sendMessage(msg(cfgSnapshot, "kick-success", "player", targetName, "team", id));
+                        sendToSender(staff, msg(cfgSnapshot, "kick-success", "player", targetName, "team", id));
 
-                        try {
-                            Player onlineLookup = Bukkit.getPlayer(uuid);
-                            if (onlineLookup != null) onlineName = onlineLookup.getName();
-                        } catch (Exception ignored) {
-                        }
                         kickedNotice = msg(cfgSnapshot, "kick-success", "player", onlineName, "team", id);
                     }
                 }
@@ -861,7 +853,7 @@ public class TeamManager {
             try {
                 // Stale-instance guard (see invite): never mutate after reload.
                 if (capturedGeneration != GENERATION.get()) {
-                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    sendToSender(staff, safeDeserialize("<red>Team data was reloaded, please retry your command."));
                     return;
                 }
                 UUID uuid = target.getUniqueId();
@@ -869,7 +861,7 @@ public class TeamManager {
                 synchronized (lockFor(uuid)) {
                     Set<UUID> pending = requests.get(id);
                     if (pending == null || !pending.contains(uuid)) {
-                        staff.sendMessage(msg(cfgSnapshot, "request-not-found", "player", targetName, "team", id));
+                        sendToSender(staff, msg(cfgSnapshot, "request-not-found", "player", targetName, "team", id));
                         return;
                     }
                     synchronized (REQUESTS_LOCK) {
@@ -879,7 +871,7 @@ public class TeamManager {
                         });
                     }
                     saveRequests();
-                    staff.sendMessage(msg(cfgSnapshot, "request-reject-success", "player", targetName, "team", id));
+                    sendToSender(staff, msg(cfgSnapshot, "request-reject-success", "player", targetName, "team", id));
 
                     rejectedNotice = msg(cfgSnapshot, "request-rejected", "team", id);
                 }
@@ -898,7 +890,7 @@ public class TeamManager {
         try {
             role = Role.valueOf(roleStr.toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
-            staff.sendMessage(msg(cfgSnapshot, "invalid-role"));
+            sendToSender(staff, msg(cfgSnapshot, "invalid-role"));
             return;
         }
         if (denyUnknownTeamStaff(staff, cfgSnapshot, id)) return;
@@ -907,7 +899,7 @@ public class TeamManager {
             try {
                 // Stale-instance guard (see invite): never mutate after reload.
                 if (capturedGeneration != GENERATION.get()) {
-                    staff.sendMessage(safeDeserialize("<red>Team data was reloaded, please retry your command."));
+                    sendToSender(staff, safeDeserialize("<red>Team data was reloaded, please retry your command."));
                     return;
                 }
                 UUID uuid = target.getUniqueId();
@@ -916,7 +908,7 @@ public class TeamManager {
                 synchronized (lockFor(uuid)) {
                     synchronized (teamLockFor(id)) {
                         if (!isMember(uuid, id)) {
-                            staff.sendMessage(msg(cfgSnapshot, "not-in-team", "team", id));
+                            sendToSender(staff, msg(cfgSnapshot, "not-in-team", "team", id));
                             return;
                         }
                         // Demoting the last remaining admin would orphan the team.
@@ -924,13 +916,8 @@ public class TeamManager {
                         if (role == Role.MEMBER && denyIfLastAdmin(staff, cfgSnapshot, id, uuid)) return;
 
                         setMember(uuid, id, role);
-                        staff.sendMessage(msg(cfgSnapshot, "setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
+                        sendToSender(staff, msg(cfgSnapshot, "setrole-success", "player", targetName, "team", id, "role", role.name().toLowerCase(Locale.ROOT)));
 
-                        try {
-                            Player onlineLookup = Bukkit.getPlayer(uuid);
-                            if (onlineLookup != null) onlineName = onlineLookup.getName();
-                        } catch (Exception ignored) {
-                        }
                         roleNotice = msg(cfgSnapshot, "setrole-success", "player", onlineName, "team", id, "role", role.name().toLowerCase(Locale.ROOT));
                     }
                 }
@@ -1064,11 +1051,14 @@ public class TeamManager {
      * re-syncs this player's scoreboard entry under their current name.
      */
     public void handleJoin(Player player) {
+        UUID joiningUuid = player.getUniqueId();
+        Object session = new Object();
+        notificationSessions.put(joiningUuid, session);
         final FileConfiguration cfgSnapshot = plugin.getTeamConfig();
         // Snapshot copy: invites may mutate concurrently (accept/deny/add on
         // another thread) — never iterate the live set. Filter ghost teams:
         // invites for deleted definitions are skipped here (purged on accept).
-        Set<String> live = invites.get(player.getUniqueId());
+        Set<String> live = invites.get(joiningUuid);
         if (live != null) {
             // Sorted for deterministic reminder order (set iteration order is
             // unspecified); snapshot copy since invites may mutate concurrently.
@@ -1077,7 +1067,7 @@ public class TeamManager {
             for (String teamId : sorted) {
                 if (teamId == null || !teamExists(teamId)) continue;
                 try {
-                    player.sendMessage(msg(cfgSnapshot, "invite-reminder-on-join", "team", teamId));
+                    notifyPlayer(player, msg(cfgSnapshot, "invite-reminder-on-join", "team", teamId), session);
                 } catch (Exception e) {
                     plugin.getLogger().fine("Failed invite reminder: " + e.getMessage());
                 }
@@ -1116,6 +1106,7 @@ public class TeamManager {
     public void handleQuit(Player player) {
         if (player == null) return;
         UUID uuid = player.getUniqueId();
+        notificationSessions.remove(uuid);
         String teamId = scoreboardTeamOf.remove(uuid);
         if (teamId == null || scoreboard == null) return;
         String sbName = scoreboardName(teamId);
@@ -1241,7 +1232,7 @@ public class TeamManager {
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
                 try {
                     if (finalName == null && !finalPlayed) {
-                        staff.sendMessage(msg(cfgSnapshot, "player-not-found", "player", name));
+                        sendToSender(staff, msg(cfgSnapshot, "player-not-found", "player", name));
                         return;
                     }
                     callback.accept(finalResolved);
@@ -1303,24 +1294,34 @@ public class TeamManager {
     /**
      * Entity-scheduler dispatch for player notifications from async/global
      * callbacks: on Folia a direct sendMessage from the wrong thread throws.
-     * Falls back to a direct send when scheduling fails. Never throws.
+     * Does not fall back to a direct send: that would violate Folia's entity
+     * ownership rule precisely when scheduler dispatch fails.
      */
     private void notifyPlayer(Player target, Component message) {
+        notifyPlayer(target, message, null);
+    }
+
+    /** Sends to a command sender from either a region or global callback. */
+    private void sendToSender(CommandSender sender, Component message) {
+        if (sender instanceof Player player) notifyPlayer(player, message);
+        else if (sender != null && message != null) sender.sendMessage(message);
+    }
+
+    private void notifyPlayer(Player target, Component message, Object expectedSession) {
         if (target == null || message == null) return;
         try {
             target.getScheduler().run(plugin, t -> {
                 try {
                     if (!target.isOnline()) return;
+                    if (expectedSession != null
+                            && notificationSessions.get(target.getUniqueId()) != expectedSession) return;
                     target.sendMessage(message);
                 } catch (Exception e) {
                     plugin.getLogger().fine("Failed to notify " + target.getName() + ": " + e.getMessage());
                 }
             }, null);
         } catch (Exception e) {
-            try {
-                target.sendMessage(message);
-            } catch (Exception ignored) {
-            }
+            plugin.getLogger().fine("Failed to schedule notification for " + target.getUniqueId() + ": " + e.getMessage());
         }
     }
 
@@ -1385,7 +1386,7 @@ public class TeamManager {
         if (members == null || members.get(targetUuid) != Role.ADMIN) return false;
         long admins = members.values().stream().filter(r -> r == Role.ADMIN).count();
         if (admins <= 1) {
-            sender.sendMessage(msg(cfgSnapshot, "last-admin", "team", teamId));
+            sendToSender(sender, msg(cfgSnapshot, "last-admin", "team", teamId));
             return true;
         }
         return false;

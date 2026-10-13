@@ -71,7 +71,7 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
         String staffName = sender.getName();
         long finalDuration = durationMillis;
 
-        resolveTarget(sender, targetName, offlinePlayer -> {
+        resolveTarget(sender, targetName, offlinePlayer -> runOnSender(sender, () -> {
             if (isGone(sender)) return;
             if (manager == null || moderationConfig == null) {
                 sender.sendMessage(render("<red>Moderation module is reloading, try again shortly."));
@@ -94,10 +94,15 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
 
             Player onlineTarget = offlinePlayer.getPlayer();
             if (onlineTarget != null) {
-                if (isExempt(offlinePlayer, sender) || isProtectedTarget(onlineTarget, sender)) {
-                    sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
-                    return;
-                }
+                checkProtectedTarget(onlineTarget, sender, protectedTarget -> {
+                    if (isGone(sender)) return;
+                    if (protectedTarget) {
+                        sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
+                        return;
+                    }
+                    tryBan(manager, offlinePlayer, name, reason, staffUuid, staffName, sender, finalDuration);
+                });
+                return;
             } else if (!isAdmin(sender)) {
                 // Offline players expose no permission API, so exempt/admin
                 // status cannot be verified — non-admins must not ban them at
@@ -105,8 +110,14 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                 sender.sendMessage(render(message("exempt", "<red>You cannot punish this player.")));
                 return;
             }
+            tryBan(manager, offlinePlayer, name, reason, staffUuid, staffName, sender, finalDuration);
+        }));
+    }
 
-            manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, (result, dbError) -> {
+    private void tryBan(BanManager manager, org.bukkit.OfflinePlayer offlinePlayer, String name,
+                        String reason, UUID staffUuid, String staffName, CommandSender sender, long finalDuration) {
+        manager.tryBanAsync(offlinePlayer.getUniqueId(), name, reason, staffUuid, staffName, finalDuration, (result, dbError) ->
+                runOnSender(sender, () -> {
                 if (isGone(sender)) return;
                 if (dbError) {
                     sender.sendMessage(render(
@@ -146,7 +157,7 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                             played = true;
                         }
                         if (!played) {
-                            Bukkit.getGlobalRegionScheduler().run(plugin, t -> {
+                            runOnSender(sender, () -> {
                                 if (isGone(sender)) return;
                                 sender.sendMessage(render(
                                         message("never-played", "<yellow>Warning: %player% has never played on this server.").replace("%player%", esc(name))));
@@ -168,8 +179,7 @@ public class TempBanCommand extends ModerationCommandBase implements BasicComman
                 broadcast(broadcastTemplate
                         .replace("%player%", esc(name)).replace("%staff%", esc(staffName))
                         .replace("%duration%", esc(durationText)).replace("%reason%", esc(reason)));
-            });
-        });
+            }));
     }
 
     @Override
