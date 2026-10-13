@@ -256,9 +256,9 @@ jobs:
           tag, date, mlink = sys.argv[1], sys.argv[2], sys.argv[3]
           block = (
             "<!-- RELEASE-SYNC:START -->\n"
-            f"> **Latest release:** [{tag}](https://github.com/j-gaertig/PlainBase/releases/tag/{tag}) — {date}"
-            f" · [Modrinth]({mlink})"
-            f" · [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase/versions/{tag})\n"
+            f"> **Latest release:** [{tag}](https://github.com/j-gaertig/PlainBase/releases/tag/{tag}) | {date}"
+            f" | [Modrinth]({mlink})"
+            f" | [Hangar](https://hangar.papermc.io/j-gaertig/PlainBase/versions/{tag})\n"
             "<!-- RELEASE-SYNC:END -->"
           )
           p = "README.md"
